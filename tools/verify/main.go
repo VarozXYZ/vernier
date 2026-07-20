@@ -23,7 +23,7 @@ func main() {
 		{"go vet", command("go", "vet", "./...")},
 		{"tests", command("go", "test", "./...")},
 		{"race tests", raceTests},
-		{"build", command("go", "build", "./...")},
+		{"build", buildCommands},
 		{"staticcheck", command("go", "tool", "staticcheck", "./...")},
 		{"govulncheck", command("go", "tool", "govulncheck", "./...")},
 		{"GitHub Actions", command("go", "tool", "actionlint")},
@@ -48,6 +48,15 @@ func raceTests() error {
 		return nil
 	}
 	return command("go", "test", "-race", "./...")()
+}
+
+func buildCommands() error {
+	directory, err := os.MkdirTemp("", "vernier-build-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(directory)
+	return command("go", "build", "-o", directory, "./...")()
 }
 
 func command(name string, args ...string) func() error {

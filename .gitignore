@@ -5,6 +5,7 @@
 # Go build and test artifacts
 /bin/
 *.test
+*.exe
 *.out
 *.prof
 coverage.*
