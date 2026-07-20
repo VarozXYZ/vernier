@@ -62,7 +62,7 @@ func Read(
 	}
 	decimals, ok := decimalsValues[0].(uint8)
 	if !ok || decimals > 36 {
-		return Observation{}, fmt.Errorf("Chainlink feed returned invalid decimals")
+		return Observation{}, fmt.Errorf("chainlink feed returned invalid decimals")
 	}
 	values, err := call(ctx, network, block, feed, "latestRoundData")
 	if err != nil {
@@ -75,7 +75,7 @@ func Read(
 	if !okRound || !okAnswer || !okUpdated || !okAnswered || roundID == nil || answer == nil ||
 		updatedAt == nil || answeredInRound == nil || roundID.Sign() <= 0 || answer.Sign() <= 0 ||
 		updatedAt.Sign() <= 0 || !updatedAt.IsInt64() || answeredInRound.Cmp(roundID) < 0 {
-		return Observation{}, fmt.Errorf("Chainlink feed returned an invalid round")
+		return Observation{}, fmt.Errorf("chainlink feed returned an invalid round")
 	}
 	return Observation{
 		Feed: feed, Block: block, RoundID: new(big.Int).Set(roundID),
