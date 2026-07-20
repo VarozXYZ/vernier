@@ -65,7 +65,7 @@ type Adapter struct {
 
 func NewAdapter(config OnChainConfig) (*Adapter, error) {
 	if config.Pool == (common.Address{}) {
-		return nil, fmt.Errorf("Uniswap V3 pool address is required")
+		return nil, fmt.Errorf("uniswap V3 pool address is required")
 	}
 	if config.MaxTickWords == 0 {
 		config.MaxTickWords = 64
@@ -103,6 +103,37 @@ func (a *Adapter) PoolInfo() (PoolInfo, bool) {
 	return a.info, a.hasInfo
 }
 
+// ExpandCoverage loads only additional bitmap words required by the configured
+// probes. It preserves the snapshot's absolute pool state and does not perform
+// a full pool reload.
+func (a *Adapter) ExpandCoverage(
+	ctx context.Context,
+	network evm.Network,
+	block evm.BlockReference,
+	snapshot Snapshot,
+) (StateUpdate, error) {
+	if snapshot.schemaVersion != snapshotSchemaVersion || snapshot.coverage.Full() {
+		return StateUpdate{}, fmt.Errorf("bounded compatible Uniswap V3 snapshot is required")
+	}
+	loaded := make(map[int32][]Tick)
+	for word := snapshot.coverage.minWord; word <= snapshot.coverage.maxWord; word++ {
+		loaded[word] = nil
+	}
+	for _, initialized := range snapshot.ticks {
+		word := int32(floorDiv(floorDiv(int64(initialized.index), int64(snapshot.tickSpacing)), 256))
+		loaded[word] = append(loaded[word], initialized)
+	}
+	minWord, maxWord := snapshot.coverage.minWord, snapshot.coverage.maxWord
+	if err := a.expandForProbes(ctx, network, block, snapshot.sqrtPriceX96, snapshot.tick, snapshot.liquidity, snapshot.feePips, snapshot.tickSpacing, loaded, &minWord, &maxWord); err != nil {
+		return StateUpdate{}, err
+	}
+	coverage, _ := NewTickCoverage(minWord, maxWord)
+	return NewCoveredStateUpdate(
+		snapshot.sqrtPriceX96, snapshot.tick, snapshot.liquidity, snapshot.feePips,
+		snapshot.tickSpacing, flattenTicks(loaded), coverage,
+	)
+}
+
 func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.BlockReference) (market.EventData, error) {
 	if network == nil {
 		return nil, fmt.Errorf("EVM network is required")
@@ -112,7 +143,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 		return nil, err
 	}
 	if len(code) == 0 {
-		return nil, fmt.Errorf("Uniswap V3 pool has no bytecode at block %d", block.Number)
+		return nil, fmt.Errorf("uniswap V3 pool has no bytecode at block %d", block.Number)
 	}
 	token0Values, err := a.call(ctx, network, block, "token0")
 	if err != nil {
@@ -125,7 +156,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 	token0, ok0 := token0Values[0].(common.Address)
 	token1, ok1 := token1Values[0].(common.Address)
 	if !ok0 || !ok1 || token0 == (common.Address{}) || token1 == (common.Address{}) || token0 == token1 {
-		return nil, fmt.Errorf("Uniswap V3 pool returned invalid tokens")
+		return nil, fmt.Errorf("uniswap V3 pool returned invalid tokens")
 	}
 	feeValues, err := a.call(ctx, network, block, "fee")
 	if err != nil {
@@ -176,7 +207,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 
 func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockReference, logs []types.Log) (market.EventData, error) {
 	if len(logs) == 0 {
-		return nil, fmt.Errorf("Uniswap V3 block %d contains no matching logs", block.Number)
+		return nil, fmt.Errorf("uniswap V3 block %d contains no matching logs", block.Number)
 	}
 	ordered := append([]types.Log(nil), logs...)
 	sort.Slice(ordered, func(i, j int) bool {
@@ -188,7 +219,7 @@ func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockR
 	updates := make([]market.EventData, 0, len(ordered))
 	for _, event := range ordered {
 		if event.Address != a.pool || event.BlockHash != block.Hash || event.BlockNumber != block.Number || event.Removed {
-			return nil, fmt.Errorf("Uniswap V3 log does not belong to pool and block")
+			return nil, fmt.Errorf("uniswap V3 log does not belong to pool and block")
 		}
 		update, err := decodeLog(event)
 		if err != nil {
@@ -206,9 +237,29 @@ func (a *Adapter) loadCoveredState(ctx context.Context, network evm.Network, blo
 		return StateUpdate{}, err
 	}
 	minWord, maxWord := currentWord, currentWord
+	if err := a.expandForProbes(ctx, network, block, sqrtPrice, tick, liquidity, fee, spacing, loaded, &minWord, &maxWord); err != nil {
+		return StateUpdate{}, err
+	}
+	coverage, _ := NewTickCoverage(minWord, maxWord)
+	return NewCoveredStateUpdate(sqrtPrice, tick, liquidity, fee, spacing, flattenTicks(loaded), coverage)
+}
+
+func (a *Adapter) expandForProbes(
+	ctx context.Context,
+	network evm.Network,
+	block evm.BlockReference,
+	sqrtPrice *big.Int,
+	tick int32,
+	liquidity *big.Int,
+	fee uint32,
+	spacing int32,
+	loaded map[int32][]Tick,
+	minWord *int32,
+	maxWord *int32,
+) error {
 	for _, probe := range a.probes {
 		for {
-			coverage, _ := NewTickCoverage(minWord, maxWord)
+			coverage, _ := NewTickCoverage(*minWord, *maxWord)
 			state := Snapshot{
 				schemaVersion: snapshotSchemaVersion, sqrtPriceX96: cloneInt(sqrtPrice), tick: tick,
 				liquidity: cloneInt(liquidity), feePips: fee, tickSpacing: spacing,
@@ -219,43 +270,42 @@ func (a *Adapter) loadCoveredState(ctx context.Context, network evm.Network, blo
 				break
 			}
 			if !errors.Is(quoteErr, ErrInsufficientTickCoverage) {
-				return StateUpdate{}, fmt.Errorf("validate Uniswap V3 coverage probe: %w", quoteErr)
+				return fmt.Errorf("validate Uniswap V3 coverage probe: %w", quoteErr)
 			}
 			if len(loaded) >= a.maxWords {
-				return StateUpdate{}, fmt.Errorf("%w: maximum of %d words reached", ErrInsufficientTickCoverage, a.maxWords)
+				return fmt.Errorf("%w: maximum of %d words reached", ErrInsufficientTickCoverage, a.maxWords)
 			}
-			word := maxWord + 1
+			word := *maxWord + 1
 			if probe.ZeroForOne {
-				word = minWord - 1
+				word = *minWord - 1
 			}
 			if err := a.loadWord(ctx, network, block, word, spacing, loaded); err != nil {
-				return StateUpdate{}, err
+				return err
 			}
 			if probe.ZeroForOne {
-				minWord = word
+				*minWord = word
 			} else {
-				maxWord = word
+				*maxWord = word
 			}
 		}
 		if len(loaded) < a.maxWords {
-			guard := maxWord + 1
+			guard := *maxWord + 1
 			if probe.ZeroForOne {
-				guard = minWord - 1
+				guard = *minWord - 1
 			}
 			if _, exists := loaded[guard]; !exists {
 				if err := a.loadWord(ctx, network, block, guard, spacing, loaded); err != nil {
-					return StateUpdate{}, err
+					return err
 				}
 				if probe.ZeroForOne {
-					minWord = guard
+					*minWord = guard
 				} else {
-					maxWord = guard
+					*maxWord = guard
 				}
 			}
 		}
 	}
-	coverage, _ := NewTickCoverage(minWord, maxWord)
-	return NewCoveredStateUpdate(sqrtPrice, tick, liquidity, fee, spacing, flattenTicks(loaded), coverage)
+	return nil
 }
 
 func (a *Adapter) loadWord(ctx context.Context, network evm.Network, block evm.BlockReference, word int32, spacing int32, loaded map[int32][]Tick) error {
@@ -263,7 +313,7 @@ func (a *Adapter) loadWord(ctx context.Context, network evm.Network, block evm.B
 		return nil
 	}
 	if word < -32768 || word > 32767 {
-		return fmt.Errorf("Uniswap V3 bitmap word %d exceeds int16", word)
+		return fmt.Errorf("uniswap V3 bitmap word %d exceeds int16", word)
 	}
 	values, err := a.call(ctx, network, block, "tickBitmap", int16(word))
 	if err != nil {
@@ -351,7 +401,7 @@ func (a *Adapter) call(ctx context.Context, network evm.Network, block evm.Block
 
 func decodeLog(event types.Log) (market.EventData, error) {
 	if len(event.Topics) == 0 {
-		return nil, fmt.Errorf("Uniswap V3 log has no signature topic")
+		return nil, fmt.Errorf("uniswap V3 log has no signature topic")
 	}
 	switch event.Topics[0] {
 	case poolABI.Events["Initialize"].ID:
@@ -469,7 +519,7 @@ func uint32Value(value any, name string) (uint32, error) {
 		return 0, err
 	}
 	if !integer.IsUint64() || integer.Uint64() > uint64(^uint32(0)) {
-		return 0, fmt.Errorf("Uniswap V3 %s exceeds uint32", name)
+		return 0, fmt.Errorf("uniswap V3 %s exceeds uint32", name)
 	}
 	return uint32(integer.Uint64()), nil
 }
@@ -480,7 +530,7 @@ func int32Value(value any, name string) (int32, error) {
 		return 0, err
 	}
 	if !integer.IsInt64() || integer.Int64() < -1<<31 || integer.Int64() > 1<<31-1 {
-		return 0, fmt.Errorf("Uniswap V3 %s exceeds int32", name)
+		return 0, fmt.Errorf("uniswap V3 %s exceeds int32", name)
 	}
 	return int32(integer.Int64()), nil
 }

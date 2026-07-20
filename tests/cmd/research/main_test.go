@@ -70,8 +70,9 @@ func TestRunTextMatchesGolden(t *testing.T) {
 func TestRunExitCodes(t *testing.T) {
 	fixture := filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.json")
 	for name, args := range map[string][]string{
-		"missing fixture": {"--fixture", filepath.Join(t.TempDir(), "missing.json")},
-		"bad format":      {"--fixture", fixture, "--format", "yaml"},
+		"missing fixture":    {"--fixture", filepath.Join(t.TempDir(), "missing.json")},
+		"bad format":         {"--fixture", fixture, "--format", "yaml"},
+		"bad observe format": {"observe-v3", "--format", "json"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code, _, _ := runCLI(t, args...)

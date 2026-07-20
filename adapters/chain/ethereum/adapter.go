@@ -35,16 +35,16 @@ type Adapter struct {
 
 func Dial(ctx context.Context, httpURL, wsURL string) (*Adapter, error) {
 	if httpURL == "" || wsURL == "" {
-		return nil, fmt.Errorf("Ethereum HTTP and WebSocket endpoints are required")
+		return nil, fmt.Errorf("ethereum HTTP and WebSocket endpoints are required")
 	}
 	httpClient, err := ethclient.DialContext(ctx, httpURL)
 	if err != nil {
-		return nil, fmt.Errorf("dial Ethereum HTTP endpoint: %w", err)
+		return nil, fmt.Errorf("dial Ethereum HTTP endpoint: connection failed")
 	}
 	wsClient, err := ethclient.DialContext(ctx, wsURL)
 	if err != nil {
 		httpClient.Close()
-		return nil, fmt.Errorf("dial Ethereum WebSocket endpoint: %w", err)
+		return nil, fmt.Errorf("dial Ethereum WebSocket endpoint: connection failed")
 	}
 	adapter, err := New(httpClient, wsClient)
 	if err != nil {
@@ -61,7 +61,7 @@ func Dial(ctx context.Context, httpURL, wsURL string) (*Adapter, error) {
 
 func New(httpClient, wsClient Client) (*Adapter, error) {
 	if httpClient == nil || wsClient == nil {
-		return nil, fmt.Errorf("Ethereum HTTP and WebSocket clients are required")
+		return nil, fmt.Errorf("ethereum HTTP and WebSocket clients are required")
 	}
 	return &Adapter{http: httpClient, ws: wsClient}, nil
 }
@@ -75,7 +75,7 @@ func (a *Adapter) Validate(ctx context.Context) error {
 			return fmt.Errorf("read Ethereum %s chain ID: %w", name, err)
 		}
 		if chainID.Cmp(mainnetChainID) != 0 {
-			return fmt.Errorf("Ethereum %s endpoint returned chain ID %s, expected 1", name, chainID)
+			return fmt.Errorf("ethereum %s endpoint returned chain ID %s, expected 1", name, chainID)
 		}
 	}
 	return nil
@@ -87,14 +87,14 @@ func (a *Adapter) CurrentBlock(ctx context.Context) (evm.BlockReference, error) 
 		return evm.BlockReference{}, fmt.Errorf("read current Ethereum block: %w", err)
 	}
 	if header == nil || header.Number == nil || !header.Number.IsUint64() {
-		return evm.BlockReference{}, fmt.Errorf("Ethereum returned an invalid current block")
+		return evm.BlockReference{}, fmt.Errorf("ethereum returned an invalid current block")
 	}
 	return evm.BlockReference{Number: header.Number.Uint64(), Hash: header.Hash()}, nil
 }
 
 func (a *Adapter) SubscribeLogs(ctx context.Context, filter evm.LogFilter, output chan<- types.Log) (evm.Subscription, error) {
 	if filter.Address == (common.Address{}) || output == nil {
-		return nil, fmt.Errorf("Ethereum log subscription requires an address and output channel")
+		return nil, fmt.Errorf("ethereum log subscription requires an address and output channel")
 	}
 	subscription, err := a.ws.SubscribeFilterLogs(ctx, filter.Query(nil), output)
 	if err != nil {
