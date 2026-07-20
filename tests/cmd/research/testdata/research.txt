@@ -1,7 +1,7 @@
 Vernier deterministic Research
 run: synthetic-two-market
 status: healthy
-config: 63c88ac1b33b628bc500c68ef6808ff3e254dc1e5663389dd105cef5bbc18f81
+config: a815735eda2ab26dd5a7cbd400671d41c74cc0f76a3f9868e42f5d02370aeb03
 evaluations: 2
 opportunities: 8
 ignored_events: 0

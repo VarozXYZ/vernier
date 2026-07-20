@@ -54,7 +54,7 @@ func TestUnmodeledQuoteFeeClosesClassification(t *testing.T) {
 	}
 	evaluation, err := arbitrage.NewEvaluation(
 		"evaluation-fees", "run", "strategy-fees", "config-hash", fixture.snapshots, fixture.cost,
-		fixture.now, fixture.now, time.Second,
+		fixture.now, fixture.now,
 	)
 	if err != nil {
 		t.Fatal(err)
