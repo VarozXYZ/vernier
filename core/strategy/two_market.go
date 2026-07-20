@@ -3,6 +3,7 @@ package strategy
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/VarozXYZ/vernier/core/sizing"
@@ -44,8 +45,11 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	if !ok {
 		return nil, fmt.Errorf("setup references unknown pair %q", config.Setup.Pair())
 	}
-	if config.Grid.Asset() != pair.QuoteAsset || config.Threshold.Asset() != pair.QuoteAsset || config.Threshold.Sign() < 0 {
-		return nil, fmt.Errorf("grid and non-negative threshold must use quote asset %q", pair.QuoteAsset)
+	if config.Grid.Asset() != pair.BaseAsset {
+		return nil, fmt.Errorf("sizing grid must use base asset %q", pair.BaseAsset)
+	}
+	if config.Threshold.Asset() != pair.QuoteAsset || config.Threshold.Sign() < 0 {
+		return nil, fmt.Errorf("non-negative threshold must use quote asset %q", pair.QuoteAsset)
 	}
 	sources := make(map[market.MarketID]quoteport.Source, len(config.Sources))
 	for _, marketID := range config.Setup.Markets() {
@@ -67,7 +71,7 @@ func (s *TwoMarketCrossChainArbitrage) Evaluate(ctx context.Context, evaluation 
 	if evaluation.Strategy() != s.id {
 		return nil, fmt.Errorf("evaluation targets strategy %q, expected %q", evaluation.Strategy(), s.id)
 	}
-	if evaluation.Cost().Amount.Asset() != s.grid.Asset() {
+	if evaluation.Cost().Amount.Asset() != s.threshold.Asset() {
 		return nil, fmt.Errorf("cost asset does not match strategy quote asset")
 	}
 	opportunities := make([]arbitrage.Opportunity, 0, len(s.setup.Directions()))
@@ -150,13 +154,15 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 }
 
 func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, size market.AssetQuantity) (arbitrage.Candidate, error) {
-	input, err := size.ToTokenAmount(buyQuote)
-	if err != nil || input.IsZero() {
-		return arbitrage.Candidate{}, fmt.Errorf("input_rounds_to_zero")
+	targetBase, err := size.ToTokenAmount(buyBase)
+	if err != nil || targetBase.IsZero() {
+		return arbitrage.Candidate{}, fmt.Errorf("size_rounds_to_zero")
 	}
-	actualInput, _ := input.ToAssetQuantity(buyQuote)
-	buy, err := s.sources[direction.BuyMarket].Quote(ctx, quoteport.Input{
-		Snapshot: buySnapshot, TokenIn: buyQuote.ID, TokenOut: buyBase.ID, AmountIn: input,
+	actualSize, _ := targetBase.ToAssetQuantity(buyBase)
+	initialHigh, _ := market.NewTokenAmount(buyQuote.ID, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(buyQuote.Decimals)), nil))
+	buy, err := sizing.MinimumInputForOutput(ctx, s.sources[direction.BuyMarket], sizing.ExactOutputRequest{
+		Snapshot: buySnapshot, TokenIn: buyQuote.ID, TokenOut: buyBase.ID,
+		TargetOut: targetBase, InitialHigh: initialHigh,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	})
 	if err != nil {
@@ -165,11 +171,11 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	if hasUnmodeledFee(buy) {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_has_unmodeled_fee")
 	}
-	baseQuantity, err := buy.AmountOut.ToAssetQuantity(buyBase)
+	actualInput, err := buy.AmountIn.ToAssetQuantity(buyQuote)
 	if err != nil {
-		return arbitrage.Candidate{}, fmt.Errorf("buy_output_invalid")
+		return arbitrage.Candidate{}, fmt.Errorf("buy_input_invalid")
 	}
-	sellInput, err := baseQuantity.ToTokenAmount(sellBase)
+	sellInput, err := actualSize.ToTokenAmount(sellBase)
 	if err != nil || sellInput.IsZero() {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_input_rounds_to_zero")
 	}
@@ -190,7 +196,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	gross, _ := output.Sub(actualInput)
 	net, _ := gross.Sub(evaluation.Cost().Amount)
 	return arbitrage.Candidate{
-		Input: actualInput, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
+		Size: actualSize, Input: actualInput, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
 		BuyQuote: buy, SellQuote: sell,
 	}, nil
 }

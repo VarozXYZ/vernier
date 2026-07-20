@@ -145,6 +145,7 @@ const (
 )
 
 type Candidate struct {
+	Size      market.AssetQuantity
 	Input     market.AssetQuantity
 	Output    market.AssetQuantity
 	GrossPnL  market.AssetQuantity
