@@ -95,6 +95,10 @@ func quoteExactInput(state Snapshot, zeroForOne bool, amountIn *big.Int) (swapRe
 		if liquidity.Sign() <= 0 {
 			return swapResult{}, fmt.Errorf("no active Uniswap V3 liquidity")
 		}
+		word := traversalWord(currentTick, state.tickSpacing, zeroForOne)
+		if !state.coverage.Contains(word) {
+			return swapResult{}, fmt.Errorf("%w: word %d", ErrInsufficientTickCoverage, word)
+		}
 		nextTick, initialized := nextInitializedTickWithinOneWord(ticks, currentTick, state.tickSpacing, zeroForOne)
 		if nextTick < MinTick {
 			nextTick = MinTick
@@ -146,6 +150,14 @@ func quoteExactInput(state Snapshot, zeroForOne bool, amountIn *big.Int) (swapRe
 		return swapResult{}, fmt.Errorf("quote output rounds to zero")
 	}
 	return swapResult{amountOut: output, fee: fees, ticksCrossed: ticksCrossed}, nil
+}
+
+func traversalWord(current, spacing int32, zeroForOne bool) int32 {
+	compressed := floorDiv(int64(current), int64(spacing))
+	if !zeroForOne {
+		compressed++
+	}
+	return int32(floorDiv(compressed, 256))
 }
 
 type swapStep struct {
