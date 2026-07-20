@@ -29,10 +29,44 @@ type SnapshotData interface {
 	SnapshotKind() string
 }
 
+type SourcePositionKind string
+
+const SourcePositionBlock SourcePositionKind = "block"
+
+// SourcePosition is optional, source-provided ordering evidence. Positions are
+// comparable only when they use the same non-empty kind.
+type SourcePosition struct {
+	Kind  SourcePositionKind
+	Value uint64
+}
+
+func (p SourcePosition) Known() bool { return p.Kind != "" }
+
+func (p SourcePosition) Validate() error {
+	if p.Kind != "" && p.Kind != SourcePositionBlock {
+		return fmt.Errorf("unsupported source position kind %q", p.Kind)
+	}
+	return nil
+}
+
+func (p SourcePosition) Compare(other SourcePosition) (int, bool) {
+	if !p.Known() || p.Kind != other.Kind {
+		return 0, false
+	}
+	switch {
+	case p.Value < other.Value:
+		return -1, true
+	case p.Value > other.Value:
+		return 1, true
+	default:
+		return 0, true
+	}
+}
+
 type MarketEvent struct {
 	Market          MarketID
 	Source          SourceID
-	Sequence        uint64
+	Position        SourcePosition
 	Finality        Finality
 	SourceTime      time.Time
 	SourceTimeKnown bool
@@ -45,8 +79,8 @@ func NewMarketEvent(event MarketEvent) (MarketEvent, error) {
 	if event.Market == "" || event.Source == "" {
 		return MarketEvent{}, fmt.Errorf("market and source are required")
 	}
-	if event.Sequence == 0 {
-		return MarketEvent{}, fmt.Errorf("event sequence must be positive")
+	if err := event.Position.Validate(); err != nil {
+		return MarketEvent{}, err
 	}
 	if event.ReceivedAt.IsZero() {
 		return MarketEvent{}, fmt.Errorf("received timestamp is required")
@@ -68,13 +102,15 @@ type SnapshotMetadata struct {
 	Market          MarketID
 	Source          SourceID
 	Version         uint64
-	EventSequence   uint64
+	EventPosition   SourcePosition
 	Finality        Finality
 	SourceTime      time.Time
 	SourceTimeKnown bool
 	ReceivedAt      time.Time
 	AppliedAt       time.Time
 	Health          Health
+	HealthReason    string
+	HealthChangedAt time.Time
 	StateHash       [sha256.Size]byte
 }
 
@@ -89,8 +125,11 @@ func NewMarketSnapshot(metadata SnapshotMetadata, data SnapshotData) (MarketSnap
 	if metadata.Market == "" || metadata.Source == "" {
 		return MarketSnapshot{}, fmt.Errorf("market and source are required")
 	}
-	if metadata.Version == 0 || metadata.EventSequence == 0 {
-		return MarketSnapshot{}, fmt.Errorf("snapshot version and event sequence must be positive")
+	if metadata.Version == 0 {
+		return MarketSnapshot{}, fmt.Errorf("snapshot version must be positive")
+	}
+	if err := metadata.EventPosition.Validate(); err != nil {
+		return MarketSnapshot{}, err
 	}
 	if metadata.ReceivedAt.IsZero() || metadata.AppliedAt.IsZero() {
 		return MarketSnapshot{}, fmt.Errorf("received and applied timestamps are required")
@@ -98,11 +137,21 @@ func NewMarketSnapshot(metadata SnapshotMetadata, data SnapshotData) (MarketSnap
 	if metadata.Health != HealthHealthy && metadata.Health != HealthDegraded {
 		return MarketSnapshot{}, fmt.Errorf("invalid snapshot health %q", metadata.Health)
 	}
+	if metadata.HealthChangedAt.IsZero() {
+		return MarketSnapshot{}, fmt.Errorf("health changed timestamp is required")
+	}
+	if metadata.Health == HealthDegraded && metadata.HealthReason == "" {
+		return MarketSnapshot{}, fmt.Errorf("degraded snapshot requires a health reason")
+	}
+	if metadata.Health == HealthHealthy && metadata.HealthReason != "" {
+		return MarketSnapshot{}, fmt.Errorf("healthy snapshot cannot have a health reason")
+	}
 	if data == nil || data.SnapshotKind() == "" {
 		return MarketSnapshot{}, fmt.Errorf("snapshot data and kind are required")
 	}
 	metadata.ReceivedAt = metadata.ReceivedAt.UTC()
 	metadata.AppliedAt = metadata.AppliedAt.UTC()
+	metadata.HealthChangedAt = metadata.HealthChangedAt.UTC()
 	if metadata.SourceTimeKnown {
 		metadata.SourceTime = metadata.SourceTime.UTC()
 	}

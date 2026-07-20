@@ -4,6 +4,7 @@ package feed
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/VarozXYZ/vernier/domain/market"
 )
@@ -19,19 +20,52 @@ type Feed interface {
 
 type Mirror interface {
 	MarketID() market.MarketID
-	Apply(context.Context, market.MarketEvent) (market.MarketSnapshot, error)
+	Apply(context.Context, market.MarketEvent) (ApplyResult, error)
+	SetHealth(context.Context, HealthUpdate) error
 	Current() (market.MarketSnapshot, bool)
 	Health() market.Health
 }
 
-type SequenceViolation struct {
-	Market   market.MarketID
-	Expected uint64
-	Actual   uint64
+type ApplyDisposition string
+
+const (
+	ApplyDispositionApplied      ApplyDisposition = "applied"
+	ApplyDispositionIgnoredStale ApplyDisposition = "ignored_stale"
+)
+
+type ApplyResult struct {
+	Disposition ApplyDisposition
+	Snapshot    market.MarketSnapshot
 }
 
-func (e SequenceViolation) Error() string {
-	return fmt.Sprintf("market %q expected sequence %d, received %d", e.Market, e.Expected, e.Actual)
+func (r ApplyResult) Validate() error {
+	if r.Disposition != ApplyDispositionApplied && r.Disposition != ApplyDispositionIgnoredStale {
+		return fmt.Errorf("invalid apply disposition %q", r.Disposition)
+	}
+	if r.Snapshot.Metadata().Version == 0 {
+		return fmt.Errorf("apply result requires a snapshot")
+	}
+	return nil
 }
 
-func (e SequenceViolation) IsGap() bool { return e.Actual > e.Expected }
+type HealthUpdate struct {
+	Health     market.Health
+	Reason     string
+	ObservedAt time.Time
+}
+
+func (u HealthUpdate) Validate() error {
+	if u.Health != market.HealthHealthy && u.Health != market.HealthDegraded {
+		return fmt.Errorf("invalid feed health %q", u.Health)
+	}
+	if u.ObservedAt.IsZero() {
+		return fmt.Errorf("feed health timestamp is required")
+	}
+	if u.Health == market.HealthDegraded && u.Reason == "" {
+		return fmt.Errorf("degraded feed health requires a reason")
+	}
+	if u.Health == market.HealthHealthy && u.Reason != "" {
+		return fmt.Errorf("healthy feed health cannot have a reason")
+	}
+	return nil
+}

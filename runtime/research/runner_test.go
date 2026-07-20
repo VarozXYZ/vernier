@@ -58,24 +58,45 @@ func assertSharedSnapshots(t *testing.T, left, right arbitrage.Opportunity) {
 	}
 }
 
-func TestGapDegradesReportAndOpportunities(t *testing.T) {
+func TestDisconnectDegradesReportAndOpportunities(t *testing.T) {
 	fixture, hash := loadExample(t)
-	fixture.Feeds[1].Events[1].Sequence = 3
+	fixture.Feeds[1].Disconnect = &DisconnectFixture{
+		Reason: "websocket_disconnected", ObservedAt: "2026-01-01T00:00:03.100Z",
+		EvaluationStartedAt:  "2026-01-01T00:00:03.120Z",
+		EvaluationFinishedAt: "2026-01-01T00:00:03.130Z",
+	}
 
 	report := runFixture(t, fixture, hash)
-	if report.Status != StatusDegraded || len(report.Gaps) != 1 {
-		t.Fatalf("expected one explicit gap, got %+v", report)
+	if report.Status != StatusDegraded || len(report.FeedIncidents) != 1 {
+		t.Fatalf("expected one explicit feed incident, got %+v", report)
 	}
-	if report.Gaps[0].Expected != 2 || report.Gaps[0].Actual != 3 || report.Gaps[0].Kind != "gap" {
-		t.Fatalf("unexpected gap evidence: %+v", report.Gaps[0])
+	if incident := report.FeedIncidents[0]; incident.Reason != "websocket_disconnected" {
+		t.Fatalf("unexpected incident evidence: %+v", incident)
 	}
 	for _, opportunity := range report.Opportunities[len(report.Opportunities)-4:] {
 		if opportunity.Classification != arbitrage.ClassificationUnclassifiable {
-			t.Fatalf("gap result classified as %q", opportunity.Classification)
+			t.Fatalf("disconnect result classified as %q", opportunity.Classification)
 		}
 		if len(opportunity.Reasons) != 1 || opportunity.Reasons[0] != "degraded_market_snapshot" {
 			t.Fatalf("unexpected degradation reason: %v", opportunity.Reasons)
 		}
+	}
+}
+
+func TestOlderBlockIsIgnoredWithoutDegradingOrEvaluating(t *testing.T) {
+	fixture, hash := loadExample(t)
+	older := uint64(199)
+	fixture.Feeds[1].Events[1].BlockNumber = &older
+
+	report := runFixture(t, fixture, hash)
+	if report.Status != StatusHealthy || len(report.FeedIncidents) != 0 {
+		t.Fatalf("stale event changed feed health: %+v", report)
+	}
+	if len(report.IgnoredEvents) != 1 || report.IgnoredEvents[0].Reason != "provably_older_source_data" {
+		t.Fatalf("missing stale-event audit evidence: %+v", report.IgnoredEvents)
+	}
+	if report.Evaluations != 1 || len(report.Opportunities) != 4 {
+		t.Fatalf("ignored event triggered evaluation: %+v", report)
 	}
 }
 

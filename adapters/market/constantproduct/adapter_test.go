@@ -2,7 +2,6 @@ package constantproduct_test
 
 import (
 	"context"
-	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -33,20 +32,90 @@ func TestMirrorPublishesImmutableSnapshots(t *testing.T) {
 	}
 }
 
-func TestMirrorMarksCurrentSnapshotDegradedOnSequenceViolation(t *testing.T) {
+func TestMirrorIgnoresOlderBlocksWithoutDegrading(t *testing.T) {
 	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
-	apply(t, mirror, event(t, 1, 1_000_000, 2_000_000))
-	_, err := mirror.Apply(context.Background(), event(t, 3, 1_000_000, 2_000_000))
-	var violation feedport.SequenceViolation
-	if !errors.As(err, &violation) || !violation.IsGap() {
-		t.Fatalf("expected sequence gap, got %v", err)
+	first := apply(t, mirror, event(t, 20, 1_000_000, 2_000_000))
+	result, err := mirror.Apply(context.Background(), event(t, 19, 9_000_000, 9_000_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != feedport.ApplyDispositionIgnoredStale {
+		t.Fatalf("older block disposition = %q", result.Disposition)
 	}
 	current, ok := mirror.Current()
-	if !ok || current.Metadata().Health != market.HealthDegraded || mirror.Health() != market.HealthDegraded {
-		t.Fatal("mirror did not expose degraded health")
+	if !ok || current.Metadata().Health != market.HealthHealthy || mirror.Health() != market.HealthHealthy {
+		t.Fatal("stale event degraded the mirror")
 	}
-	if current.Metadata().Version != 1 {
-		t.Fatal("sequence violation changed market-state version")
+	if current.Metadata().Version != first.Metadata().Version || current.Metadata().StateHash != first.Metadata().StateHash {
+		t.Fatal("stale event changed market state")
+	}
+}
+
+func TestMirrorAcceptsSameAndNonContiguousLaterBlocks(t *testing.T) {
+	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	apply(t, mirror, event(t, 20, 1_000_000, 2_000_000))
+	sameBlock := apply(t, mirror, event(t, 20, 2_000_000, 3_000_000))
+	laterBlock := apply(t, mirror, event(t, 900, 3_000_000, 4_000_000))
+	if sameBlock.Metadata().Version != 2 || laterBlock.Metadata().Version != 3 {
+		t.Fatalf("accepted events have versions %d and %d", sameBlock.Metadata().Version, laterBlock.Metadata().Version)
+	}
+}
+
+func TestMirrorUsesArrivalOrderWithoutComparableSourceEvidence(t *testing.T) {
+	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	first := event(t, 20, 1_000_000, 2_000_000)
+	first.Position = market.SourcePosition{}
+	apply(t, mirror, first)
+	second := event(t, 19, 2_000_000, 3_000_000)
+	second.Position = market.SourcePosition{}
+	second.SourceTimeKnown = false
+	second.SourceTime = time.Time{}
+	if got := apply(t, mirror, second).Metadata().Version; got != 2 {
+		t.Fatalf("arrival-order update version = %d", got)
+	}
+}
+
+func TestMirrorIgnoresOlderKnownTimestampWhenPositionsAreUnknown(t *testing.T) {
+	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	current := event(t, 20, 1_000_000, 2_000_000)
+	current.Position = market.SourcePosition{}
+	apply(t, mirror, current)
+	older := event(t, 21, 9_000_000, 9_000_000)
+	older.Position = market.SourcePosition{}
+	older.SourceTime = current.SourceTime.Add(-time.Second)
+	result, err := mirror.Apply(context.Background(), older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != feedport.ApplyDispositionIgnoredStale || mirror.Health() != market.HealthHealthy {
+		t.Fatalf("older timestamp result = %+v, health = %q", result, mirror.Health())
+	}
+}
+
+func TestMirrorDisconnectIsExplicitAndFreshDataRecoversHealth(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)
+	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return now })
+	healthy := apply(t, mirror, event(t, 20, 1_000_000, 2_000_000))
+	disconnectedAt := now.Add(time.Second)
+	if err := mirror.SetHealth(context.Background(), feedport.HealthUpdate{
+		Health: market.HealthDegraded, Reason: "websocket_disconnected", ObservedAt: disconnectedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	degraded, _ := mirror.Current()
+	if mirror.Health() != market.HealthDegraded || degraded.Metadata().HealthReason != "websocket_disconnected" {
+		t.Fatal("disconnect was not reflected in mirror health")
+	}
+	if degraded.Metadata().Version != healthy.Metadata().Version || degraded.Metadata().StateHash != healthy.Metadata().StateHash {
+		t.Fatal("health transition changed market state")
+	}
+	if healthy.Metadata().Health != market.HealthHealthy {
+		t.Fatal("previous immutable snapshot was mutated")
+	}
+	now = disconnectedAt.Add(time.Second)
+	recovered := apply(t, mirror, event(t, 21, 2_000_000, 3_000_000))
+	if recovered.Metadata().Health != market.HealthHealthy || recovered.Metadata().HealthReason != "" {
+		t.Fatal("fresh event did not restore healthy state")
 	}
 }
 
@@ -92,7 +161,7 @@ func TestQuoterRejectsWrongMarketSnapshot(t *testing.T) {
 func TestMirrorRejectsZeroReserveUpdateWithoutPanicking(t *testing.T) {
 	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: "market", Source: "feed", Sequence: 1, Finality: market.FinalityConfirmed,
+		Market: "market", Source: "feed", Finality: market.FinalityConfirmed,
 		ReceivedAt: time.Now().UTC(), Data: constantproduct.ReserveUpdate{},
 	})
 	if err != nil {
@@ -103,21 +172,22 @@ func TestMirrorRejectsZeroReserveUpdateWithoutPanicking(t *testing.T) {
 	}
 }
 
-func event(t *testing.T, sequence uint64, base, quote int64) market.MarketEvent {
+func event(t *testing.T, block uint64, base, quote int64) market.MarketEvent {
 	t.Helper()
-	return eventForMarket(t, "market", sequence, base, quote)
+	return eventForMarket(t, "market", block, base, quote)
 }
 
-func eventForMarket(t *testing.T, marketID market.MarketID, sequence uint64, base, quote int64) market.MarketEvent {
+func eventForMarket(t *testing.T, marketID market.MarketID, block uint64, base, quote int64) market.MarketEvent {
 	t.Helper()
 	update, err := constantproduct.NewReserveUpdate(big.NewInt(base), big.NewInt(quote), 30)
 	if err != nil {
 		t.Fatal(err)
 	}
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: marketID, Source: "feed", Sequence: sequence, Finality: market.FinalityConfirmed,
-		SourceTime: time.Date(2026, 1, 1, 0, 0, int(sequence), 0, time.UTC), SourceTimeKnown: true,
-		ReceivedAt: time.Date(2026, 1, 1, 0, 0, int(sequence), int(time.Millisecond), time.UTC), Data: update,
+		Market: marketID, Source: "feed", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: block},
+		Finality:   market.FinalityConfirmed,
+		SourceTime: time.Date(2026, 1, 1, 0, 0, int(block%60), 0, time.UTC), SourceTimeKnown: true,
+		ReceivedAt: time.Date(2026, 1, 1, 0, 1, int(block%60), 0, time.UTC), Data: update,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -127,9 +197,9 @@ func eventForMarket(t *testing.T, marketID market.MarketID, sequence uint64, bas
 
 func apply(t *testing.T, mirror *constantproduct.Mirror, event market.MarketEvent) market.MarketSnapshot {
 	t.Helper()
-	snapshot, err := mirror.Apply(context.Background(), event)
+	result, err := mirror.Apply(context.Background(), event)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return snapshot
+	return result.Snapshot
 }

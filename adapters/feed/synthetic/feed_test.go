@@ -14,10 +14,10 @@ type eventData struct{}
 
 func (eventData) EventKind() string { return "test" }
 
-type sink struct{ sequences []uint64 }
+type sink struct{ blocks []uint64 }
 
 func (s *sink) Publish(_ context.Context, event market.MarketEvent) error {
-	s.sequences = append(s.sequences, event.Sequence)
+	s.blocks = append(s.blocks, event.Position.Value)
 	return nil
 }
 
@@ -31,8 +31,8 @@ func TestFeedPublishesEventsInFixtureOrder(t *testing.T) {
 	if err := feed.Run(context.Background(), collector); err != nil {
 		t.Fatal(err)
 	}
-	if len(collector.sequences) != 2 || collector.sequences[0] != 2 || collector.sequences[1] != 1 {
-		t.Fatalf("events were reordered: %v", collector.sequences)
+	if len(collector.blocks) != 2 || collector.blocks[0] != 2 || collector.blocks[1] != 1 {
+		t.Fatalf("events were reordered: %v", collector.blocks)
 	}
 }
 
@@ -48,11 +48,11 @@ func TestFeedHonorsCancellation(t *testing.T) {
 	}
 }
 
-func newEvent(t *testing.T, sequence uint64) market.MarketEvent {
+func newEvent(t *testing.T, block uint64) market.MarketEvent {
 	t.Helper()
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: "market", Source: "source", Sequence: sequence,
-		Finality: market.FinalityConfirmed, ReceivedAt: time.Date(2026, 1, 1, 0, 0, int(sequence), 0, time.UTC),
+		Market: "market", Source: "source", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: block},
+		Finality: market.FinalityConfirmed, ReceivedAt: time.Date(2026, 1, 1, 0, 0, int(block), 0, time.UTC),
 		Data: eventData{},
 	})
 	if err != nil {

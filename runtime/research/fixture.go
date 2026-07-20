@@ -103,22 +103,30 @@ type StrategyFixture struct {
 }
 
 type FeedFixture struct {
-	Market string         `json:"market"`
-	Source string         `json:"source"`
-	Events []EventFixture `json:"events"`
+	Market     string             `json:"market"`
+	Source     string             `json:"source"`
+	Events     []EventFixture     `json:"events"`
+	Disconnect *DisconnectFixture `json:"disconnect,omitempty"`
 }
 
 type EventFixture struct {
-	Sequence             uint64 `json:"sequence"`
-	Finality             string `json:"finality"`
-	SourceTime           string `json:"source_time,omitempty"`
-	ReceivedAt           string `json:"received_at"`
-	AppliedAt            string `json:"applied_at"`
+	BlockNumber          *uint64 `json:"block_number,omitempty"`
+	Finality             string  `json:"finality"`
+	SourceTime           string  `json:"source_time,omitempty"`
+	ReceivedAt           string  `json:"received_at"`
+	AppliedAt            string  `json:"applied_at"`
+	EvaluationStartedAt  string  `json:"evaluation_started_at"`
+	EvaluationFinishedAt string  `json:"evaluation_finished_at"`
+	BaseReserve          string  `json:"base_reserve"`
+	QuoteReserve         string  `json:"quote_reserve"`
+	FeeBPS               uint16  `json:"fee_bps"`
+}
+
+type DisconnectFixture struct {
+	Reason               string `json:"reason"`
+	ObservedAt           string `json:"observed_at"`
 	EvaluationStartedAt  string `json:"evaluation_started_at"`
 	EvaluationFinishedAt string `json:"evaluation_finished_at"`
-	BaseReserve          string `json:"base_reserve"`
-	QuoteReserve         string `json:"quote_reserve"`
-	FeeBPS               uint16 `json:"fee_bps"`
 }
 
 func ParseFixture(data []byte) (Fixture, string, error) {

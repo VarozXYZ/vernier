@@ -31,9 +31,11 @@ snapshot versions and hashes, local quotes, costs, classifications, and times.
 
 The demonstration processes normalized events into constant-product mirrors,
 takes immutable snapshots, and evaluates both directions for two strategies
-that share the same market infrastructure. Sequence gaps are reported as
-explicit degradation and produce `unclassifiable` results; they are not hidden
-as an absence of market opportunity.
+that share the same market infrastructure. Arrival order updates a mirror unless
+comparable source metadata (currently a block number or known timestamp) proves
+an event is older, in which case it is ignored and audited without degrading the
+mirror. Explicit feed-liveness failures, such as a WebSocket disconnect, degrade
+the mirror and produce `unclassifiable` results until fresh data arrives.
 
 ## Development
 

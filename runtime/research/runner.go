@@ -2,7 +2,6 @@ package research
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/big"
 	"sync"
@@ -27,12 +26,19 @@ const (
 	StatusDegraded Status = "degraded"
 )
 
-type Gap struct {
+type IgnoredEvent struct {
+	Market          market.MarketID
+	Reason          string
+	Position        market.SourcePosition
+	CurrentPosition market.SourcePosition
+	ReceivedAt      time.Time
+}
+
+type FeedIncident struct {
 	Market     market.MarketID
-	Expected   uint64
-	Actual     uint64
-	Kind       string
-	ReceivedAt time.Time
+	Health     market.Health
+	Reason     string
+	ObservedAt time.Time
 }
 
 type Report struct {
@@ -41,7 +47,8 @@ type Report struct {
 	Status        Status
 	Evaluations   int
 	Opportunities []arbitrage.Opportunity
-	Gaps          []Gap
+	IgnoredEvents []IgnoredEvent
+	FeedIncidents []FeedIncident
 }
 
 type Runner struct {
@@ -60,14 +67,21 @@ type Runner struct {
 }
 
 type builtFeed struct {
-	feed    *synthetic.Feed
-	mirror  feedport.Mirror
-	clock   *manualClock
-	timings []eventTiming
+	feed       *synthetic.Feed
+	mirror     feedport.Mirror
+	clock      *manualClock
+	timings    []eventTiming
+	disconnect *disconnectTiming
 }
 
 type eventTiming struct {
 	appliedAt  time.Time
+	startedAt  time.Time
+	finishedAt time.Time
+}
+
+type disconnectTiming struct {
+	update     feedport.HealthUpdate
 	startedAt  time.Time
 	finishedAt time.Time
 }
@@ -159,7 +173,13 @@ func NewRunner(fixture Fixture, configHash string) (*Runner, error) {
 		}
 		mirrors[marketID] = mirror
 		quoteSources[marketID] = quoter
-		feeds = append(feeds, builtFeed{feed: feed, mirror: mirror, clock: clock, timings: timings})
+		disconnect, err := buildDisconnect(configuredFeed)
+		if err != nil {
+			return nil, err
+		}
+		feeds = append(feeds, builtFeed{
+			feed: feed, mirror: mirror, clock: clock, timings: timings, disconnect: disconnect,
+		})
 	}
 	for _, marketID := range setupMarkets {
 		if _, exists := seenFeeds[marketID]; !exists {
@@ -216,6 +236,22 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		if err := configured.feed.Run(ctx, sink); err != nil {
 			return Report{}, err
 		}
+		if configured.disconnect != nil {
+			incident := configured.disconnect
+			if err := configured.mirror.SetHealth(ctx, incident.update); err != nil {
+				return Report{}, err
+			}
+			r.report.Status = StatusDegraded
+			r.report.FeedIncidents = append(r.report.FeedIncidents, FeedIncident{
+				Market: configured.mirror.MarketID(), Health: incident.update.Health,
+				Reason: incident.update.Reason, ObservedAt: incident.update.ObservedAt,
+			})
+			if err := r.evaluate(ctx, incident.update.ObservedAt, eventTiming{
+				startedAt: incident.startedAt, finishedAt: incident.finishedAt,
+			}); err != nil {
+				return Report{}, err
+			}
+		}
 	}
 	return r.report, nil
 }
@@ -235,26 +271,28 @@ func (s *runtimeSink) Publish(ctx context.Context, event market.MarketEvent) err
 	timing := s.timings[s.index]
 	s.index++
 	s.clock.Set(timing.appliedAt)
-	_, err := s.mirror.Apply(ctx, event)
+	result, err := s.mirror.Apply(ctx, event)
 	if err != nil {
-		var violation feedport.SequenceViolation
-		if !errors.As(err, &violation) {
-			return err
-		}
-		kind := "duplicate_or_out_of_order"
-		if violation.IsGap() {
-			kind = "gap"
-		}
-		s.runner.report.Status = StatusDegraded
-		s.runner.report.Gaps = append(s.runner.report.Gaps, Gap{
-			Market: violation.Market, Expected: violation.Expected, Actual: violation.Actual,
-			Kind: kind, ReceivedAt: event.ReceivedAt,
-		})
+		return err
 	}
-	return s.runner.evaluate(ctx, event, timing)
+	if err := result.Validate(); err != nil {
+		return err
+	}
+	switch result.Disposition {
+	case feedport.ApplyDispositionIgnoredStale:
+		s.runner.report.IgnoredEvents = append(s.runner.report.IgnoredEvents, IgnoredEvent{
+			Market: event.Market, Reason: "provably_older_source_data", Position: event.Position,
+			CurrentPosition: result.Snapshot.Metadata().EventPosition, ReceivedAt: event.ReceivedAt,
+		})
+		return nil
+	case feedport.ApplyDispositionApplied:
+		return s.runner.evaluate(ctx, event.ReceivedAt, timing)
+	default:
+		return fmt.Errorf("unsupported apply disposition %q", result.Disposition)
+	}
 }
 
-func (r *Runner) evaluate(ctx context.Context, event market.MarketEvent, timing eventTiming) error {
+func (r *Runner) evaluate(ctx context.Context, triggeredAt time.Time, timing eventTiming) error {
 	snapshots := make([]market.MarketSnapshot, 0, len(r.setup.Markets()))
 	for _, marketID := range r.setup.Markets() {
 		snapshot, exists := r.mirrors[marketID].Current()
@@ -272,7 +310,7 @@ func (r *Runner) evaluate(ctx context.Context, event market.MarketEvent, timing 
 	opportunities, err := r.evaluator.Evaluate(ctx, coreresearch.EvaluationRequest{
 		IDPrefix: fmt.Sprintf("evaluation-%04d", r.report.Evaluations), Run: r.runID,
 		ConfigHash: r.configHash, Snapshots: snapshots, Cost: cost,
-		TriggeredAt: event.ReceivedAt, StartedAt: timing.startedAt, MaxSnapshotAge: r.maxAge,
+		TriggeredAt: triggeredAt, StartedAt: timing.startedAt, MaxSnapshotAge: r.maxAge,
 	})
 	if err != nil {
 		return err
@@ -370,7 +408,10 @@ func buildEvents(fixture FeedFixture) ([]market.MarketEvent, []eventTiming, erro
 		}
 		event := market.MarketEvent{
 			Market: market.MarketID(fixture.Market), Source: market.SourceID(fixture.Source),
-			Sequence: configured.Sequence, Finality: finality, ReceivedAt: receivedAt, Data: update,
+			Finality: finality, ReceivedAt: receivedAt, Data: update,
+		}
+		if configured.BlockNumber != nil {
+			event.Position = market.SourcePosition{Kind: market.SourcePositionBlock, Value: *configured.BlockNumber}
 		}
 		if configured.SourceTime != "" {
 			event.SourceTime, err = parseTimestamp("source_time", configured.SourceTime)
@@ -390,6 +431,37 @@ func buildEvents(fixture FeedFixture) ([]market.MarketEvent, []eventTiming, erro
 		timings = append(timings, eventTiming{appliedAt: appliedAt, startedAt: startedAt, finishedAt: finishedAt})
 	}
 	return events, timings, nil
+}
+
+func buildDisconnect(fixture FeedFixture) (*disconnectTiming, error) {
+	if fixture.Disconnect == nil {
+		return nil, nil
+	}
+	configured := fixture.Disconnect
+	if configured.Reason == "" {
+		return nil, fmt.Errorf("feed %q disconnect requires a reason", fixture.Market)
+	}
+	observedAt, err := parseTimestamp("disconnect observed_at", configured.ObservedAt)
+	if err != nil {
+		return nil, err
+	}
+	startedAt, err := parseTimestamp("disconnect evaluation_started_at", configured.EvaluationStartedAt)
+	if err != nil {
+		return nil, err
+	}
+	finishedAt, err := parseTimestamp("disconnect evaluation_finished_at", configured.EvaluationFinishedAt)
+	if err != nil {
+		return nil, err
+	}
+	if startedAt.Before(observedAt) || finishedAt.Before(startedAt) {
+		return nil, fmt.Errorf("feed %q disconnect timestamps are not causal", fixture.Market)
+	}
+	return &disconnectTiming{
+		update: feedport.HealthUpdate{
+			Health: market.HealthDegraded, Reason: configured.Reason, ObservedAt: observedAt,
+		},
+		startedAt: startedAt, finishedAt: finishedAt,
+	}, nil
 }
 
 func parseTimestamp(field, value string) (time.Time, error) {

@@ -58,8 +58,10 @@ func (researchSnapshotData) SnapshotKind() string { return "test" }
 func researchSnapshot(t *testing.T, id market.MarketID, version uint64, now time.Time) market.MarketSnapshot {
 	t.Helper()
 	snapshot, err := market.NewMarketSnapshot(market.SnapshotMetadata{
-		Market: id, Source: "source", Version: version, EventSequence: version,
-		Finality: market.FinalityConfirmed, ReceivedAt: now, AppliedAt: now, Health: market.HealthHealthy,
+		Market: id, Source: "source", Version: version,
+		EventPosition: market.SourcePosition{Kind: market.SourcePositionBlock, Value: version},
+		Finality:      market.FinalityConfirmed, ReceivedAt: now, AppliedAt: now,
+		Health: market.HealthHealthy, HealthChangedAt: now,
 	}, researchSnapshotData{})
 	if err != nil {
 		t.Fatal(err)

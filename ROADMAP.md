@@ -13,7 +13,7 @@ Status: implemented as an offline synthetic vertical slice.
 ## 2. Durable Research
 
 Persist runs and market history, reconstruct opportunity windows, compare
-settings, and make data gaps explicit.
+settings, and make source health and data-quality incidents explicit.
 
 ## 3. Generality
 

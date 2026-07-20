@@ -18,7 +18,7 @@ func (d testSnapshotData) SnapshotKind() string { return d.kind }
 func TestMarketEventNormalizesTimestamps(t *testing.T) {
 	zone := time.FixedZone("test", 3600)
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: "market", Source: "source", Sequence: 1,
+		Market: "market", Source: "source", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
 		Finality:   market.FinalityConfirmed,
 		SourceTime: time.Date(2026, 1, 1, 1, 0, 0, 0, zone), SourceTimeKnown: true,
 		ReceivedAt: time.Date(2026, 1, 1, 1, 0, 1, 0, zone),
@@ -35,9 +35,10 @@ func TestMarketEventNormalizesTimestamps(t *testing.T) {
 func TestSnapshotCopiesMetadataAndReportsAge(t *testing.T) {
 	received := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	metadata := market.SnapshotMetadata{
-		Market: "market", Source: "source", Version: 1, EventSequence: 1,
-		Finality: market.FinalityConfirmed, ReceivedAt: received, AppliedAt: received,
-		Health: market.HealthHealthy,
+		Market: "market", Source: "source", Version: 1,
+		EventPosition: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
+		Finality:      market.FinalityConfirmed, ReceivedAt: received, AppliedAt: received,
+		Health: market.HealthHealthy, HealthChangedAt: received,
 	}
 	snapshot, err := market.NewMarketSnapshot(metadata, testSnapshotData{kind: "test"})
 	if err != nil {
@@ -53,10 +54,21 @@ func TestSnapshotCopiesMetadataAndReportsAge(t *testing.T) {
 }
 
 func TestStateConstructorsRejectMissingPayloads(t *testing.T) {
-	if _, err := market.NewMarketEvent(market.MarketEvent{Market: "m", Source: "s", Sequence: 1, ReceivedAt: time.Now()}); err == nil {
+	if _, err := market.NewMarketEvent(market.MarketEvent{Market: "m", Source: "s", ReceivedAt: time.Now()}); err == nil {
 		t.Fatal("expected event without payload to fail")
 	}
-	if _, err := market.NewMarketSnapshot(market.SnapshotMetadata{Market: "m", Source: "s", Version: 1, EventSequence: 1, ReceivedAt: time.Now(), AppliedAt: time.Now(), Health: market.HealthHealthy}, nil); err == nil {
+	if _, err := market.NewMarketSnapshot(market.SnapshotMetadata{Market: "m", Source: "s", Version: 1, ReceivedAt: time.Now(), AppliedAt: time.Now(), Health: market.HealthHealthy, HealthChangedAt: time.Now()}, nil); err == nil {
 		t.Fatal("expected snapshot without payload to fail")
+	}
+}
+
+func TestSourcePositionsCompareOnlyWithinTheSameKnownKind(t *testing.T) {
+	block10 := market.SourcePosition{Kind: market.SourcePositionBlock, Value: 10}
+	block11 := market.SourcePosition{Kind: market.SourcePositionBlock, Value: 11}
+	if comparison, ok := block10.Compare(block11); !ok || comparison != -1 {
+		t.Fatalf("unexpected comparison: %d, %v", comparison, ok)
+	}
+	if _, ok := block10.Compare(market.SourcePosition{}); ok {
+		t.Fatal("known and unknown positions must not be comparable")
 	}
 }

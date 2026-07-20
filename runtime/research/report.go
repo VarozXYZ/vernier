@@ -20,8 +20,9 @@ func WriteJSON(writer io.Writer, report Report) error {
 }
 
 func WriteText(writer io.Writer, report Report) error {
-	if _, err := fmt.Fprintf(writer, "Vernier deterministic Research\nrun: %s\nstatus: %s\nconfig: %s\nevaluations: %d\nopportunities: %d\ngaps: %d\n",
-		report.RunID, report.Status, report.ConfigHash, report.Evaluations, len(report.Opportunities), len(report.Gaps)); err != nil {
+	if _, err := fmt.Fprintf(writer, "Vernier deterministic Research\nrun: %s\nstatus: %s\nconfig: %s\nevaluations: %d\nopportunities: %d\nignored_events: %d\nfeed_incidents: %d\n",
+		report.RunID, report.Status, report.ConfigHash, report.Evaluations, len(report.Opportunities),
+		len(report.IgnoredEvents), len(report.FeedIncidents)); err != nil {
 		return err
 	}
 	for _, opportunity := range report.Opportunities {
@@ -39,13 +40,14 @@ func WriteText(writer io.Writer, report Report) error {
 }
 
 type reportDTO struct {
-	SchemaVersion int              `json:"schema_version"`
-	RunID         string           `json:"run_id"`
-	ConfigHash    string           `json:"config_hash"`
-	Status        Status           `json:"status"`
-	Evaluations   int              `json:"evaluations"`
-	Opportunities []opportunityDTO `json:"opportunities"`
-	Gaps          []gapDTO         `json:"gaps"`
+	SchemaVersion int               `json:"schema_version"`
+	RunID         string            `json:"run_id"`
+	ConfigHash    string            `json:"config_hash"`
+	Status        Status            `json:"status"`
+	Evaluations   int               `json:"evaluations"`
+	Opportunities []opportunityDTO  `json:"opportunities"`
+	IgnoredEvents []ignoredEventDTO `json:"ignored_events"`
+	FeedIncidents []feedIncidentDTO `json:"feed_incidents"`
 }
 
 type opportunityDTO struct {
@@ -67,17 +69,24 @@ type opportunityDTO struct {
 }
 
 type snapshotDTO struct {
-	Market          string `json:"market"`
-	Source          string `json:"source"`
-	Version         uint64 `json:"version"`
-	EventSequence   uint64 `json:"event_sequence"`
-	Finality        string `json:"finality"`
-	SourceTime      string `json:"source_time,omitempty"`
-	SourceTimeKnown bool   `json:"source_time_known"`
-	ReceivedAt      string `json:"received_at"`
-	AppliedAt       string `json:"applied_at"`
-	Health          string `json:"health"`
-	StateHash       string `json:"state_hash"`
+	Market          string             `json:"market"`
+	Source          string             `json:"source"`
+	Version         uint64             `json:"version"`
+	SourcePosition  *sourcePositionDTO `json:"source_position,omitempty"`
+	Finality        string             `json:"finality"`
+	SourceTime      string             `json:"source_time,omitempty"`
+	SourceTimeKnown bool               `json:"source_time_known"`
+	ReceivedAt      string             `json:"received_at"`
+	AppliedAt       string             `json:"applied_at"`
+	Health          string             `json:"health"`
+	HealthReason    string             `json:"health_reason,omitempty"`
+	HealthChangedAt string             `json:"health_changed_at"`
+	StateHash       string             `json:"state_hash"`
+}
+
+type sourcePositionDTO struct {
+	Kind  string `json:"kind"`
+	Value uint64 `json:"value"`
 }
 
 type candidateDTO struct {
@@ -116,12 +125,19 @@ type quoteDTO struct {
 	QuotedAt        string `json:"quoted_at"`
 }
 
-type gapDTO struct {
+type ignoredEventDTO struct {
+	Market          string             `json:"market"`
+	Reason          string             `json:"reason"`
+	SourcePosition  *sourcePositionDTO `json:"source_position,omitempty"`
+	CurrentPosition *sourcePositionDTO `json:"current_position,omitempty"`
+	ReceivedAt      string             `json:"received_at"`
+}
+
+type feedIncidentDTO struct {
 	Market     string `json:"market"`
-	Expected   uint64 `json:"expected"`
-	Actual     uint64 `json:"actual"`
-	Kind       string `json:"kind"`
-	ReceivedAt string `json:"received_at"`
+	Health     string `json:"health"`
+	Reason     string `json:"reason"`
+	ObservedAt string `json:"observed_at"`
 }
 
 func newReportDTO(report Report) reportDTO {
@@ -129,15 +145,23 @@ func newReportDTO(report Report) reportDTO {
 		SchemaVersion: 1, RunID: string(report.RunID), ConfigHash: report.ConfigHash,
 		Status: report.Status, Evaluations: report.Evaluations,
 		Opportunities: make([]opportunityDTO, 0, len(report.Opportunities)),
-		Gaps:          make([]gapDTO, 0, len(report.Gaps)),
+		IgnoredEvents: make([]ignoredEventDTO, 0, len(report.IgnoredEvents)),
+		FeedIncidents: make([]feedIncidentDTO, 0, len(report.FeedIncidents)),
 	}
 	for _, opportunity := range report.Opportunities {
 		dto.Opportunities = append(dto.Opportunities, newOpportunityDTO(opportunity))
 	}
-	for _, gap := range report.Gaps {
-		dto.Gaps = append(dto.Gaps, gapDTO{
-			Market: string(gap.Market), Expected: gap.Expected, Actual: gap.Actual,
-			Kind: gap.Kind, ReceivedAt: formatTime(gap.ReceivedAt),
+	for _, ignored := range report.IgnoredEvents {
+		dto.IgnoredEvents = append(dto.IgnoredEvents, ignoredEventDTO{
+			Market: string(ignored.Market), Reason: ignored.Reason,
+			SourcePosition: sourcePosition(ignored.Position), CurrentPosition: sourcePosition(ignored.CurrentPosition),
+			ReceivedAt: formatTime(ignored.ReceivedAt),
+		})
+	}
+	for _, incident := range report.FeedIncidents {
+		dto.FeedIncidents = append(dto.FeedIncidents, feedIncidentDTO{
+			Market: string(incident.Market), Health: string(incident.Health),
+			Reason: incident.Reason, ObservedAt: formatTime(incident.ObservedAt),
 		})
 	}
 	return dto
@@ -171,15 +195,23 @@ func newOpportunityDTO(opportunity arbitrage.Opportunity) opportunityDTO {
 func snapshot(metadata market.SnapshotMetadata) snapshotDTO {
 	dto := snapshotDTO{
 		Market: string(metadata.Market), Source: string(metadata.Source), Version: metadata.Version,
-		EventSequence: metadata.EventSequence, Finality: string(metadata.Finality),
+		SourcePosition: sourcePosition(metadata.EventPosition), Finality: string(metadata.Finality),
 		SourceTimeKnown: metadata.SourceTimeKnown, ReceivedAt: formatTime(metadata.ReceivedAt),
-		AppliedAt: formatTime(metadata.AppliedAt), Health: string(metadata.Health),
-		StateHash: hex.EncodeToString(metadata.StateHash[:]),
+		AppliedAt: formatTime(metadata.AppliedAt), Health: string(metadata.Health), HealthReason: metadata.HealthReason,
+		HealthChangedAt: formatTime(metadata.HealthChangedAt),
+		StateHash:       hex.EncodeToString(metadata.StateHash[:]),
 	}
 	if metadata.SourceTimeKnown {
 		dto.SourceTime = formatTime(metadata.SourceTime)
 	}
 	return dto
+}
+
+func sourcePosition(position market.SourcePosition) *sourcePositionDTO {
+	if !position.Known() {
+		return nil
+	}
+	return &sourcePositionDTO{Kind: string(position.Kind), Value: position.Value}
 }
 
 func quantity(value market.AssetQuantity) quantityDTO {

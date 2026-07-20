@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
 
 func TestRunTextMatchesGolden(t *testing.T) {
@@ -52,9 +55,21 @@ func TestRunReturnsSuccessForExplicitDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	degraded := strings.Replace(string(data), `"sequence": 2`, `"sequence": 3`, 1)
+	configured, _, err := runtimeresearch.ParseFixture(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured.Feeds[1].Disconnect = &runtimeresearch.DisconnectFixture{
+		Reason: "websocket_disconnected", ObservedAt: "2026-01-01T00:00:03.100Z",
+		EvaluationStartedAt:  "2026-01-01T00:00:03.120Z",
+		EvaluationFinishedAt: "2026-01-01T00:00:03.130Z",
+	}
+	degraded, err := json.MarshalIndent(configured, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
 	fixture := filepath.Join(t.TempDir(), "degraded.json")
-	if err := os.WriteFile(fixture, []byte(degraded), 0o600); err != nil {
+	if err := os.WriteFile(fixture, degraded, 0o600); err != nil {
 		t.Fatal(err)
 	}
 

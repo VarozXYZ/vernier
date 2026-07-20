@@ -53,9 +53,10 @@ func TestEvaluationFixesUniqueSnapshots(t *testing.T) {
 func testSnapshot(t *testing.T, id market.MarketID, now time.Time) market.MarketSnapshot {
 	t.Helper()
 	snapshot, err := market.NewMarketSnapshot(market.SnapshotMetadata{
-		Market: id, Source: "source", Version: 1, EventSequence: 1,
-		Finality: market.FinalityConfirmed, ReceivedAt: now, AppliedAt: now,
-		Health: market.HealthHealthy,
+		Market: id, Source: "source", Version: 1,
+		EventPosition: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
+		Finality:      market.FinalityConfirmed, ReceivedAt: now, AppliedAt: now,
+		Health: market.HealthHealthy, HealthChangedAt: now,
 	}, snapshotData{})
 	if err != nil {
 		t.Fatal(err)

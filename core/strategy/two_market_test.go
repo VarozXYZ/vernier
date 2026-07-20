@@ -81,6 +81,8 @@ func TestTwoMarketMarksStaleAndDegradedSnapshotsUnclassifiable(t *testing.T) {
 
 	degraded := fixture.snapshots[0].Metadata()
 	degraded.Health = market.HealthDegraded
+	degraded.HealthReason = "websocket_disconnected"
+	degraded.HealthChangedAt = fixture.now.Add(time.Second)
 	degradedSnapshot, err := market.NewMarketSnapshot(degraded, fixture.snapshots[0].Data())
 	if err != nil {
 		t.Fatal(err)
@@ -172,17 +174,18 @@ func strategySnapshot(t *testing.T, marketID market.MarketID, base, quote string
 		t.Fatal(err)
 	}
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: marketID, Source: "feed", Sequence: 1, Finality: market.FinalityConfirmed,
+		Market: marketID, Source: "feed", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
+		Finality:   market.FinalityConfirmed,
 		SourceTime: now.Add(-time.Millisecond), SourceTimeKnown: true, ReceivedAt: now, Data: update,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := mirror.Apply(context.Background(), event)
+	result, err := mirror.Apply(context.Background(), event)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return snapshot
+	return result.Snapshot
 }
 
 func strategyRegistry(t *testing.T) *market.Registry {
