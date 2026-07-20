@@ -144,7 +144,7 @@ type InitializeUpdate struct {
 
 func NewInitializeUpdate(sqrtPriceX96 *big.Int, tick int32) (InitializeUpdate, error) {
 	if sqrtPriceX96 == nil {
-		return InitializeUpdate{}, fmt.Errorf("Uniswap V3 initialization price is required")
+		return InitializeUpdate{}, fmt.Errorf("uniswap V3 initialization price is required")
 	}
 	if err := validateTickPrice(tick, sqrtPriceX96); err != nil {
 		return InitializeUpdate{}, err
@@ -160,7 +160,7 @@ type BlockUpdate struct {
 
 func NewBlockUpdate(updates ...market.EventData) (BlockUpdate, error) {
 	if len(updates) == 0 {
-		return BlockUpdate{}, fmt.Errorf("Uniswap V3 block update requires events")
+		return BlockUpdate{}, fmt.Errorf("uniswap V3 block update requires events")
 	}
 	result := BlockUpdate{updates: append([]market.EventData(nil), updates...)}
 	for _, update := range result.updates {

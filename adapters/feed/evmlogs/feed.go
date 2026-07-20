@@ -150,12 +150,12 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 			return true, false, ctx.Err()
 		case err, open := <-subscription.Err():
 			if !open || err == nil {
-				err = fmt.Errorf("Ethereum log subscription closed")
+				err = fmt.Errorf("ethereum log subscription closed")
 			}
 			return true, true, err
 		case observed, open := <-logs:
 			if !open {
-				return true, true, fmt.Errorf("Ethereum log stream closed")
+				return true, true, fmt.Errorf("ethereum log stream closed")
 			}
 			if observed.Removed || observed.BlockNumber < highest {
 				continue
