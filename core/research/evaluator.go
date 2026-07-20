@@ -12,14 +12,13 @@ import (
 )
 
 type EvaluationRequest struct {
-	IDPrefix       string
-	Run            arbitrage.ResearchRunID
-	ConfigHash     string
-	Snapshots      []market.MarketSnapshot
-	Cost           arbitrage.CostSnapshot
-	TriggeredAt    time.Time
-	StartedAt      time.Time
-	MaxSnapshotAge time.Duration
+	IDPrefix    string
+	Run         arbitrage.ResearchRunID
+	ConfigHash  string
+	Snapshots   []market.MarketSnapshot
+	Cost        arbitrage.CostSnapshot
+	TriggeredAt time.Time
+	StartedAt   time.Time
 }
 
 type Evaluator struct {
@@ -52,7 +51,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, request EvaluationRequest) ([]
 		evaluation, err := arbitrage.NewEvaluation(
 			arbitrage.EvaluationID(fmt.Sprintf("%s/%s", request.IDPrefix, candidate.ID())),
 			request.Run, candidate.ID(), request.ConfigHash, request.Snapshots, request.Cost,
-			request.TriggeredAt, request.StartedAt, request.MaxSnapshotAge,
+			request.TriggeredAt, request.StartedAt,
 		)
 		if err != nil {
 			return nil, err

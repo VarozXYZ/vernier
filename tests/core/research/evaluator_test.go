@@ -38,7 +38,7 @@ func TestEvaluatorSharesTheSameSnapshotVersionsAcrossStrategies(t *testing.T) {
 	results, err := evaluator.Evaluate(context.Background(), research.EvaluationRequest{
 		IDPrefix: "evaluation", Run: "run", ConfigHash: "hash", Snapshots: snapshots,
 		Cost:        arbitrage.CostSnapshot{ID: "cost", Amount: costAmount, CapturedAt: now},
-		TriggeredAt: now, StartedAt: now, MaxSnapshotAge: time.Second,
+		TriggeredAt: now, StartedAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)

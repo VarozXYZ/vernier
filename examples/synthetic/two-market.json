@@ -1,7 +1,6 @@
 {
   "schema_version": 1,
   "run_id": "synthetic-two-market",
-  "max_snapshot_age": "5s",
   "fixed_cost": "0.5",
   "catalog": {
     "chains": [
