@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -112,11 +113,11 @@ func checkPublicTree() error {
 
 	var forbidden []string
 	for _, file := range files {
-		path := strings.ToLower(filepath.ToSlash(file))
-		base := filepath.Base(path)
-		if path == "agents.md" || strings.HasSuffix(path, "/agents.md") ||
-			path == "agents.override.md" || strings.HasSuffix(path, "/agents.override.md") ||
-			strings.HasPrefix(path, "docs/") || base == ".env" || strings.HasPrefix(base, ".env.") {
+		normalized := strings.ToLower(filepath.ToSlash(file))
+		base := pathpkg.Base(normalized)
+		if normalized == "agents.md" || strings.HasSuffix(normalized, "/agents.md") ||
+			normalized == "agents.override.md" || strings.HasSuffix(normalized, "/agents.override.md") ||
+			strings.HasPrefix(normalized, "docs/") || base == ".env" || strings.HasPrefix(base, ".env.") {
 			forbidden = append(forbidden, file)
 		}
 	}
