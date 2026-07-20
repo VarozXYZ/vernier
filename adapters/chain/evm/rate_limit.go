@@ -84,21 +84,30 @@ func (n *RateLimitedNetwork) CodeAt(
 func (n *RateLimitedNetwork) Close() { n.delegate.Close() }
 
 func (n *RateLimitedNetwork) wait(ctx context.Context) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	now := time.Now()
-	if delay := time.Until(n.next); delay > 0 {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-		}
-		now = time.Now()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	n.next = now.Add(n.interval)
-	return nil
+	n.mu.Lock()
+	now := time.Now()
+	scheduled := now
+	if n.next.After(now) {
+		scheduled = n.next
+	}
+	n.next = scheduled.Add(n.interval)
+	n.mu.Unlock()
+
+	delay := time.Until(scheduled)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 var _ Network = (*RateLimitedNetwork)(nil)
