@@ -77,7 +77,7 @@
   },
   "strategies": [
     { "id": "baseline", "sizes": ["10", "20"], "threshold": "1" },
-    { "id": "conservative", "sizes": ["10", "20"], "threshold": "4" }
+    { "id": "conservative", "sizes": ["10", "20"], "threshold": "7" }
   ],
   "feeds": [
     {
