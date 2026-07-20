@@ -59,7 +59,6 @@ type Runner struct {
 	configHash    string
 	setup         arbitrage.ArbitrageSetup
 	registry      *market.Registry
-	maxAge        time.Duration
 	cost          costing.Fixed
 	evaluator     *coreresearch.Evaluator
 	strategyClock *manualClock
@@ -109,10 +108,6 @@ func (c *manualClock) Set(value time.Time) {
 func NewRunner(fixture Fixture, configHash string) (*Runner, error) {
 	if fixture.RunID == "" || configHash == "" {
 		return nil, fmt.Errorf("run ID and config hash are required")
-	}
-	maxAge, err := time.ParseDuration(fixture.MaxSnapshotAge)
-	if err != nil || maxAge < 0 {
-		return nil, fmt.Errorf("invalid max_snapshot_age %q", fixture.MaxSnapshotAge)
 	}
 	registry, err := buildRegistry(fixture.Catalog)
 	if err != nil {
@@ -218,7 +213,7 @@ func NewRunner(fixture Fixture, configHash string) (*Runner, error) {
 	}
 	return &Runner{
 		runID: arbitrage.ResearchRunID(fixture.RunID), configHash: configHash, setup: setup,
-		registry: registry, maxAge: maxAge, cost: costSource, evaluator: evaluator,
+		registry: registry, cost: costSource, evaluator: evaluator,
 		strategyClock: strategyClock, mirrors: mirrors, feeds: feeds,
 	}, nil
 }
@@ -313,7 +308,7 @@ func (r *Runner) evaluate(ctx context.Context, triggeredAt time.Time, timing eve
 	opportunities, err := r.evaluator.Evaluate(ctx, coreresearch.EvaluationRequest{
 		IDPrefix: fmt.Sprintf("evaluation-%04d", r.report.Evaluations), Run: r.runID,
 		ConfigHash: r.configHash, Snapshots: snapshots, Cost: cost,
-		TriggeredAt: triggeredAt, StartedAt: timing.startedAt, MaxSnapshotAge: r.maxAge,
+		TriggeredAt: triggeredAt, StartedAt: timing.startedAt,
 	})
 	if err != nil {
 		return err

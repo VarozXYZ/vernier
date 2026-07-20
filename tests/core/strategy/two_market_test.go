@@ -18,7 +18,7 @@ import (
 
 func TestTwoMarketEvaluatesBothDirectionsWithExactDecimals(t *testing.T) {
 	fixture := newStrategyFixture(t, "1", "0.5")
-	opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now, time.Second))
+	opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestTwoMarketSeparatesEconomicClassifications(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newStrategyFixture(t, test.threshold, test.cost)
-			opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now, time.Second))
+			opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -70,15 +70,14 @@ func TestTwoMarketSeparatesEconomicClassifications(t *testing.T) {
 	}
 }
 
-func TestTwoMarketMarksStaleAndDegradedSnapshotsUnclassifiable(t *testing.T) {
+func TestTwoMarketUsesHealthySnapshotsWithoutAgeExpiry(t *testing.T) {
 	fixture := newStrategyFixture(t, "1", "0.5")
-	staleEvaluation := fixture.evaluation(t, fixture.snapshots, fixture.now.Add(10*time.Second), time.Second)
-	stale, err := fixture.strategy.Evaluate(context.Background(), staleEvaluation)
+	oldButHealthy, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now.Add(24*time.Hour)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stale[0].Classification != arbitrage.ClassificationUnclassifiable || stale[0].Reasons[0] != "stale_market_snapshot" {
-		t.Fatalf("unexpected stale result: %+v", stale[0])
+	if oldButHealthy[0].Classification == arbitrage.ClassificationUnclassifiable {
+		t.Fatalf("healthy snapshot expired by age: %+v", oldButHealthy[0])
 	}
 
 	degraded := fixture.snapshots[0].Metadata()
@@ -90,7 +89,7 @@ func TestTwoMarketMarksStaleAndDegradedSnapshotsUnclassifiable(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshots := []market.MarketSnapshot{degradedSnapshot, fixture.snapshots[1]}
-	results, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, snapshots, fixture.now, time.Second))
+	results, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, snapshots, fixture.now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,11 +141,11 @@ func newStrategyFixture(t *testing.T, thresholdText, costText string) strategyFi
 	}
 }
 
-func (f strategyFixture) evaluation(t *testing.T, snapshots []market.MarketSnapshot, started time.Time, maxAge time.Duration) arbitrage.Evaluation {
+func (f strategyFixture) evaluation(t *testing.T, snapshots []market.MarketSnapshot, started time.Time) arbitrage.Evaluation {
 	t.Helper()
 	evaluation, err := arbitrage.NewEvaluation(
 		"evaluation", "run", "strategy", "config-hash", snapshots, f.cost,
-		f.now, started, maxAge,
+		f.now, started,
 	)
 	if err != nil {
 		t.Fatal(err)

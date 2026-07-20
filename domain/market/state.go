@@ -184,7 +184,3 @@ func NewMarketSnapshot(metadata SnapshotMetadata, data SnapshotData) (MarketSnap
 
 func (s MarketSnapshot) Metadata() SnapshotMetadata { return s.metadata }
 func (s MarketSnapshot) Data() SnapshotData         { return s.data }
-
-func (s MarketSnapshot) Age(at time.Time) time.Duration {
-	return at.UTC().Sub(s.metadata.ReceivedAt)
-}

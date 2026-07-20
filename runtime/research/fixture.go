@@ -13,14 +13,13 @@ import (
 // Fixture is the experimental schema used by the synthetic Research demo.
 // It is test data, not Vernier's stable public configuration API.
 type Fixture struct {
-	SchemaVersion  int               `json:"schema_version"`
-	RunID          string            `json:"run_id"`
-	MaxSnapshotAge string            `json:"max_snapshot_age"`
-	FixedCost      string            `json:"fixed_cost"`
-	Catalog        CatalogFixture    `json:"catalog"`
-	Setup          SetupFixture      `json:"setup"`
-	Strategies     []StrategyFixture `json:"strategies"`
-	Feeds          []FeedFixture     `json:"feeds"`
+	SchemaVersion int               `json:"schema_version"`
+	RunID         string            `json:"run_id"`
+	FixedCost     string            `json:"fixed_cost"`
+	Catalog       CatalogFixture    `json:"catalog"`
+	Setup         SetupFixture      `json:"setup"`
+	Strategies    []StrategyFixture `json:"strategies"`
+	Feeds         []FeedFixture     `json:"feeds"`
 }
 
 type CatalogFixture struct {

@@ -74,18 +74,17 @@ type CostSnapshot struct {
 }
 
 type Evaluation struct {
-	id             EvaluationID
-	run            ResearchRunID
-	strategy       StrategyID
-	configHash     string
-	snapshots      []market.MarketSnapshot
-	cost           CostSnapshot
-	triggeredAt    time.Time
-	startedAt      time.Time
-	maxSnapshotAge time.Duration
+	id          EvaluationID
+	run         ResearchRunID
+	strategy    StrategyID
+	configHash  string
+	snapshots   []market.MarketSnapshot
+	cost        CostSnapshot
+	triggeredAt time.Time
+	startedAt   time.Time
 }
 
-func NewEvaluation(id EvaluationID, run ResearchRunID, strategy StrategyID, configHash string, snapshots []market.MarketSnapshot, cost CostSnapshot, triggeredAt, startedAt time.Time, maxAge time.Duration) (Evaluation, error) {
+func NewEvaluation(id EvaluationID, run ResearchRunID, strategy StrategyID, configHash string, snapshots []market.MarketSnapshot, cost CostSnapshot, triggeredAt, startedAt time.Time) (Evaluation, error) {
 	if id == "" || run == "" || strategy == "" || configHash == "" {
 		return Evaluation{}, fmt.Errorf("evaluation identity and config hash are required")
 	}
@@ -95,8 +94,8 @@ func NewEvaluation(id EvaluationID, run ResearchRunID, strategy StrategyID, conf
 	if cost.ID == "" || cost.Amount.Asset() == "" || cost.CapturedAt.IsZero() {
 		return Evaluation{}, fmt.Errorf("valid cost snapshot is required")
 	}
-	if triggeredAt.IsZero() || startedAt.IsZero() || maxAge < 0 {
-		return Evaluation{}, fmt.Errorf("evaluation timestamps and non-negative max age are required")
+	if triggeredAt.IsZero() || startedAt.IsZero() {
+		return Evaluation{}, fmt.Errorf("evaluation timestamps are required")
 	}
 	seen := make(map[market.MarketID]struct{}, len(snapshots))
 	for _, snapshot := range snapshots {
@@ -109,18 +108,17 @@ func NewEvaluation(id EvaluationID, run ResearchRunID, strategy StrategyID, conf
 	return Evaluation{
 		id: id, run: run, strategy: strategy, configHash: configHash,
 		snapshots: append([]market.MarketSnapshot(nil), snapshots...), cost: cost,
-		triggeredAt: triggeredAt.UTC(), startedAt: startedAt.UTC(), maxSnapshotAge: maxAge,
+		triggeredAt: triggeredAt.UTC(), startedAt: startedAt.UTC(),
 	}, nil
 }
 
-func (e Evaluation) ID() EvaluationID              { return e.id }
-func (e Evaluation) Run() ResearchRunID            { return e.run }
-func (e Evaluation) Strategy() StrategyID          { return e.strategy }
-func (e Evaluation) ConfigHash() string            { return e.configHash }
-func (e Evaluation) Cost() CostSnapshot            { return e.cost }
-func (e Evaluation) TriggeredAt() time.Time        { return e.triggeredAt }
-func (e Evaluation) StartedAt() time.Time          { return e.startedAt }
-func (e Evaluation) MaxSnapshotAge() time.Duration { return e.maxSnapshotAge }
+func (e Evaluation) ID() EvaluationID       { return e.id }
+func (e Evaluation) Run() ResearchRunID     { return e.run }
+func (e Evaluation) Strategy() StrategyID   { return e.strategy }
+func (e Evaluation) ConfigHash() string     { return e.configHash }
+func (e Evaluation) Cost() CostSnapshot     { return e.cost }
+func (e Evaluation) TriggeredAt() time.Time { return e.triggeredAt }
+func (e Evaluation) StartedAt() time.Time   { return e.startedAt }
 func (e Evaluation) Snapshots() []market.MarketSnapshot {
 	return append([]market.MarketSnapshot(nil), e.snapshots...)
 }

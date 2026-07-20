@@ -41,8 +41,10 @@ initialized ticks; it does not use a spot-price approximation.
 Arrival order updates a mirror unless a feed-selected policy has comparable
 source evidence (the fixture uses block number and known timestamp) proving an
 event is older. Older events are ignored and audited without degrading the
-mirror. Explicit feed-liveness failures, such as a WebSocket disconnect, degrade
-the mirror and produce `unclassifiable` results until fresh data arrives.
+mirror. Explicit feed-liveness failures, such as a WebSocket disconnect,
+degrade the mirror and produce `unclassifiable` results until reconnection
+performs a full current-state bootstrap. A healthy WebSocket keeps the mirror
+valid indefinitely: snapshots have no age expiry or finality gate.
 
 The current V3 slice is deliberately local: it reduces normalized full-state,
 swap, and liquidity events and quotes from immutable snapshots. ABI decoding,

@@ -100,11 +100,6 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 			opportunity.Reasons = []string{"degraded_market_snapshot"}
 			return s.finish(opportunity)
 		}
-		age := snapshot.Age(evaluation.StartedAt())
-		if age < 0 || age > evaluation.MaxSnapshotAge() {
-			opportunity.Reasons = []string{"stale_market_snapshot"}
-			return s.finish(opportunity)
-		}
 	}
 
 	buyMarket, buyExists := s.registry.Market(direction.BuyMarket)

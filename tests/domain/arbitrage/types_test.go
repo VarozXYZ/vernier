@@ -34,7 +34,7 @@ func TestEvaluationFixesUniqueSnapshots(t *testing.T) {
 	cost, _ := market.ParseAssetQuantity("quote", "1")
 	evaluation, err := arbitrage.NewEvaluation(
 		"evaluation", "run", "strategy", "hash", snapshots,
-		arbitrage.CostSnapshot{ID: "cost", Amount: cost, CapturedAt: now}, now, now, time.Second,
+		arbitrage.CostSnapshot{ID: "cost", Amount: cost, CapturedAt: now}, now, now,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestEvaluationFixesUniqueSnapshots(t *testing.T) {
 	}
 
 	duplicate := []market.MarketSnapshot{testSnapshot(t, "market-a", now), testSnapshot(t, "market-a", now)}
-	if _, err := arbitrage.NewEvaluation("e", "r", "s", "h", duplicate, arbitrage.CostSnapshot{ID: "cost", Amount: cost, CapturedAt: now}, now, now, 0); err == nil {
+	if _, err := arbitrage.NewEvaluation("e", "r", "s", "h", duplicate, arbitrage.CostSnapshot{ID: "cost", Amount: cost, CapturedAt: now}, now, now); err == nil {
 		t.Fatal("expected duplicate market snapshots to fail")
 	}
 }
