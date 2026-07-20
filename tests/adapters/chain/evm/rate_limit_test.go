@@ -60,3 +60,37 @@ func TestRateLimitedNetworkHonorsCancellationBeforeDelegating(t *testing.T) {
 		t.Fatalf("delegate calls = %d, want 1", delegate.calls)
 	}
 }
+
+func TestRateLimitedNetworkDoesNotHoldSchedulerLockWhileWaiting(t *testing.T) {
+	delegate := &countingNetwork{}
+	network, err := evm.NewRateLimitedNetwork(delegate, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := network.CurrentBlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	waiting := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(waiting)
+		_, callErr := network.CurrentBlock(context.Background())
+		done <- callErr
+	}()
+	<-waiting
+	time.Sleep(20 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	if _, err := network.CurrentBlock(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled wait, got %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 50*time.Millisecond {
+		t.Fatalf("cancellation blocked behind scheduler lock for %s", elapsed)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
