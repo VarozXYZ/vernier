@@ -55,6 +55,38 @@ func TestVerifierRejectsNestedEnvFiles(t *testing.T) {
 	}
 }
 
+func TestVerifierRejectsLocalConfiguration(t *testing.T) {
+	repositoryRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	extension := ""
+	if runtime.GOOS == "windows" {
+		extension = ".exe"
+	}
+	verifier := filepath.Join(t.TempDir(), "verify"+extension)
+	build := exec.Command("go", "build", "-o", verifier, "./tools/verify")
+	build.Dir = repositoryRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build verifier: %v\n%s", err, output)
+	}
+	testRepository := t.TempDir()
+	runGit(t, testRepository, "init", "--quiet")
+	path := filepath.Join(testRepository, "config", "local")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "pool.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, testRepository, "add", "--force", "config/local/pool.json")
+	command := exec.Command(verifier)
+	command.Dir = testRepository
+	if output, err := command.CombinedOutput(); err == nil || !strings.Contains(string(output), "config/local/pool.json") {
+		t.Fatalf("verifier did not reject local configuration: %v\n%s", err, output)
+	}
+}
+
 func runGit(t *testing.T, directory string, arguments ...string) {
 	t.Helper()
 	command := exec.Command("git", arguments...)

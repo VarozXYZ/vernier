@@ -38,5 +38,5 @@ log, ABI, and EVM data types.
 Source: <https://github.com/ethereum/go-ethereum>
 
 The go-ethereum libraries are licensed under the GNU Lesser General Public
-License version 3. The license text is available from the upstream project:
-<https://github.com/ethereum/go-ethereum/blob/v1.17.4/COPYING.LESSER>.
+License version 3. See
+[licenses/go-ethereum-LGPL-3.0.txt](licenses/go-ethereum-LGPL-3.0.txt).

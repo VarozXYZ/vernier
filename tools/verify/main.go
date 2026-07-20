@@ -117,7 +117,8 @@ func checkPublicTree() error {
 		base := pathpkg.Base(normalized)
 		if normalized == "agents.md" || strings.HasSuffix(normalized, "/agents.md") ||
 			normalized == "agents.override.md" || strings.HasSuffix(normalized, "/agents.override.md") ||
-			strings.HasPrefix(normalized, "docs/") || base == ".env" || strings.HasPrefix(base, ".env.") {
+			strings.HasPrefix(normalized, "docs/") || strings.HasPrefix(normalized, "config/local/") ||
+			base == ".env" || strings.HasPrefix(base, ".env.") {
 			forbidden = append(forbidden, file)
 		}
 	}

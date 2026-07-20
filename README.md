@@ -13,6 +13,8 @@ explain every evaluated opportunity from immutable market snapshots.
 - Architecture baseline: complete.
 - Deterministic Research kernel: available with constant-product and Uniswap
   V3 local market adapters.
+- Read-only Ethereum observation: experimental, with filtered Uniswap V3 logs
+  and exact local/QuoterV2 parity checks.
 - Live execution: not implemented.
 
 See [ROADMAP.md](ROADMAP.md) for the public delivery sequence.
@@ -49,6 +51,54 @@ adapter capabilities, not hidden dependencies of the quote path.
 
 The adapter boundary is recorded in
 [ADR 0001](decisions/0001-market-adapter-boundaries.md).
+
+## Experimental Ethereum observation
+
+The read-only observer uses the canonical Ethereum and Uniswap V3 adapters. Its
+WebSocket subscription is restricted to one pool address and the Initialize,
+Swap, Mint, and Burn topics. It does not subscribe to new heads, poll inactive
+blocks, infer gaps from non-contiguous event blocks, sign, or broadcast.
+
+Create a private ignored file under config/local/:
+
+~~~json
+{
+  "schema_version": 1,
+  "network_adapter": "ethereum",
+  "venue_adapter": "uniswap-v3",
+  "market_id": "local-market",
+  "pool_address": "0x...",
+  "quoter_v2_address": "0x...",
+  "http_url_env": "VERNIER_ETHEREUM_HTTP_URL",
+  "ws_url_env": "VERNIER_ETHEREUM_WS_URL",
+  "token0_id": "token-0",
+  "token1_id": "token-1",
+  "quote_inputs": [
+    {"token_in": "token-0", "amount": "1000000"},
+    {"token_in": "token-1", "amount": "1000000"}
+  ],
+  "max_tick_words": 64
+}
+~~~
+
+Set the named environment variables locally, then run:
+
+~~~console
+go run ./cmd/research observe-v3 --config config/local/pool.local.json --format jsonl --updates 1
+~~~
+
+The value updates=1 emits the bootstrap snapshot and waits for one block
+containing a matching pool event. The value updates=0 runs until canceled.
+Configuration, endpoints, and addresses are not included in output records.
+
+The observer loads complete state only at startup and after a confirmed
+WebSocket disconnection. Each active block is fetched once by exact block hash
+to order its pool logs. Tick coverage is explicit; the local quoter fails
+closed and loads additional bitmap words when a configured probe needs them.
+Every emitted quote is compared exactly with QuoterV2 at the same block hash.
+
+Canonical adapter reuse and network/fork boundaries are recorded in
+[ADR 0003](decisions/0003-canonical-chain-and-market-adapters.md).
 
 ## Development
 
