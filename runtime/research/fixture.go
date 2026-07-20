@@ -110,16 +110,28 @@ type FeedFixture struct {
 }
 
 type EventFixture struct {
-	BlockNumber          *uint64 `json:"block_number,omitempty"`
-	Finality             string  `json:"finality"`
-	SourceTime           string  `json:"source_time,omitempty"`
-	ReceivedAt           string  `json:"received_at"`
-	AppliedAt            string  `json:"applied_at"`
-	EvaluationStartedAt  string  `json:"evaluation_started_at"`
-	EvaluationFinishedAt string  `json:"evaluation_finished_at"`
-	BaseReserve          string  `json:"base_reserve"`
-	QuoteReserve         string  `json:"quote_reserve"`
-	FeeBPS               uint16  `json:"fee_bps"`
+	BlockNumber          *uint64       `json:"block_number,omitempty"`
+	Finality             string        `json:"finality"`
+	SourceTime           string        `json:"source_time,omitempty"`
+	ReceivedAt           string        `json:"received_at"`
+	AppliedAt            string        `json:"applied_at"`
+	EvaluationStartedAt  string        `json:"evaluation_started_at"`
+	EvaluationFinishedAt string        `json:"evaluation_finished_at"`
+	BaseReserve          string        `json:"base_reserve,omitempty"`
+	QuoteReserve         string        `json:"quote_reserve,omitempty"`
+	FeeBPS               uint16        `json:"fee_bps,omitempty"`
+	SqrtPriceX96         string        `json:"sqrt_price_x96,omitempty"`
+	Tick                 *int32        `json:"tick,omitempty"`
+	Liquidity            string        `json:"liquidity,omitempty"`
+	FeePips              *uint32       `json:"fee_pips,omitempty"`
+	TickSpacing          *int32        `json:"tick_spacing,omitempty"`
+	InitializedTicks     []TickFixture `json:"initialized_ticks,omitempty"`
+}
+
+type TickFixture struct {
+	Index          int32  `json:"index"`
+	LiquidityGross string `json:"liquidity_gross"`
+	LiquidityNet   string `json:"liquidity_net"`
 }
 
 type DisconnectFixture struct {

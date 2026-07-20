@@ -1,4 +1,5 @@
-package constantproduct
+// Package marketstate owns generic market-mirror lifecycle and snapshot publication.
+package marketstate
 
 import (
 	"context"
@@ -13,11 +14,25 @@ import (
 
 type Clock func() time.Time
 
+// Reducer is the protocol-specific state transition used by a generic Mirror.
+// Implementations must return immutable snapshot data and its deterministic hash.
+type Reducer interface {
+	Reduce(context.Context, market.SnapshotData, market.EventData) (market.SnapshotData, [sha256.Size]byte, error)
+}
+
+// Orderer encapsulates source-specific stale-event detection. An event is
+// accepted unless the policy has positive evidence that it is older.
+type Orderer interface {
+	Stale(market.SnapshotMetadata, market.MarketEvent) (bool, string)
+}
+
 type Mirror struct {
 	mu              sync.RWMutex
 	market          market.MarketID
 	source          market.SourceID
 	clock           Clock
+	reducer         Reducer
+	orderer         Orderer
 	version         uint64
 	current         market.MarketSnapshot
 	hasState        bool
@@ -26,13 +41,13 @@ type Mirror struct {
 	healthChangedAt time.Time
 }
 
-func NewMirror(marketID market.MarketID, source market.SourceID, clock Clock) (*Mirror, error) {
-	if marketID == "" || source == "" || clock == nil {
-		return nil, fmt.Errorf("market, source, and clock are required")
+func NewMirror(marketID market.MarketID, source market.SourceID, reducer Reducer, orderer Orderer, clock Clock) (*Mirror, error) {
+	if marketID == "" || source == "" || reducer == nil || orderer == nil || clock == nil {
+		return nil, fmt.Errorf("market, source, reducer, orderer, and clock are required")
 	}
 	return &Mirror{
-		market: marketID, source: source, clock: clock, health: market.HealthHealthy,
-		healthChangedAt: clock().UTC(),
+		market: marketID, source: source, reducer: reducer, orderer: orderer, clock: clock,
+		health: market.HealthHealthy, healthChangedAt: clock().UTC(),
 	}, nil
 }
 
@@ -48,23 +63,20 @@ func (m *Mirror) Apply(ctx context.Context, event market.MarketEvent) (feedport.
 	if event.Market != m.market || event.Source != m.source {
 		return feedport.ApplyResult{}, fmt.Errorf("event market/source does not match mirror")
 	}
-	update, ok := event.Data.(ReserveUpdate)
-	if !ok {
-		return feedport.ApplyResult{}, fmt.Errorf("unsupported event payload %T", event.Data)
+	if m.hasState {
+		if stale, reason := m.orderer.Stale(m.current.Metadata(), event); stale {
+			return feedport.ApplyResult{
+				Disposition: feedport.ApplyDispositionIgnoredStale, Reason: reason, Snapshot: m.current,
+			}, nil
+		}
 	}
-	if err := update.validate(); err != nil {
+	var previous market.SnapshotData
+	if m.hasState {
+		previous = m.current.Data()
+	}
+	data, stateHash, err := m.reducer.Reduce(ctx, previous, event.Data)
+	if err != nil {
 		return feedport.ApplyResult{}, err
-	}
-	if m.hasState && isProvablyOlder(event, m.current.Metadata()) {
-		return feedport.ApplyResult{
-			Disposition: feedport.ApplyDispositionIgnoredStale,
-			Snapshot:    m.current,
-		}, nil
-	}
-
-	state := Snapshot{
-		schemaVersion: snapshotSchemaVersion,
-		baseReserve:   update.BaseReserve(), quoteReserve: update.QuoteReserve(), feeBPS: update.FeeBPS(),
 	}
 	appliedAt := m.clock().UTC()
 	m.version++
@@ -77,9 +89,9 @@ func (m *Mirror) Apply(ctx context.Context, event market.MarketEvent) (feedport.
 		Market: m.market, Source: m.source, Version: m.version, EventPosition: event.Position,
 		Finality: event.Finality, SourceTime: event.SourceTime, SourceTimeKnown: event.SourceTimeKnown,
 		ReceivedAt: event.ReceivedAt, AppliedAt: appliedAt, Health: m.health,
-		HealthReason: m.healthReason, HealthChangedAt: m.healthChangedAt, StateHash: stateHash(state),
+		HealthReason: m.healthReason, HealthChangedAt: m.healthChangedAt, StateHash: stateHash,
 	}
-	snapshot, err := market.NewMarketSnapshot(metadata, state)
+	snapshot, err := market.NewMarketSnapshot(metadata, data)
 	if err != nil {
 		return feedport.ApplyResult{}, err
 	}
@@ -130,16 +142,4 @@ func (m *Mirror) SetHealth(ctx context.Context, update feedport.HealthUpdate) er
 	}
 	m.current = snapshot
 	return nil
-}
-
-func isProvablyOlder(event market.MarketEvent, current market.SnapshotMetadata) bool {
-	if comparison, comparable := event.Position.Compare(current.EventPosition); comparable {
-		return comparison < 0
-	}
-	return event.SourceTimeKnown && current.SourceTimeKnown && event.SourceTime.Before(current.SourceTime)
-}
-
-func stateHash(snapshot Snapshot) [sha256.Size]byte {
-	payload := fmt.Sprintf("%d|%s|%s|%d", snapshot.schemaVersion, snapshot.baseReserve, snapshot.quoteReserve, snapshot.feeBPS)
-	return sha256.Sum256([]byte(payload))
 }

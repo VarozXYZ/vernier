@@ -69,8 +69,12 @@ func (q *Quoter) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	if err != nil {
 		return market.Quote{}, err
 	}
+	feeComponent, err := market.NewQuoteFee("liquidity_provider", market.QuoteFeeCost, fee, true)
+	if err != nil {
+		return market.Quote{}, err
+	}
 	return market.NewQuote(market.Quote{
 		Source: q.id, Market: q.market.ID, SnapshotVersion: metadata.Version, SnapshotHash: metadata.StateHash,
-		Purpose: input.Purpose, AmountIn: input.AmountIn, AmountOut: amountOut, Fee: fee, QuotedAt: input.QuotedAt,
-	})
+		Purpose: input.Purpose, AmountIn: input.AmountIn, AmountOut: amountOut, QuotedAt: input.QuotedAt,
+	}, feeComponent)
 }

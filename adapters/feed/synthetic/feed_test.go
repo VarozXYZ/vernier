@@ -51,7 +51,7 @@ func TestFeedHonorsCancellation(t *testing.T) {
 func newEvent(t *testing.T, block uint64) market.MarketEvent {
 	t.Helper()
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: "market", Source: "source", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: block},
+		Market: "market", Source: "source", Position: market.SourcePosition{Kind: "block", Value: block},
 		Finality: market.FinalityConfirmed, ReceivedAt: time.Date(2026, 1, 1, 0, 0, int(block), 0, time.UTC),
 		Data: eventData{},
 	})

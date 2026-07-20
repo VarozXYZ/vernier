@@ -35,6 +35,7 @@ const (
 
 type ApplyResult struct {
 	Disposition ApplyDisposition
+	Reason      string
 	Snapshot    market.MarketSnapshot
 }
 
@@ -44,6 +45,12 @@ func (r ApplyResult) Validate() error {
 	}
 	if r.Snapshot.Metadata().Version == 0 {
 		return fmt.Errorf("apply result requires a snapshot")
+	}
+	if r.Disposition == ApplyDispositionIgnoredStale && r.Reason == "" {
+		return fmt.Errorf("ignored event requires a reason")
+	}
+	if r.Disposition == ApplyDispositionApplied && r.Reason != "" {
+		return fmt.Errorf("applied event cannot have an ignore reason")
 	}
 	return nil
 }

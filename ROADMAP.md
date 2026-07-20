@@ -6,7 +6,8 @@ dates are intentionally omitted until implementation evidence supports them.
 ## 1. Deterministic Research kernel
 
 Normalize synthetic market events, publish immutable snapshots, quote locally,
-evaluate two-market strategies, and produce auditable opportunity reports.
+evaluate two-market strategies across constant-product and Uniswap V3 markets,
+and produce auditable opportunity reports.
 
 Status: implemented as an offline synthetic vertical slice.
 
@@ -19,6 +20,9 @@ settings, and make source health and data-quality incidents explicit.
 
 Add another market shape and conformance suites to prove that the core does not
 branch on chain or protocol names.
+
+Status: concentrated liquidity is represented by the local Uniswap V3 adapter;
+an order-book shape remains future work.
 
 ## 4. Modeled execution
 

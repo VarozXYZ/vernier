@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/VarozXYZ/vernier/adapters/market/constantproduct"
+	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 )
 
@@ -38,10 +40,37 @@ func TestFixtureProducesDeterministicReport(t *testing.T) {
 	if !bytes.Equal(firstJSON.Bytes(), secondJSON.Bytes()) {
 		t.Fatal("the same fixture produced different JSON")
 	}
-	for _, required := range []string{hash, `"run_id": "synthetic-two-market"`, `"triggered_at"`, `"snapshot_version"`} {
+	for _, required := range []string{
+		hash, `"run_id": "synthetic-two-market"`, `"triggered_at"`, `"snapshot_version"`,
+		`"kind": "liquidity_provider"`, `"included_in_amounts": true`,
+	} {
 		if !strings.Contains(firstJSON.String(), required) {
 			t.Fatalf("JSON does not contain %q", required)
 		}
+	}
+	for _, adapterDetail := range []string{"sqrt_price_x96", "base_reserve", "initialized_ticks"} {
+		if strings.Contains(firstJSON.String(), adapterDetail) {
+			t.Fatalf("adapter detail %q leaked into canonical report", adapterDetail)
+		}
+	}
+}
+
+func TestFixtureComposesHeterogeneousMarketAdapters(t *testing.T) {
+	fixture, hash := loadExample(t)
+	runner, err := NewRunner(fixture, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	alpha, _ := runner.mirrors["market-alpha"].Current()
+	beta, _ := runner.mirrors["market-beta"].Current()
+	if _, ok := alpha.Data().(constantproduct.Snapshot); !ok {
+		t.Fatalf("market alpha state type = %T", alpha.Data())
+	}
+	if _, ok := beta.Data().(uniswapv3.Snapshot); !ok {
+		t.Fatalf("market beta state type = %T", beta.Data())
 	}
 }
 
@@ -92,7 +121,7 @@ func TestOlderBlockIsIgnoredWithoutDegradingOrEvaluating(t *testing.T) {
 	if report.Status != StatusHealthy || len(report.FeedIncidents) != 0 {
 		t.Fatalf("stale event changed feed health: %+v", report)
 	}
-	if len(report.IgnoredEvents) != 1 || report.IgnoredEvents[0].Reason != "provably_older_source_data" {
+	if len(report.IgnoredEvents) != 1 || report.IgnoredEvents[0].Reason != "older_block" {
 		t.Fatalf("missing stale-event audit evidence: %+v", report.IgnoredEvents)
 	}
 	if report.Evaluations != 1 || len(report.Opportunities) != 4 {

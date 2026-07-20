@@ -18,7 +18,7 @@ func (d testSnapshotData) SnapshotKind() string { return d.kind }
 func TestMarketEventNormalizesTimestamps(t *testing.T) {
 	zone := time.FixedZone("test", 3600)
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: "market", Source: "source", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
+		Market: "market", Source: "source", Position: market.SourcePosition{Kind: "block", Value: 1},
 		Finality:   market.FinalityConfirmed,
 		SourceTime: time.Date(2026, 1, 1, 1, 0, 0, 0, zone), SourceTimeKnown: true,
 		ReceivedAt: time.Date(2026, 1, 1, 1, 0, 1, 0, zone),
@@ -36,7 +36,7 @@ func TestSnapshotCopiesMetadataAndReportsAge(t *testing.T) {
 	received := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	metadata := market.SnapshotMetadata{
 		Market: "market", Source: "source", Version: 1,
-		EventPosition: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
+		EventPosition: market.SourcePosition{Kind: "block", Value: 1},
 		Finality:      market.FinalityConfirmed, ReceivedAt: received, AppliedAt: received,
 		Health: market.HealthHealthy, HealthChangedAt: received,
 	}
@@ -63,8 +63,8 @@ func TestStateConstructorsRejectMissingPayloads(t *testing.T) {
 }
 
 func TestSourcePositionsCompareOnlyWithinTheSameKnownKind(t *testing.T) {
-	block10 := market.SourcePosition{Kind: market.SourcePositionBlock, Value: 10}
-	block11 := market.SourcePosition{Kind: market.SourcePositionBlock, Value: 11}
+	block10 := market.SourcePosition{Kind: "block", Value: 10}
+	block11 := market.SourcePosition{Kind: "block", Value: 11}
 	if comparison, ok := block10.Compare(block11); !ok || comparison != -1 {
 		t.Fatalf("unexpected comparison: %d, %v", comparison, ok)
 	}

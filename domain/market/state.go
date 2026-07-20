@@ -31,8 +31,6 @@ type SnapshotData interface {
 
 type SourcePositionKind string
 
-const SourcePositionBlock SourcePositionKind = "block"
-
 // SourcePosition is optional, source-provided ordering evidence. Positions are
 // comparable only when they use the same non-empty kind.
 type SourcePosition struct {
@@ -43,8 +41,8 @@ type SourcePosition struct {
 func (p SourcePosition) Known() bool { return p.Kind != "" }
 
 func (p SourcePosition) Validate() error {
-	if p.Kind != "" && p.Kind != SourcePositionBlock {
-		return fmt.Errorf("unsupported source position kind %q", p.Kind)
+	if p.Kind == "" && p.Value != 0 {
+		return fmt.Errorf("source position value requires a kind")
 	}
 	return nil
 }

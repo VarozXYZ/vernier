@@ -112,17 +112,25 @@ type quantityDTO struct {
 }
 
 type quoteDTO struct {
-	Source          string `json:"source"`
-	Market          string `json:"market"`
-	SnapshotVersion uint64 `json:"snapshot_version"`
-	SnapshotHash    string `json:"snapshot_hash"`
-	Purpose         string `json:"purpose"`
-	TokenIn         string `json:"token_in"`
-	AmountIn        string `json:"amount_in"`
-	TokenOut        string `json:"token_out"`
-	AmountOut       string `json:"amount_out"`
-	Fee             string `json:"fee"`
-	QuotedAt        string `json:"quoted_at"`
+	Source          string        `json:"source"`
+	Market          string        `json:"market"`
+	SnapshotVersion uint64        `json:"snapshot_version"`
+	SnapshotHash    string        `json:"snapshot_hash"`
+	Purpose         string        `json:"purpose"`
+	TokenIn         string        `json:"token_in"`
+	AmountIn        string        `json:"amount_in"`
+	TokenOut        string        `json:"token_out"`
+	AmountOut       string        `json:"amount_out"`
+	Fees            []quoteFeeDTO `json:"fees"`
+	QuotedAt        string        `json:"quoted_at"`
+}
+
+type quoteFeeDTO struct {
+	Kind              string `json:"kind"`
+	Effect            string `json:"effect"`
+	Token             string `json:"token"`
+	Amount            string `json:"amount"`
+	IncludedInAmounts bool   `json:"included_in_amounts"`
 }
 
 type ignoredEventDTO struct {
@@ -219,13 +227,20 @@ func quantity(value market.AssetQuantity) quantityDTO {
 }
 
 func quote(value market.Quote) quoteDTO {
-	return quoteDTO{
+	dto := quoteDTO{
 		Source: string(value.Source), Market: string(value.Market), SnapshotVersion: value.SnapshotVersion,
 		SnapshotHash: hex.EncodeToString(value.SnapshotHash[:]), Purpose: string(value.Purpose),
 		TokenIn: string(value.AmountIn.Token()), AmountIn: value.AmountIn.String(),
-		TokenOut: string(value.AmountOut.Token()), AmountOut: value.AmountOut.String(), Fee: value.Fee.String(),
-		QuotedAt: formatTime(value.QuotedAt),
+		TokenOut: string(value.AmountOut.Token()), AmountOut: value.AmountOut.String(),
+		Fees: make([]quoteFeeDTO, 0, len(value.Fees())), QuotedAt: formatTime(value.QuotedAt),
 	}
+	for _, fee := range value.Fees() {
+		dto.Fees = append(dto.Fees, quoteFeeDTO{
+			Kind: fee.Kind(), Effect: string(fee.Effect()), Token: string(fee.Amount().Token()),
+			Amount: fee.Amount().String(), IncludedInAmounts: fee.IncludedInAmounts(),
+		})
+	}
+	return dto
 }
 
 func trimDecimal(value string) string {

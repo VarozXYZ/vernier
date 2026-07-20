@@ -167,6 +167,9 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed")
 	}
+	if hasUnmodeledFee(buy) {
+		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_has_unmodeled_fee")
+	}
 	baseQuantity, err := buy.AmountOut.ToAssetQuantity(buyBase)
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_output_invalid")
@@ -182,6 +185,9 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed")
 	}
+	if hasUnmodeledFee(sell) {
+		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_has_unmodeled_fee")
+	}
 	output, err := sell.AmountOut.ToAssetQuantity(sellQuote)
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_output_invalid")
@@ -192,6 +198,15 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 		Input: actualInput, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
 		BuyQuote: buy, SellQuote: sell,
 	}, nil
+}
+
+func hasUnmodeledFee(quote market.Quote) bool {
+	for _, fee := range quote.Fees() {
+		if !fee.IncludedInAmounts() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *TwoMarketCrossChainArbitrage) finish(opportunity arbitrage.Opportunity) arbitrage.Opportunity {

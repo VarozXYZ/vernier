@@ -54,7 +54,7 @@ func testSnapshot(t *testing.T, id market.MarketID, now time.Time) market.Market
 	t.Helper()
 	snapshot, err := market.NewMarketSnapshot(market.SnapshotMetadata{
 		Market: id, Source: "source", Version: 1,
-		EventPosition: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
+		EventPosition: market.SourcePosition{Kind: "block", Value: 1},
 		Finality:      market.FinalityConfirmed, ReceivedAt: now, AppliedAt: now,
 		Health: market.HealthHealthy, HealthChangedAt: now,
 	}, snapshotData{})

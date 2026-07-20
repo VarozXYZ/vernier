@@ -37,7 +37,7 @@
         "venue": "synthetic-amm",
         "chain": "chain-beta",
         "tokens": ["base-beta", "quote-beta"],
-        "adapter": "constant_product"
+        "adapter": "uniswap_v3"
       }
     ],
     "paths": [
@@ -111,9 +111,15 @@
           "applied_at": "2026-01-01T00:00:01.110Z",
           "evaluation_started_at": "2026-01-01T00:00:01.120Z",
           "evaluation_finished_at": "2026-01-01T00:00:01.130Z",
-          "base_reserve": "100000000000",
-          "quote_reserve": "2200000000",
-          "fee_bps": 30
+          "sqrt_price_x96": "11751457072291319085750132610",
+          "tick": -38169,
+          "liquidity": "1000000000000",
+          "fee_pips": 3000,
+          "tick_spacing": 60,
+          "initialized_ticks": [
+            { "index": -60000, "liquidity_gross": "1000000000000", "liquidity_net": "1000000000000" },
+            { "index": 0, "liquidity_gross": "1000000000000", "liquidity_net": "-1000000000000" }
+          ]
         },
         {
           "block_number": 201,
@@ -123,9 +129,15 @@
           "applied_at": "2026-01-01T00:00:02.110Z",
           "evaluation_started_at": "2026-01-01T00:00:02.120Z",
           "evaluation_finished_at": "2026-01-01T00:00:02.130Z",
-          "base_reserve": "100000000000",
-          "quote_reserve": "1700000000",
-          "fee_bps": 30
+          "sqrt_price_x96": "10326193275265597883880897907",
+          "tick": -40755,
+          "liquidity": "1000000000000",
+          "fee_pips": 3000,
+          "tick_spacing": 60,
+          "initialized_ticks": [
+            { "index": -60000, "liquidity_gross": "1000000000000", "liquidity_net": "1000000000000" },
+            { "index": 0, "liquidity_gross": "1000000000000", "liquidity_net": "-1000000000000" }
+          ]
         }
       ]
     }

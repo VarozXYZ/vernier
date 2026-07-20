@@ -7,9 +7,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
 	"github.com/VarozXYZ/vernier/adapters/feed/synthetic"
 	"github.com/VarozXYZ/vernier/adapters/market/constantproduct"
+	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
 	"github.com/VarozXYZ/vernier/core/costing"
+	"github.com/VarozXYZ/vernier/core/marketstate"
 	coreresearch "github.com/VarozXYZ/vernier/core/research"
 	"github.com/VarozXYZ/vernier/core/sizing"
 	"github.com/VarozXYZ/vernier/core/strategy"
@@ -151,19 +154,15 @@ func NewRunner(fixture Fixture, configHash string) (*Runner, error) {
 		}
 		seenFeeds[marketID] = struct{}{}
 		candidate, _ := registry.Market(marketID)
-		if err := validateConstantProductMarket(registry, candidate); err != nil {
-			return nil, err
-		}
 		clock := &manualClock{}
-		mirror, err := constantproduct.NewMirror(marketID, market.SourceID(configuredFeed.Source), clock.Now)
+		reducer, quoter, events, timings, err := buildMarketAdapter(registry, candidate, configuredFeed)
 		if err != nil {
 			return nil, err
 		}
-		quoter, err := constantproduct.NewQuoter(market.SourceID("local/"+configuredFeed.Source), candidate)
-		if err != nil {
-			return nil, err
-		}
-		events, timings, err := buildEvents(configuredFeed)
+		mirror, err := marketstate.NewMirror(
+			marketID, market.SourceID(configuredFeed.Source), reducer,
+			sourceorder.NewMonotonic(sourceorder.BlockPositionKind, true), clock.Now,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -281,7 +280,7 @@ func (s *runtimeSink) Publish(ctx context.Context, event market.MarketEvent) err
 	switch result.Disposition {
 	case feedport.ApplyDispositionIgnoredStale:
 		s.runner.report.IgnoredEvents = append(s.runner.report.IgnoredEvents, IgnoredEvent{
-			Market: event.Market, Reason: "provably_older_source_data", Position: event.Position,
+			Market: event.Market, Reason: result.Reason, Position: event.Position,
 			CurrentPosition: result.Snapshot.Metadata().EventPosition, ReceivedAt: event.ReceivedAt,
 		})
 		return nil
@@ -367,19 +366,13 @@ func buildRegistry(fixture CatalogFixture) (*market.Registry, error) {
 	return market.NewRegistry(catalog)
 }
 
-func buildEvents(fixture FeedFixture) ([]market.MarketEvent, []eventTiming, error) {
+type eventDataBuilder func(EventFixture) (market.EventData, error)
+
+func buildEvents(fixture FeedFixture, buildData eventDataBuilder) ([]market.MarketEvent, []eventTiming, error) {
 	events := make([]market.MarketEvent, 0, len(fixture.Events))
 	timings := make([]eventTiming, 0, len(fixture.Events))
 	for index, configured := range fixture.Events {
-		baseReserve, ok := new(big.Int).SetString(configured.BaseReserve, 10)
-		if !ok {
-			return nil, nil, fmt.Errorf("feed %q event %d has invalid base reserve", fixture.Market, index)
-		}
-		quoteReserve, ok := new(big.Int).SetString(configured.QuoteReserve, 10)
-		if !ok {
-			return nil, nil, fmt.Errorf("feed %q event %d has invalid quote reserve", fixture.Market, index)
-		}
-		update, err := constantproduct.NewReserveUpdate(baseReserve, quoteReserve, configured.FeeBPS)
+		data, err := buildData(configured)
 		if err != nil {
 			return nil, nil, fmt.Errorf("feed %q event %d: %w", fixture.Market, index, err)
 		}
@@ -408,10 +401,10 @@ func buildEvents(fixture FeedFixture) ([]market.MarketEvent, []eventTiming, erro
 		}
 		event := market.MarketEvent{
 			Market: market.MarketID(fixture.Market), Source: market.SourceID(fixture.Source),
-			Finality: finality, ReceivedAt: receivedAt, Data: update,
+			Finality: finality, ReceivedAt: receivedAt, Data: data,
 		}
 		if configured.BlockNumber != nil {
-			event.Position = market.SourcePosition{Kind: market.SourcePositionBlock, Value: *configured.BlockNumber}
+			event.Position = market.SourcePosition{Kind: sourceorder.BlockPositionKind, Value: *configured.BlockNumber}
 		}
 		if configured.SourceTime != "" {
 			event.SourceTime, err = parseTimestamp("source_time", configured.SourceTime)
@@ -431,6 +424,88 @@ func buildEvents(fixture FeedFixture) ([]market.MarketEvent, []eventTiming, erro
 		timings = append(timings, eventTiming{appliedAt: appliedAt, startedAt: startedAt, finishedAt: finishedAt})
 	}
 	return events, timings, nil
+}
+
+func buildMarketAdapter(registry *market.Registry, candidate market.Market, fixture FeedFixture) (marketstate.Reducer, quoteport.Source, []market.MarketEvent, []eventTiming, error) {
+	path, ok := registry.Path(candidate.Path)
+	if !ok || len(path.Hops) != 1 {
+		return nil, nil, nil, nil, fmt.Errorf("synthetic market %q requires a one-hop path", candidate.ID)
+	}
+	pool, ok := registry.Pool(path.Hops[0].Pool)
+	if !ok {
+		return nil, nil, nil, nil, fmt.Errorf("synthetic market %q references an unknown pool", candidate.ID)
+	}
+	quoteID := market.SourceID("local/" + fixture.Source)
+	var reducer marketstate.Reducer
+	var quoter quoteport.Source
+	var builder eventDataBuilder
+	var err error
+	switch pool.Adapter {
+	case "constant_product":
+		reducer = constantproduct.Reducer{}
+		quoter, err = constantproduct.NewQuoter(quoteID, candidate)
+		builder = buildConstantProductEvent
+	case "uniswap_v3":
+		if len(pool.Tokens) != 2 {
+			return nil, nil, nil, nil, fmt.Errorf("uniswap V3 market %q requires exactly two pool tokens", candidate.ID)
+		}
+		reducer = uniswapv3.Reducer{}
+		quoter, err = uniswapv3.NewQuoter(quoteID, candidate, pool.Tokens[0], pool.Tokens[1])
+		builder = buildUniswapV3Event
+	default:
+		return nil, nil, nil, nil, fmt.Errorf("synthetic market %q uses unsupported adapter %q", candidate.ID, pool.Adapter)
+	}
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	events, timings, err := buildEvents(fixture, builder)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return reducer, quoter, events, timings, nil
+}
+
+func buildConstantProductEvent(configured EventFixture) (market.EventData, error) {
+	baseReserve, ok := new(big.Int).SetString(configured.BaseReserve, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid base reserve")
+	}
+	quoteReserve, ok := new(big.Int).SetString(configured.QuoteReserve, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid quote reserve")
+	}
+	return constantproduct.NewReserveUpdate(baseReserve, quoteReserve, configured.FeeBPS)
+}
+
+func buildUniswapV3Event(configured EventFixture) (market.EventData, error) {
+	if configured.Tick == nil || configured.FeePips == nil || configured.TickSpacing == nil {
+		return nil, fmt.Errorf("uniswap V3 state requires tick, fee_pips, and tick_spacing")
+	}
+	sqrtPrice, ok := new(big.Int).SetString(configured.SqrtPriceX96, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid sqrt_price_x96")
+	}
+	liquidity, ok := new(big.Int).SetString(configured.Liquidity, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid liquidity")
+	}
+	ticks := make([]uniswapv3.Tick, 0, len(configured.InitializedTicks))
+	for _, configuredTick := range configured.InitializedTicks {
+		gross, ok := new(big.Int).SetString(configuredTick.LiquidityGross, 10)
+		if !ok {
+			return nil, fmt.Errorf("tick %d has invalid gross liquidity", configuredTick.Index)
+		}
+		net, ok := new(big.Int).SetString(configuredTick.LiquidityNet, 10)
+		if !ok {
+			return nil, fmt.Errorf("tick %d has invalid net liquidity", configuredTick.Index)
+		}
+		initialized, err := uniswapv3.NewTick(configuredTick.Index, gross, net)
+		if err != nil {
+			return nil, err
+		}
+		ticks = append(ticks, initialized)
+	}
+	return uniswapv3.NewStateUpdate(sqrtPrice, *configured.Tick, liquidity, *configured.FeePips, *configured.TickSpacing, ticks)
 }
 
 func buildDisconnect(fixture FeedFixture) (*disconnectTiming, error) {
@@ -480,18 +555,6 @@ func parseFinality(value string) (market.Finality, error) {
 	default:
 		return "", fmt.Errorf("invalid finality %q", value)
 	}
-}
-
-func validateConstantProductMarket(registry *market.Registry, candidate market.Market) error {
-	path, ok := registry.Path(candidate.Path)
-	if !ok || len(path.Hops) != 1 {
-		return fmt.Errorf("synthetic market %q requires a one-hop path", candidate.ID)
-	}
-	pool, ok := registry.Pool(path.Hops[0].Pool)
-	if !ok || pool.Adapter != "constant_product" {
-		return fmt.Errorf("synthetic market %q requires constant_product adapter", candidate.ID)
-	}
-	return nil
 }
 
 func containsMarket(markets []market.MarketID, candidate market.MarketID) bool {

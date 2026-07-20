@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
 	"github.com/VarozXYZ/vernier/adapters/market/constantproduct"
+	"github.com/VarozXYZ/vernier/core/marketstate"
 	"github.com/VarozXYZ/vernier/core/sizing"
 	"github.com/VarozXYZ/vernier/core/strategy"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
@@ -169,12 +171,15 @@ func strategySnapshot(t *testing.T, marketID market.MarketID, base, quote string
 	if err != nil {
 		t.Fatal(err)
 	}
-	mirror, err := constantproduct.NewMirror(marketID, "feed", func() time.Time { return now })
+	mirror, err := marketstate.NewMirror(
+		marketID, "feed", constantproduct.Reducer{},
+		sourceorder.NewMonotonic(sourceorder.BlockPositionKind, true), func() time.Time { return now },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: marketID, Source: "feed", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: 1},
+		Market: marketID, Source: "feed", Position: market.SourcePosition{Kind: sourceorder.BlockPositionKind, Value: 1},
 		Finality:   market.FinalityConfirmed,
 		SourceTime: now.Add(-time.Millisecond), SourceTimeKnown: true, ReceivedAt: now, Data: update,
 	})

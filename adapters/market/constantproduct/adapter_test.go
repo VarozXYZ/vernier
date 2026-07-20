@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
 	"github.com/VarozXYZ/vernier/adapters/market/constantproduct"
+	"github.com/VarozXYZ/vernier/core/marketstate"
 	"github.com/VarozXYZ/vernier/domain/market"
 	feedport "github.com/VarozXYZ/vernier/ports/feed"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
@@ -14,10 +16,7 @@ import (
 
 func TestMirrorPublishesImmutableSnapshots(t *testing.T) {
 	appliedAt := time.Date(2026, 1, 1, 0, 0, 2, 0, time.UTC)
-	mirror, err := constantproduct.NewMirror("market", "feed", func() time.Time { return appliedAt })
-	if err != nil {
-		t.Fatal(err)
-	}
+	mirror := newMirror(t, "market", func() time.Time { return appliedAt })
 	first := apply(t, mirror, event(t, 1, 1_000_000, 2_000_000))
 	second := apply(t, mirror, event(t, 2, 2_000_000, 3_000_000))
 
@@ -33,7 +32,7 @@ func TestMirrorPublishesImmutableSnapshots(t *testing.T) {
 }
 
 func TestMirrorIgnoresOlderBlocksWithoutDegrading(t *testing.T) {
-	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	mirror := newMirror(t, "market", func() time.Time { return time.Now().UTC() })
 	first := apply(t, mirror, event(t, 20, 1_000_000, 2_000_000))
 	result, err := mirror.Apply(context.Background(), event(t, 19, 9_000_000, 9_000_000))
 	if err != nil {
@@ -52,7 +51,7 @@ func TestMirrorIgnoresOlderBlocksWithoutDegrading(t *testing.T) {
 }
 
 func TestMirrorAcceptsSameAndNonContiguousLaterBlocks(t *testing.T) {
-	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	mirror := newMirror(t, "market", func() time.Time { return time.Now().UTC() })
 	apply(t, mirror, event(t, 20, 1_000_000, 2_000_000))
 	sameBlock := apply(t, mirror, event(t, 20, 2_000_000, 3_000_000))
 	laterBlock := apply(t, mirror, event(t, 900, 3_000_000, 4_000_000))
@@ -62,7 +61,7 @@ func TestMirrorAcceptsSameAndNonContiguousLaterBlocks(t *testing.T) {
 }
 
 func TestMirrorUsesArrivalOrderWithoutComparableSourceEvidence(t *testing.T) {
-	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	mirror := newMirror(t, "market", func() time.Time { return time.Now().UTC() })
 	first := event(t, 20, 1_000_000, 2_000_000)
 	first.Position = market.SourcePosition{}
 	apply(t, mirror, first)
@@ -76,7 +75,7 @@ func TestMirrorUsesArrivalOrderWithoutComparableSourceEvidence(t *testing.T) {
 }
 
 func TestMirrorIgnoresOlderKnownTimestampWhenPositionsAreUnknown(t *testing.T) {
-	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	mirror := newMirror(t, "market", func() time.Time { return time.Now().UTC() })
 	current := event(t, 20, 1_000_000, 2_000_000)
 	current.Position = market.SourcePosition{}
 	apply(t, mirror, current)
@@ -94,7 +93,7 @@ func TestMirrorIgnoresOlderKnownTimestampWhenPositionsAreUnknown(t *testing.T) {
 
 func TestMirrorDisconnectIsExplicitAndFreshDataRecoversHealth(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)
-	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return now })
+	mirror := newMirror(t, "market", func() time.Time { return now })
 	healthy := apply(t, mirror, event(t, 20, 1_000_000, 2_000_000))
 	disconnectedAt := now.Add(time.Second)
 	if err := mirror.SetHealth(context.Background(), feedport.HealthUpdate{
@@ -120,7 +119,7 @@ func TestMirrorDisconnectIsExplicitAndFreshDataRecoversHealth(t *testing.T) {
 }
 
 func TestQuoterMatchesConstantProductGoldenVector(t *testing.T) {
-	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time {
+	mirror := newMirror(t, "market", func() time.Time {
 		return time.Date(2026, 1, 1, 0, 0, 2, 0, time.UTC)
 	})
 	snapshot := apply(t, mirror, event(t, 1, 1_000_000, 2_000_000))
@@ -139,13 +138,13 @@ func TestQuoterMatchesConstantProductGoldenVector(t *testing.T) {
 	if got := quote.AmountOut.String(); got != "47482" {
 		t.Fatalf("unexpected output: got %s, want 47482", got)
 	}
-	if got := quote.Fee.String(); got != "300" {
+	if got := quote.Fees()[0].Amount().String(); got != "300" {
 		t.Fatalf("unexpected fee: got %s, want 300", got)
 	}
 }
 
 func TestQuoterRejectsWrongMarketSnapshot(t *testing.T) {
-	mirror, _ := constantproduct.NewMirror("other", "feed", func() time.Time { return time.Now().UTC() })
+	mirror := newMirror(t, "other", func() time.Time { return time.Now().UTC() })
 	snapshot := apply(t, mirror, eventForMarket(t, "other", 1, 1_000_000, 2_000_000))
 	quoter, _ := constantproduct.NewQuoter("local", market.Market{ID: "market", BaseToken: "base", QuoteToken: "quote"})
 	amount, _ := market.ParseTokenAmount("quote", "100")
@@ -159,7 +158,7 @@ func TestQuoterRejectsWrongMarketSnapshot(t *testing.T) {
 }
 
 func TestMirrorRejectsZeroReserveUpdateWithoutPanicking(t *testing.T) {
-	mirror, _ := constantproduct.NewMirror("market", "feed", func() time.Time { return time.Now().UTC() })
+	mirror := newMirror(t, "market", func() time.Time { return time.Now().UTC() })
 	event, err := market.NewMarketEvent(market.MarketEvent{
 		Market: "market", Source: "feed", Finality: market.FinalityConfirmed,
 		ReceivedAt: time.Now().UTC(), Data: constantproduct.ReserveUpdate{},
@@ -184,7 +183,7 @@ func eventForMarket(t *testing.T, marketID market.MarketID, block uint64, base, 
 		t.Fatal(err)
 	}
 	event, err := market.NewMarketEvent(market.MarketEvent{
-		Market: marketID, Source: "feed", Position: market.SourcePosition{Kind: market.SourcePositionBlock, Value: block},
+		Market: marketID, Source: "feed", Position: market.SourcePosition{Kind: sourceorder.BlockPositionKind, Value: block},
 		Finality:   market.FinalityConfirmed,
 		SourceTime: time.Date(2026, 1, 1, 0, 0, int(block%60), 0, time.UTC), SourceTimeKnown: true,
 		ReceivedAt: time.Date(2026, 1, 1, 0, 1, int(block%60), 0, time.UTC), Data: update,
@@ -195,7 +194,19 @@ func eventForMarket(t *testing.T, marketID market.MarketID, block uint64, base, 
 	return event
 }
 
-func apply(t *testing.T, mirror *constantproduct.Mirror, event market.MarketEvent) market.MarketSnapshot {
+func newMirror(t *testing.T, marketID market.MarketID, clock marketstate.Clock) *marketstate.Mirror {
+	t.Helper()
+	mirror, err := marketstate.NewMirror(
+		marketID, "feed", constantproduct.Reducer{},
+		sourceorder.NewMonotonic(sourceorder.BlockPositionKind, true), clock,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mirror
+}
+
+func apply(t *testing.T, mirror *marketstate.Mirror, event market.MarketEvent) market.MarketSnapshot {
 	t.Helper()
 	result, err := mirror.Apply(context.Background(), event)
 	if err != nil {
