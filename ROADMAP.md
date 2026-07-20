@@ -13,11 +13,14 @@ Status: implemented as an offline synthetic vertical slice.
 
 ## 2. Real market observation
 
-Observe a canonical Uniswap V3 pool on Ethereum through pool-filtered WebSocket
-logs, maintain bounded local tick state, and compare local quotes exactly with
-QuoterV2 at the same block hash.
+Observe canonical and compatible pools through pool-filtered WebSocket logs,
+maintain local state, and compare local quotes exactly with venue references at
+the same block hash.
 
-Status: implemented as an experimental read-only vertical slice.
+Status: implemented experimentally for canonical Uniswap V3 on Ethereum, a
+canonical Uniswap V2 pool on Robinhood Chain, and an Aerodrome Slipstream pool
+on Base. The two latter markets also have a read-only point-in-time
+cross-chain comparison.
 
 ## 3. Durable Research
 
@@ -29,8 +32,10 @@ settings, and make source health and data-quality incidents explicit.
 Add another market shape and conformance suites to prove that the core does not
 branch on chain or protocol names.
 
-Status: concentrated liquidity is represented by the local Uniswap V3 adapter;
-an order-book shape remains future work.
+Status: constant-product and concentrated-liquidity shapes are represented.
+Slipstream proves that a venue variant can reuse canonical V3 state and local
+quoting while adapting metadata, dynamic fees, and its reference quoter. An
+order-book shape remains future work.
 
 ## 5. Modeled execution
 
