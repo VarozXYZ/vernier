@@ -28,7 +28,7 @@ func New(marketID market.MarketID, events []market.MarketEvent) (*Feed, error) {
 
 func (f *Feed) MarketID() market.MarketID { return f.market }
 
-func (f *Feed) Run(ctx context.Context, sink feedport.EventSink) error {
+func (f *Feed) Run(ctx context.Context, sink feedport.Sink) error {
 	if sink == nil {
 		return fmt.Errorf("event sink is required")
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/VarozXYZ/vernier/adapters/feed/synthetic"
 	"github.com/VarozXYZ/vernier/domain/market"
+	feedport "github.com/VarozXYZ/vernier/ports/feed"
 )
 
 type eventData struct{}
@@ -20,6 +21,8 @@ func (s *sink) Publish(_ context.Context, event market.MarketEvent) error {
 	s.blocks = append(s.blocks, event.Position.Value)
 	return nil
 }
+
+func (s *sink) SetHealth(context.Context, feedport.HealthUpdate) error { return nil }
 
 func TestFeedPublishesEventsInFixtureOrder(t *testing.T) {
 	events := []market.MarketEvent{newEvent(t, 2), newEvent(t, 1)}

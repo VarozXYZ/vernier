@@ -30,6 +30,24 @@ type SnapshotData interface {
 }
 
 type SourcePositionKind string
+type SourceReferenceKind string
+
+// SourceReference identifies the source object from which an event or
+// snapshot was derived. It is opaque to the economic domain and is never used
+// for ordering.
+type SourceReference struct {
+	Kind  SourceReferenceKind
+	Value string
+}
+
+func (r SourceReference) Known() bool { return r.Kind != "" }
+
+func (r SourceReference) Validate() error {
+	if (r.Kind == "") != (r.Value == "") {
+		return fmt.Errorf("source reference kind and value must be provided together")
+	}
+	return nil
+}
 
 // SourcePosition is optional, source-provided ordering evidence. Positions are
 // comparable only when they use the same non-empty kind.
@@ -65,6 +83,7 @@ type MarketEvent struct {
 	Market          MarketID
 	Source          SourceID
 	Position        SourcePosition
+	Reference       SourceReference
 	Finality        Finality
 	SourceTime      time.Time
 	SourceTimeKnown bool
@@ -78,6 +97,9 @@ func NewMarketEvent(event MarketEvent) (MarketEvent, error) {
 		return MarketEvent{}, fmt.Errorf("market and source are required")
 	}
 	if err := event.Position.Validate(); err != nil {
+		return MarketEvent{}, err
+	}
+	if err := event.Reference.Validate(); err != nil {
 		return MarketEvent{}, err
 	}
 	if event.ReceivedAt.IsZero() {
@@ -101,6 +123,7 @@ type SnapshotMetadata struct {
 	Source          SourceID
 	Version         uint64
 	EventPosition   SourcePosition
+	EventReference  SourceReference
 	Finality        Finality
 	SourceTime      time.Time
 	SourceTimeKnown bool
@@ -127,6 +150,9 @@ func NewMarketSnapshot(metadata SnapshotMetadata, data SnapshotData) (MarketSnap
 		return MarketSnapshot{}, fmt.Errorf("snapshot version must be positive")
 	}
 	if err := metadata.EventPosition.Validate(); err != nil {
+		return MarketSnapshot{}, err
+	}
+	if err := metadata.EventReference.Validate(); err != nil {
 		return MarketSnapshot{}, err
 	}
 	if metadata.ReceivedAt.IsZero() || metadata.AppliedAt.IsZero() {

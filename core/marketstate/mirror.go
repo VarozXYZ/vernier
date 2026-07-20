@@ -87,7 +87,8 @@ func (m *Mirror) Apply(ctx context.Context, event market.MarketEvent) (feedport.
 	m.healthReason = ""
 	metadata := market.SnapshotMetadata{
 		Market: m.market, Source: m.source, Version: m.version, EventPosition: event.Position,
-		Finality: event.Finality, SourceTime: event.SourceTime, SourceTimeKnown: event.SourceTimeKnown,
+		EventReference: event.Reference,
+		Finality:       event.Finality, SourceTime: event.SourceTime, SourceTimeKnown: event.SourceTimeKnown,
 		ReceivedAt: event.ReceivedAt, AppliedAt: appliedAt, Health: m.health,
 		HealthReason: m.healthReason, HealthChangedAt: m.healthChangedAt, StateHash: stateHash,
 	}

@@ -72,3 +72,18 @@ func TestSourcePositionsCompareOnlyWithinTheSameKnownKind(t *testing.T) {
 		t.Fatal("known and unknown positions must not be comparable")
 	}
 }
+
+func TestSourceReferenceRequiresKindAndValueTogether(t *testing.T) {
+	for _, reference := range []market.SourceReference{
+		{Kind: "evm_block_hash"},
+		{Value: "0xabc"},
+	} {
+		_, err := market.NewMarketEvent(market.MarketEvent{
+			Market: "market", Source: "source", Reference: reference,
+			ReceivedAt: time.Now(), Data: testEventData{kind: "test"},
+		})
+		if err == nil {
+			t.Fatalf("expected invalid reference %+v to fail", reference)
+		}
+	}
+}
