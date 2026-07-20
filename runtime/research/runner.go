@@ -185,7 +185,7 @@ func NewRunner(fixture Fixture, configHash string) (*Runner, error) {
 	for _, configuredStrategy := range fixture.Strategies {
 		values := make([]market.AssetQuantity, len(configuredStrategy.Sizes))
 		for index, size := range configuredStrategy.Sizes {
-			values[index], err = market.ParseAssetQuantity(pair.QuoteAsset, size)
+			values[index], err = market.ParseAssetQuantity(pair.BaseAsset, size)
 			if err != nil {
 				return nil, fmt.Errorf("strategy %q size: %w", configuredStrategy.ID, err)
 			}

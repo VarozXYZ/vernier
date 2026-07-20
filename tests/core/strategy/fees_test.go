@@ -35,7 +35,7 @@ func TestUnmodeledQuoteFeeClosesClassification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "10")})
+	grid, err := sizing.NewGrid([]market.AssetQuantity{baseQuantity(t, "10")})
 	if err != nil {
 		t.Fatal(err)
 	}

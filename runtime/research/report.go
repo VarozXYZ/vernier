@@ -90,6 +90,7 @@ type sourcePositionDTO struct {
 }
 
 type candidateDTO struct {
+	Size      quantityDTO `json:"size"`
 	Input     quantityDTO `json:"input"`
 	Output    quantityDTO `json:"output"`
 	GrossPnL  quantityDTO `json:"gross_pnl"`
@@ -191,7 +192,7 @@ func newOpportunityDTO(opportunity arbitrage.Opportunity) opportunityDTO {
 	}
 	for _, candidate := range opportunity.Candidates {
 		dto.Candidates = append(dto.Candidates, candidateDTO{
-			Input: quantity(candidate.Input), Output: quantity(candidate.Output), GrossPnL: quantity(candidate.GrossPnL),
+			Size: quantity(candidate.Size), Input: quantity(candidate.Input), Output: quantity(candidate.Output), GrossPnL: quantity(candidate.GrossPnL),
 			Cost:     costDTO{ID: candidate.Cost.ID, Amount: quantity(candidate.Cost.Amount), CapturedAt: formatTime(candidate.Cost.CapturedAt)},
 			NetPnL:   quantity(candidate.NetPnL),
 			BuyQuote: quote(candidate.BuyQuote), SellQuote: quote(candidate.SellQuote),
