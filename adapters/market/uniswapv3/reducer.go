@@ -33,6 +33,13 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 		next.sqrtPriceX96 = cloneInt(update.sqrtPriceX96)
 		next.tick = update.tick
 		next.liquidity = cloneInt(update.liquidity)
+	case FeeUpdate:
+		current, err := requireSnapshot(previous)
+		if err != nil {
+			return nil, [sha256.Size]byte{}, err
+		}
+		next = current
+		next.feePips = update.feePips
 	case LiquidityUpdate:
 		current, err := requireSnapshot(previous)
 		if err != nil {

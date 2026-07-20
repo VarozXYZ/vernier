@@ -26,7 +26,7 @@ const poolABIJSON = "[" +
 	"{\"type\":\"function\",\"name\":\"fee\",\"stateMutability\":\"view\",\"inputs\":[],\"outputs\":[{\"type\":\"uint24\"}]}," +
 	"{\"type\":\"function\",\"name\":\"tickSpacing\",\"stateMutability\":\"view\",\"inputs\":[],\"outputs\":[{\"type\":\"int24\"}]}," +
 	"{\"type\":\"function\",\"name\":\"liquidity\",\"stateMutability\":\"view\",\"inputs\":[],\"outputs\":[{\"type\":\"uint128\"}]}," +
-	"{\"type\":\"function\",\"name\":\"slot0\",\"stateMutability\":\"view\",\"inputs\":[],\"outputs\":[{\"type\":\"uint160\"},{\"type\":\"int24\"},{\"type\":\"uint16\"},{\"type\":\"uint16\"},{\"type\":\"uint16\"},{\"type\":\"uint8\"},{\"type\":\"bool\"}]}," +
+	"{\"type\":\"function\",\"name\":\"slot0\",\"stateMutability\":\"view\",\"inputs\":[],\"outputs\":[{\"type\":\"uint160\"},{\"type\":\"int24\"}]}," +
 	"{\"type\":\"function\",\"name\":\"tickBitmap\",\"stateMutability\":\"view\",\"inputs\":[{\"type\":\"int16\"}],\"outputs\":[{\"type\":\"uint256\"}]}," +
 	"{\"type\":\"function\",\"name\":\"ticks\",\"stateMutability\":\"view\",\"inputs\":[{\"type\":\"int24\"}],\"outputs\":[{\"type\":\"uint128\"},{\"type\":\"int128\"},{\"type\":\"uint256\"},{\"type\":\"uint256\"},{\"type\":\"int56\"},{\"type\":\"uint160\"},{\"type\":\"uint32\"},{\"type\":\"bool\"}]}," +
 	"{\"type\":\"event\",\"name\":\"Initialize\",\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"name\":\"sqrtPriceX96\",\"type\":\"uint160\"},{\"indexed\":false,\"name\":\"tick\",\"type\":\"int24\"}]}," +
