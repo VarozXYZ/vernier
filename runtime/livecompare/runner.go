@@ -202,9 +202,18 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	threshold, _ := market.NewAssetQuantity(quoteAssetID, new(big.Rat))
-	robinhoodMarket, _ := registry.Market(robinhoodMarketID)
-	baseMarket, _ := registry.Market(baseMarketID)
+	threshold, err := market.NewAssetQuantity(quoteAssetID, new(big.Rat))
+	if err != nil {
+		return Report{}, fmt.Errorf("build live comparison threshold: %w", err)
+	}
+	robinhoodMarket, ok := registry.Market(robinhoodMarketID)
+	if !ok {
+		return Report{}, fmt.Errorf("live registry is missing Robinhood market")
+	}
+	baseMarket, ok := registry.Market(baseMarketID)
+	if !ok {
+		return Report{}, fmt.Errorf("live registry is missing Base market")
+	}
 	v2Local, err := constantproduct.NewQuoter("uniswap-v2/local", robinhoodMarket)
 	if err != nil {
 		return Report{}, err
@@ -461,7 +470,10 @@ func readDecimals(
 	block evm.BlockReference,
 	token common.Address,
 ) (uint8, error) {
-	input, _ := erc20ABI.Pack("decimals")
+	input, err := erc20ABI.Pack("decimals")
+	if err != nil {
+		return 0, fmt.Errorf("encode ERC-20 decimals call: %w", err)
+	}
 	output, err := network.CallContract(ctx, block, geth.CallMsg{To: &token, Data: input})
 	if err != nil {
 		return 0, err
