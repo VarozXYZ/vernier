@@ -1,4 +1,4 @@
-package research
+package research_test
 
 import (
 	"bytes"
@@ -8,9 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VarozXYZ/vernier/adapters/market/constantproduct"
-	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
+	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
 
 func TestFixtureProducesDeterministicReport(t *testing.T) {
@@ -18,7 +17,7 @@ func TestFixtureProducesDeterministicReport(t *testing.T) {
 
 	first := runFixture(t, fixture, hash)
 	second := runFixture(t, fixture, hash)
-	if first.Status != StatusHealthy || first.Evaluations != 2 || len(first.Opportunities) != 8 {
+	if first.Status != runtimeresearch.StatusHealthy || first.Evaluations != 2 || len(first.Opportunities) != 8 {
 		t.Fatalf("unexpected report summary: %+v", first)
 	}
 	if first.Opportunities[0].Classification != arbitrage.ClassificationPolicyQualified {
@@ -31,10 +30,10 @@ func TestFixtureProducesDeterministicReport(t *testing.T) {
 	assertSharedSnapshots(t, first.Opportunities[0], first.Opportunities[2])
 
 	var firstJSON, secondJSON bytes.Buffer
-	if err := WriteJSON(&firstJSON, first); err != nil {
+	if err := runtimeresearch.WriteJSON(&firstJSON, first); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteJSON(&secondJSON, second); err != nil {
+	if err := runtimeresearch.WriteJSON(&secondJSON, second); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(firstJSON.Bytes(), secondJSON.Bytes()) {
@@ -57,20 +56,19 @@ func TestFixtureProducesDeterministicReport(t *testing.T) {
 
 func TestFixtureComposesHeterogeneousMarketAdapters(t *testing.T) {
 	fixture, hash := loadExample(t)
-	runner, err := NewRunner(fixture, hash)
+	if len(fixture.Catalog.Pools) != 2 || fixture.Catalog.Pools[0].Adapter != "constant_product" || fixture.Catalog.Pools[1].Adapter != "uniswap_v3" {
+		t.Fatalf("fixture does not configure heterogeneous adapters: %+v", fixture.Catalog.Pools)
+	}
+	runner, err := runtimeresearch.NewRunner(fixture, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Run(context.Background()); err != nil {
+	report, err := runner.Run(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	alpha, _ := runner.mirrors["market-alpha"].Current()
-	beta, _ := runner.mirrors["market-beta"].Current()
-	if _, ok := alpha.Data().(constantproduct.Snapshot); !ok {
-		t.Fatalf("market alpha state type = %T", alpha.Data())
-	}
-	if _, ok := beta.Data().(uniswapv3.Snapshot); !ok {
-		t.Fatalf("market beta state type = %T", beta.Data())
+	if report.Status != runtimeresearch.StatusHealthy || len(report.Opportunities) == 0 {
+		t.Fatalf("heterogeneous runtime did not produce a healthy report: %+v", report)
 	}
 }
 
@@ -89,14 +87,14 @@ func assertSharedSnapshots(t *testing.T, left, right arbitrage.Opportunity) {
 
 func TestDisconnectDegradesReportAndOpportunities(t *testing.T) {
 	fixture, hash := loadExample(t)
-	fixture.Feeds[1].Disconnect = &DisconnectFixture{
+	fixture.Feeds[1].Disconnect = &runtimeresearch.DisconnectFixture{
 		Reason: "websocket_disconnected", ObservedAt: "2026-01-01T00:00:03.100Z",
 		EvaluationStartedAt:  "2026-01-01T00:00:03.120Z",
 		EvaluationFinishedAt: "2026-01-01T00:00:03.130Z",
 	}
 
 	report := runFixture(t, fixture, hash)
-	if report.Status != StatusDegraded || len(report.FeedIncidents) != 1 {
+	if report.Status != runtimeresearch.StatusDegraded || len(report.FeedIncidents) != 1 {
 		t.Fatalf("expected one explicit feed incident, got %+v", report)
 	}
 	if incident := report.FeedIncidents[0]; incident.Reason != "websocket_disconnected" {
@@ -118,7 +116,7 @@ func TestOlderBlockIsIgnoredWithoutDegradingOrEvaluating(t *testing.T) {
 	fixture.Feeds[1].Events[1].BlockNumber = &older
 
 	report := runFixture(t, fixture, hash)
-	if report.Status != StatusHealthy || len(report.FeedIncidents) != 0 {
+	if report.Status != runtimeresearch.StatusHealthy || len(report.FeedIncidents) != 0 {
 		t.Fatalf("stale event changed feed health: %+v", report)
 	}
 	if len(report.IgnoredEvents) != 1 || report.IgnoredEvents[0].Reason != "older_block" {
@@ -136,7 +134,7 @@ func TestFixtureDecoderIsStrict(t *testing.T) {
 		"second value":  `{"schema_version":1} {}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := ParseFixture([]byte(data)); err == nil {
+			if _, _, err := runtimeresearch.ParseFixture([]byte(data)); err == nil {
 				t.Fatal("expected fixture rejection")
 			}
 		})
@@ -145,7 +143,7 @@ func TestFixtureDecoderIsStrict(t *testing.T) {
 
 func TestRunnerIsSingleUse(t *testing.T) {
 	fixture, hash := loadExample(t)
-	runner, err := NewRunner(fixture, hash)
+	runner, err := runtimeresearch.NewRunner(fixture, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,22 +155,22 @@ func TestRunnerIsSingleUse(t *testing.T) {
 	}
 }
 
-func loadExample(t *testing.T) (Fixture, string) {
+func loadExample(t *testing.T) (runtimeresearch.Fixture, string) {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "synthetic", "two-market.json"))
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "examples", "synthetic", "two-market.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture, hash, err := ParseFixture(data)
+	fixture, hash, err := runtimeresearch.ParseFixture(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return fixture, hash
 }
 
-func runFixture(t *testing.T, fixture Fixture, hash string) Report {
+func runFixture(t *testing.T, fixture runtimeresearch.Fixture, hash string) runtimeresearch.Report {
 	t.Helper()
-	runner, err := NewRunner(fixture, hash)
+	runner, err := runtimeresearch.NewRunner(fixture, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +181,7 @@ func runFixture(t *testing.T, fixture Fixture, hash string) Report {
 	return report
 }
 
-func assertFixedSnapshots(t *testing.T, report Report) {
+func assertFixedSnapshots(t *testing.T, report runtimeresearch.Report) {
 	t.Helper()
 	for _, opportunity := range report.Opportunities {
 		if len(opportunity.Candidates) < 2 {

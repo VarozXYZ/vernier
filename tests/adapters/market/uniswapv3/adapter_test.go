@@ -1,4 +1,4 @@
-package uniswapv3
+package uniswapv3_test
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
+	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
 	"github.com/VarozXYZ/vernier/core/marketstate"
 	"github.com/VarozXYZ/vernier/domain/market"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
@@ -17,11 +18,11 @@ func TestSqrtRatioAtTickMatchesCanonicalBoundaries(t *testing.T) {
 		tick int32
 		want string
 	}{
-		{tick: MinTick, want: "4295128739"},
+		{tick: uniswapv3.MinTick, want: "4295128739"},
 		{tick: 0, want: "79228162514264337593543950336"},
-		{tick: MaxTick, want: "1461446703485210103287273052203988822378723970342"},
+		{tick: uniswapv3.MaxTick, want: "1461446703485210103287273052203988822378723970342"},
 	} {
-		got, err := SqrtRatioAtTick(test.tick)
+		got, err := uniswapv3.SqrtRatioAtTick(test.tick)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -33,7 +34,7 @@ func TestSqrtRatioAtTickMatchesCanonicalBoundaries(t *testing.T) {
 
 func TestExactInputQuoteMatchesIndependentSingleRangeVector(t *testing.T) {
 	snapshot := snapshotForTest(t, big.NewInt(1_000_000_000_000), nil)
-	quoter, err := NewQuoter("local-v3", testMarket(), "token0", "token1")
+	quoter, err := uniswapv3.NewQuoter("local-v3", testMarket(), "token0", "token1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +53,7 @@ func TestExactInputQuoteMatchesIndependentSingleRangeVector(t *testing.T) {
 
 func TestExactInputQuoteSupportsBothTokenDirections(t *testing.T) {
 	snapshot := snapshotForTest(t, big.NewInt(1_000_000_000_000), nil)
-	quoter, _ := NewQuoter("local-v3", testMarket(), "token0", "token1")
+	quoter, _ := uniswapv3.NewQuoter("local-v3", testMarket(), "token0", "token1")
 	amountIn, _ := market.ParseTokenAmount("token1", "1000000")
 	quote, err := quoter.Quote(context.Background(), quoteport.Input{
 		Snapshot: snapshot, TokenIn: "token1", TokenOut: "token0", AmountIn: amountIn,
@@ -66,65 +67,73 @@ func TestExactInputQuoteSupportsBothTokenDirections(t *testing.T) {
 	}
 }
 
+func TestExactInputQuoteTraversesBitmapWordBoundaries(t *testing.T) {
+	snapshot := snapshotForTest(t, big.NewInt(1_000_000_000_000), nil)
+	quoter, _ := uniswapv3.NewQuoter("local-v3", testMarket(), "token0", "token1")
+	amountIn, _ := market.ParseTokenAmount("token0", "2000000000000")
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{
+		Snapshot: snapshot, TokenIn: "token0", TokenOut: "token1", AmountIn: amountIn,
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: testTime().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.AmountOut.String() != "665998663994" || quote.Fees()[0].Amount().String() != "6000000001" {
+		t.Fatalf("word traversal quote output=%s fee=%s", quote.AmountOut, quote.Fees()[0].Amount())
+	}
+}
+
 func TestQuoteCrossesInitializedTickAndChangesLiquidity(t *testing.T) {
 	inner := big.NewInt(1_000_000_000_000)
 	outer := big.NewInt(1_000_000_000_000)
-	ticks := []Tick{
+	ticks := []uniswapv3.Tick{
 		mustTick(t, -120, outer, outer),
 		mustTick(t, -60, inner, inner),
 		mustTick(t, 60, inner, new(big.Int).Neg(new(big.Int).Set(inner))),
 		mustTick(t, 120, outer, new(big.Int).Neg(new(big.Int).Set(outer))),
 	}
-	state := snapshotForTest(t, big.NewInt(2_000_000_000_000), ticks).Data().(Snapshot)
-	result, err := quoteExactInput(state, true, big.NewInt(7_000_000_000))
+	snapshot := snapshotForTest(t, big.NewInt(2_000_000_000_000), ticks)
+	quoter, err := uniswapv3.NewQuoter("local-v3", testMarket(), "token0", "token1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ticksCrossed != 1 || result.amountOut.String() != "6954265622" || result.fee.String() != "21000001" {
-		t.Fatalf("unexpected crossing result: %+v", result)
+	amountIn, _ := market.ParseTokenAmount("token0", "7000000000")
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{
+		Snapshot: snapshot, TokenIn: "token0", TokenOut: "token1", AmountIn: amountIn,
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: testTime().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestTickTraversalPreservesBitmapWordBoundaries(t *testing.T) {
-	if next, initialized := nextInitializedTickWithinOneWord(nil, 0, 60, true); next != 0 || initialized {
-		t.Fatalf("zero-for-one boundary = %d initialized=%v", next, initialized)
-	}
-	if next, initialized := nextInitializedTickWithinOneWord(nil, -1, 60, true); next != -15360 || initialized {
-		t.Fatalf("negative word boundary = %d initialized=%v", next, initialized)
-	}
-	if next, initialized := nextInitializedTickWithinOneWord(nil, 0, 60, false); next != 15300 || initialized {
-		t.Fatalf("one-for-zero boundary = %d initialized=%v", next, initialized)
-	}
-	tick := mustTick(t, -60, big.NewInt(1), big.NewInt(1))
-	if next, initialized := nextInitializedTickWithinOneWord([]Tick{tick}, -1, 60, true); next != -60 || !initialized {
-		t.Fatalf("initialized boundary = %d initialized=%v", next, initialized)
+	if quote.AmountOut.String() != "6954265622" || quote.Fees()[0].Amount().String() != "21000001" {
+		t.Fatalf("crossing quote output=%s fee=%s", quote.AmountOut, quote.Fees()[0].Amount())
 	}
 }
 
 func TestReducerPublishesImmutableStateAndAppliesLiquidityEvents(t *testing.T) {
 	mirror := newV3Mirror(t)
 	initial := applyV3(t, mirror, v3Event(t, 10, stateUpdateForTest(t, big.NewInt(1_000_000_000_000), nil)))
-	initialState := initial.Data().(Snapshot)
+	initialState := initial.Data().(uniswapv3.Snapshot)
 	price := initialState.SqrtPriceX96()
 	price.SetInt64(1)
-	if initialState.SqrtPriceX96().Cmp(q96) != 0 {
+	if initialState.SqrtPriceX96().Cmp(q96()) != 0 {
 		t.Fatal("snapshot price mutated through returned integer")
 	}
 
-	liquidityEvent, err := NewLiquidityUpdate(-60, 60, big.NewInt(500_000_000_000))
+	liquidityEvent, err := uniswapv3.NewLiquidityUpdate(-60, 60, big.NewInt(500_000_000_000))
 	if err != nil {
 		t.Fatal(err)
 	}
 	updated := applyV3(t, mirror, v3Event(t, 11, liquidityEvent))
-	updatedState := updated.Data().(Snapshot)
+	updatedState := updated.Data().(uniswapv3.Snapshot)
 	if updatedState.Liquidity().String() != "1500000000000" || len(updatedState.Ticks()) != 2 {
 		t.Fatalf("unexpected liquidity state: liquidity=%s ticks=%d", updatedState.Liquidity(), len(updatedState.Ticks()))
 	}
 	if initial.Metadata().Version != 1 || updated.Metadata().Version != 2 || len(initialState.Ticks()) != 0 {
 		t.Fatal("generic mirror did not preserve immutable V3 snapshots")
 	}
-	burn, _ := NewLiquidityUpdate(-60, 60, big.NewInt(-500_000_000_000))
-	restored := applyV3(t, mirror, v3Event(t, 12, burn)).Data().(Snapshot)
+	burn, _ := uniswapv3.NewLiquidityUpdate(-60, 60, big.NewInt(-500_000_000_000))
+	restored := applyV3(t, mirror, v3Event(t, 12, burn)).Data().(uniswapv3.Snapshot)
 	if restored.Liquidity().String() != "1000000000000" || len(restored.Ticks()) != 0 {
 		t.Fatalf("liquidity burn did not restore state: liquidity=%s ticks=%d", restored.Liquidity(), len(restored.Ticks()))
 	}
@@ -133,37 +142,37 @@ func TestReducerPublishesImmutableStateAndAppliesLiquidityEvents(t *testing.T) {
 func TestReducerAppliesSwapStateWithoutLosingInitializedTicks(t *testing.T) {
 	mirror := newV3Mirror(t)
 	outer := big.NewInt(1_000_000_000_000)
-	ticks := []Tick{
+	ticks := []uniswapv3.Tick{
 		mustTick(t, -60, outer, outer),
 		mustTick(t, 60, outer, new(big.Int).Neg(new(big.Int).Set(outer))),
 	}
 	applyV3(t, mirror, v3Event(t, 1, stateUpdateForTest(t, outer, ticks)))
-	nextPrice, _ := SqrtRatioAtTick(1)
-	swap, err := NewSwapUpdate(nextPrice, 1, outer)
+	nextPrice, _ := uniswapv3.SqrtRatioAtTick(1)
+	swap, err := uniswapv3.NewSwapUpdate(nextPrice, 1, outer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated := applyV3(t, mirror, v3Event(t, 2, swap)).Data().(Snapshot)
+	updated := applyV3(t, mirror, v3Event(t, 2, swap)).Data().(uniswapv3.Snapshot)
 	if updated.Tick() != 1 || updated.SqrtPriceX96().Cmp(nextPrice) != 0 || len(updated.Ticks()) != 2 {
 		t.Fatalf("unexpected swap state: tick=%d price=%s ticks=%d", updated.Tick(), updated.SqrtPriceX96(), len(updated.Ticks()))
 	}
 }
 
 func TestStateRejectsPriceInconsistentWithTick(t *testing.T) {
-	if _, err := NewStateUpdate(q96, 60, big.NewInt(1), 3000, 60, nil); err == nil {
+	if _, err := uniswapv3.NewStateUpdate(q96(), 60, big.NewInt(1), 3000, 60, nil); err == nil {
 		t.Fatal("inconsistent tick and sqrt price were accepted")
 	}
 }
 
-func snapshotForTest(t *testing.T, liquidity *big.Int, ticks []Tick) market.MarketSnapshot {
+func snapshotForTest(t *testing.T, liquidity *big.Int, ticks []uniswapv3.Tick) market.MarketSnapshot {
 	t.Helper()
 	mirror := newV3Mirror(t)
 	return applyV3(t, mirror, v3Event(t, 1, stateUpdateForTest(t, liquidity, ticks)))
 }
 
-func stateUpdateForTest(t *testing.T, liquidity *big.Int, ticks []Tick) StateUpdate {
+func stateUpdateForTest(t *testing.T, liquidity *big.Int, ticks []uniswapv3.Tick) uniswapv3.StateUpdate {
 	t.Helper()
-	update, err := NewStateUpdate(q96, 0, liquidity, 3000, 60, ticks)
+	update, err := uniswapv3.NewStateUpdate(q96(), 0, liquidity, 3000, 60, ticks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +182,7 @@ func stateUpdateForTest(t *testing.T, liquidity *big.Int, ticks []Tick) StateUpd
 func newV3Mirror(t *testing.T) *marketstate.Mirror {
 	t.Helper()
 	mirror, err := marketstate.NewMirror(
-		"market", "feed", Reducer{}, sourceorder.NewMonotonic(sourceorder.BlockPositionKind, true), testTime,
+		"market", "feed", uniswapv3.Reducer{}, sourceorder.NewMonotonic(sourceorder.BlockPositionKind, true), testTime,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -202,9 +211,9 @@ func v3Event(t *testing.T, block uint64, data market.EventData) market.MarketEve
 	return event
 }
 
-func mustTick(t *testing.T, index int32, gross, net *big.Int) Tick {
+func mustTick(t *testing.T, index int32, gross, net *big.Int) uniswapv3.Tick {
 	t.Helper()
-	tick, err := NewTick(index, gross, net)
+	tick, err := uniswapv3.NewTick(index, gross, net)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,3 +225,8 @@ func testMarket() market.Market {
 }
 
 func testTime() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }
+
+func q96() *big.Int {
+	value, _ := new(big.Int).SetString("79228162514264337593543950336", 10)
+	return value
+}

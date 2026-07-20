@@ -14,3 +14,9 @@ public issue. Follow [SECURITY.md](SECURITY.md) instead.
 Project-owned changes use short branches, English Conventional Commit titles,
 tests proportional to risk, and pull requests that explain problem, approach,
 scope, validation, risks, and documentation.
+
+All Go tests and test-only data live under the root `tests/` tree, mirroring the
+production package layout. Production directories must not contain `_test.go`
+files or `testdata/`. Tests exercise public behavior; production internals are
+not exported solely to make them testable. `go run ./tools/verify` enforces this
+layout.

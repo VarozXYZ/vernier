@@ -18,6 +18,7 @@ func main() {
 		fn   func() error
 	}{
 		{"public tree", checkPublicTree},
+		{"test layout", checkTestLayout},
 		{"Go formatting", checkGoFormatting},
 		{"text formatting", checkTextFormatting},
 		{"go vet", command("go", "vet", "./...")},
@@ -121,6 +122,28 @@ func checkPublicTree() error {
 	}
 	if len(forbidden) > 0 {
 		return fmt.Errorf("private paths are tracked: %s", strings.Join(forbidden, ", "))
+	}
+	return nil
+}
+
+func checkTestLayout() error {
+	files, err := repositoryFiles()
+	if err != nil {
+		return err
+	}
+
+	var misplaced []string
+	for _, file := range files {
+		path := strings.ToLower(filepath.ToSlash(file))
+		if strings.HasPrefix(path, "tests/") {
+			continue
+		}
+		if strings.HasSuffix(path, "_test.go") || strings.HasPrefix(path, "testdata/") || strings.Contains(path, "/testdata/") {
+			misplaced = append(misplaced, file)
+		}
+	}
+	if len(misplaced) > 0 {
+		return fmt.Errorf("test files must live under tests/: %s", strings.Join(misplaced, ", "))
 	}
 	return nil
 }

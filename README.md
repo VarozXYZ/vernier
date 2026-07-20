@@ -62,6 +62,9 @@ go run ./tools/verify
 Code contributions are closed by default. See [CONTRIBUTING.md](CONTRIBUTING.md)
 and [SECURITY.md](SECURITY.md) before opening an issue.
 
+Tests and test-only data are centralized under `tests/`; production package
+directories contain implementation only.
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
