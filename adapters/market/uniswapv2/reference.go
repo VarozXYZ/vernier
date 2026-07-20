@@ -23,7 +23,7 @@ type ReferenceQuoter struct{ router common.Address }
 
 func NewReferenceQuoter(router common.Address) (*ReferenceQuoter, error) {
 	if router == (common.Address{}) {
-		return nil, fmt.Errorf("Uniswap V2 router address is required")
+		return nil, fmt.Errorf("uniswap V2 router address is required")
 	}
 	return &ReferenceQuoter{router: router}, nil
 }
@@ -53,7 +53,7 @@ func (q *ReferenceQuoter) QuoteExactInput(
 	}
 	amounts, ok := values[0].([]*big.Int)
 	if !ok || len(amounts) != 2 || amounts[1] == nil || amounts[1].Sign() <= 0 {
-		return nil, fmt.Errorf("Uniswap V2 router returned invalid amounts")
+		return nil, fmt.Errorf("uniswap V2 router returned invalid amounts")
 	}
 	return new(big.Int).Set(amounts[1]), nil
 }

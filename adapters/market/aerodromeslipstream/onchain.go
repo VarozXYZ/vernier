@@ -45,7 +45,7 @@ func NewAdapter(config Config) (*Adapter, error) {
 	if config.Pool == (common.Address{}) || config.Factory == (common.Address{}) ||
 		config.BaseToken == (common.Address{}) || config.QuoteToken == (common.Address{}) ||
 		config.BaseToken == config.QuoteToken {
-		return nil, fmt.Errorf("Slipstream pool, factory, and distinct market tokens are required")
+		return nil, fmt.Errorf("slipstream pool, factory, and distinct market tokens are required")
 	}
 	inner, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{
 		Pool: config.Pool, MaxTickWords: config.MaxTickWords, Probes: config.Probes,
@@ -72,7 +72,7 @@ func (a *Adapter) Bootstrap(
 		return nil, err
 	}
 	if factory != a.config.Factory {
-		return nil, fmt.Errorf("Slipstream pool factory does not match configuration")
+		return nil, fmt.Errorf("slipstream pool factory does not match configuration")
 	}
 	update, err := a.inner.Bootstrap(ctx, network, block)
 	if err != nil {
@@ -80,7 +80,7 @@ func (a *Adapter) Bootstrap(
 	}
 	info, ok := a.inner.PoolInfo()
 	if !ok || !sameEndpoints(info.Token0, info.Token1, a.config.BaseToken, a.config.QuoteToken) {
-		return nil, fmt.Errorf("Slipstream pool tokens do not match market endpoints")
+		return nil, fmt.Errorf("slipstream pool tokens do not match market endpoints")
 	}
 	return update, nil
 }
@@ -130,7 +130,7 @@ func (a *Adapter) addressCall(
 	}
 	value, ok := values[0].(common.Address)
 	if !ok || value == (common.Address{}) {
-		return common.Address{}, fmt.Errorf("Slipstream %s returned an invalid address", method)
+		return common.Address{}, fmt.Errorf("slipstream %s returned an invalid address", method)
 	}
 	return value, nil
 }
@@ -146,7 +146,7 @@ func (a *Adapter) feeAt(
 	}
 	value, ok := values[0].(*big.Int)
 	if !ok || value == nil || !value.IsUint64() || value.Uint64() >= 1_000_000 {
-		return 0, fmt.Errorf("Slipstream fee is invalid")
+		return 0, fmt.Errorf("slipstream fee is invalid")
 	}
 	return uint32(value.Uint64()), nil
 }

@@ -135,17 +135,17 @@ func ParseConfig(data []byte) (ParsedConfig, error) {
 		previous = value
 	}
 	if config.Robinhood.FeeBPS == 0 || config.Robinhood.FeeBPS >= 10_000 {
-		return ParsedConfig{}, fmt.Errorf("Robinhood fee_bps must be between 1 and 9999")
+		return ParsedConfig{}, fmt.Errorf("robinhood fee_bps must be between 1 and 9999")
 	}
 	if config.Robinhood.RPCMinIntervalMS < 0 || config.Robinhood.RPCMinIntervalMS > 10_000 ||
 		config.Base.RPCMinIntervalMS < 0 || config.Base.RPCMinIntervalMS > 10_000 {
-		return ParsedConfig{}, fmt.Errorf("RPC minimum intervals must be between 0 and 10000 milliseconds")
+		return ParsedConfig{}, fmt.Errorf("rpc minimum intervals must be between 0 and 10000 milliseconds")
 	}
 	if config.Base.MaxTickWords == 0 {
 		config.Base.MaxTickWords = 64
 	}
 	if config.Base.MaxTickWords < 1 || config.Base.MaxTickWords > 512 {
-		return ParsedConfig{}, fmt.Errorf("Base max_tick_words must be between 1 and 512")
+		return ParsedConfig{}, fmt.Errorf("base max_tick_words must be between 1 and 512")
 	}
 
 	addresses := []string{

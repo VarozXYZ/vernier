@@ -4,10 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/big"
-	"strings"
 
 	geth "github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
@@ -50,7 +48,7 @@ type ReferenceQuoter struct {
 
 func NewReferenceQuoter(address common.Address) (*ReferenceQuoter, error) {
 	if address == (common.Address{}) {
-		return nil, fmt.Errorf("Slipstream quoter address is required")
+		return nil, fmt.Errorf("slipstream quoter address is required")
 	}
 	return &ReferenceQuoter{address: address}, nil
 }
@@ -85,15 +83,7 @@ func (q *ReferenceQuoter) QuoteExactInputSingle(
 	}
 	amountOut, ok := values[0].(*big.Int)
 	if !ok || amountOut == nil || amountOut.Sign() <= 0 {
-		return nil, fmt.Errorf("Slipstream quoter returned a non-positive amount")
+		return nil, fmt.Errorf("slipstream quoter returned a non-positive amount")
 	}
 	return new(big.Int).Set(amountOut), nil
-}
-
-func mustReferenceABI(definition string) abi.ABI {
-	parsed, err := abi.JSON(strings.NewReader(definition))
-	if err != nil {
-		panic(err)
-	}
-	return parsed
 }

@@ -55,13 +55,13 @@ func NewAdapter(config Config) (*Adapter, error) {
 	if config.Pool == (common.Address{}) || config.Factory == (common.Address{}) ||
 		config.BaseToken == (common.Address{}) || config.QuoteToken == (common.Address{}) ||
 		config.BaseToken == config.QuoteToken {
-		return nil, fmt.Errorf("Uniswap V2 pool, factory, and distinct market tokens are required")
+		return nil, fmt.Errorf("uniswap V2 pool, factory, and distinct market tokens are required")
 	}
 	if config.FeeBPS == 0 {
 		config.FeeBPS = 30
 	}
 	if config.FeeBPS >= 10_000 {
-		return nil, fmt.Errorf("Uniswap V2 fee must be below 10000 basis points")
+		return nil, fmt.Errorf("uniswap V2 fee must be below 10000 basis points")
 	}
 	return &Adapter{config: config}, nil
 }
@@ -83,7 +83,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 		return nil, err
 	}
 	if len(code) == 0 {
-		return nil, fmt.Errorf("Uniswap V2 pool has no code")
+		return nil, fmt.Errorf("uniswap V2 pool has no code")
 	}
 	token0, err := a.addressCall(ctx, network, block, "token0")
 	if err != nil {
@@ -98,10 +98,10 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 		return nil, err
 	}
 	if token0 == token1 || factory != a.config.Factory {
-		return nil, fmt.Errorf("Uniswap V2 pool metadata does not match configuration")
+		return nil, fmt.Errorf("uniswap V2 pool metadata does not match configuration")
 	}
 	if !sameEndpoints(token0, token1, a.config.BaseToken, a.config.QuoteToken) {
-		return nil, fmt.Errorf("Uniswap V2 pool tokens do not match market endpoints")
+		return nil, fmt.Errorf("uniswap V2 pool tokens do not match market endpoints")
 	}
 	values, err := a.call(ctx, network, block, "getReserves")
 	if err != nil {
@@ -122,7 +122,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 
 func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockReference, logs []types.Log) (market.EventData, error) {
 	if !a.loaded {
-		return nil, fmt.Errorf("Uniswap V2 pool metadata is unavailable")
+		return nil, fmt.Errorf("uniswap V2 pool metadata is unavailable")
 	}
 	ordered := append([]types.Log(nil), logs...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Index < ordered[j].Index })
@@ -137,7 +137,7 @@ func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockR
 		latest = candidate
 	}
 	if latest == nil {
-		return nil, fmt.Errorf("Uniswap V2 active block contains no usable Sync event")
+		return nil, fmt.Errorf("uniswap V2 active block contains no usable Sync event")
 	}
 	values, err := pairABI.Events["Sync"].Inputs.NonIndexed().Unpack(latest.Data)
 	if err != nil {
@@ -169,7 +169,7 @@ func (a *Adapter) addressCall(ctx context.Context, network evm.Network, block ev
 	}
 	value, ok := values[0].(common.Address)
 	if !ok || value == (common.Address{}) {
-		return common.Address{}, fmt.Errorf("Uniswap V2 %s returned an invalid address", method)
+		return common.Address{}, fmt.Errorf("uniswap V2 %s returned an invalid address", method)
 	}
 	return value, nil
 }
@@ -197,7 +197,7 @@ func sameEndpoints(token0, token1, base, quote common.Address) bool {
 func integer(value any, name string) (*big.Int, error) {
 	result, ok := value.(*big.Int)
 	if !ok || result == nil || result.Sign() <= 0 {
-		return nil, fmt.Errorf("Uniswap V2 %s is invalid", name)
+		return nil, fmt.Errorf("uniswap V2 %s is invalid", name)
 	}
 	return new(big.Int).Set(result), nil
 }

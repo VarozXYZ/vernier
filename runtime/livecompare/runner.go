@@ -211,7 +211,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	}
 	baseInfo, ok := slipstream.PoolInfo()
 	if !ok {
-		return Report{}, fmt.Errorf("Slipstream pool metadata is unavailable")
+		return Report{}, fmt.Errorf("slipstream pool metadata is unavailable")
 	}
 	token0ID, token1ID := tokens.baseBase.ID, tokens.baseQuote.ID
 	if baseInfo.Token0 == r.config.BaseQuoteToken {
@@ -403,11 +403,11 @@ func (r *Runner) validateParity(
 	}
 	_, ok := v2.PoolInfo()
 	if !ok {
-		return nil, fmt.Errorf("Uniswap V2 pool metadata is unavailable")
+		return nil, fmt.Errorf("uniswap V2 pool metadata is unavailable")
 	}
 	_, ok = slipstream.PoolInfo()
 	if !ok {
-		return nil, fmt.Errorf("Slipstream pool metadata is unavailable")
+		return nil, fmt.Errorf("slipstream pool metadata is unavailable")
 	}
 	tokenAddress := map[market.TokenID]common.Address{
 		tokens.robinhoodBase.ID: r.config.RobinhoodBaseToken, tokens.robinhoodQuote.ID: r.config.RobinhoodQuoteToken,
