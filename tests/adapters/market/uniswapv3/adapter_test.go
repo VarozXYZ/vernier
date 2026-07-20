@@ -164,6 +164,19 @@ func TestStateRejectsPriceInconsistentWithTick(t *testing.T) {
 	}
 }
 
+func TestBoundedStateRejectsTicksOutsideDeclaredCoverage(t *testing.T) {
+	coverage, err := uniswapv3.NewTickCoverage(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := mustTick(t, -60, big.NewInt(1), big.NewInt(1))
+	if _, err := uniswapv3.NewCoveredStateUpdate(
+		q96(), 0, big.NewInt(1), 3000, 60, []uniswapv3.Tick{outside}, coverage,
+	); err == nil {
+		t.Fatal("tick in bitmap word -1 was accepted by coverage 0..0")
+	}
+}
+
 func snapshotForTest(t *testing.T, liquidity *big.Int, ticks []uniswapv3.Tick) market.MarketSnapshot {
 	t.Helper()
 	mirror := newV3Mirror(t)

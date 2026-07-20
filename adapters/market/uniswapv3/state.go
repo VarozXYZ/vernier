@@ -219,6 +219,10 @@ func (s Snapshot) validate() error {
 		if initialized.index <= previous || initialized.index < MinTick || initialized.index > MaxTick || initialized.index%s.tickSpacing != 0 {
 			return fmt.Errorf("invalid or unsorted initialized tick %d", initialized.index)
 		}
+		word := int32(floorDiv(floorDiv(int64(initialized.index), int64(s.tickSpacing)), 256))
+		if !s.coverage.Contains(word) {
+			return fmt.Errorf("initialized tick %d is outside declared coverage", initialized.index)
+		}
 		if _, err := NewTick(initialized.index, initialized.liquidityGross, initialized.liquidityNet); err != nil {
 			return err
 		}
