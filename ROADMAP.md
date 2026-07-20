@@ -8,6 +8,8 @@ dates are intentionally omitted until implementation evidence supports them.
 Normalize synthetic market events, publish immutable snapshots, quote locally,
 evaluate two-market strategies, and produce auditable opportunity reports.
 
+Status: implemented as an offline synthetic vertical slice.
+
 ## 2. Durable Research
 
 Persist runs and market history, reconstruct opportunity windows, compare

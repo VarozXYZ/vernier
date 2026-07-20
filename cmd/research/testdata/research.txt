@@ -1,0 +1,15 @@
+Vernier deterministic Research
+run: synthetic-two-market
+status: healthy
+config: de6ccd1838398594b7bdd5bf30d033fffe2e3fcd5b69a7b0b15f8e5eab3ce9bb
+evaluations: 2
+opportunities: 8
+gaps: 0
+baseline market-alpha->market-beta policy_qualified net=3.272103
+baseline market-beta->market-alpha no_spread net=-2.440142
+conservative market-alpha->market-beta economic net=3.272103
+conservative market-beta->market-alpha no_spread net=-2.440142
+baseline market-alpha->market-beta no_spread net=-1.214843
+baseline market-beta->market-alpha economic net=0.067827
+conservative market-alpha->market-beta no_spread net=-1.214843
+conservative market-beta->market-alpha economic net=0.067827

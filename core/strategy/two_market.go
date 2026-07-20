@@ -82,9 +82,10 @@ func (s *TwoMarketCrossChainArbitrage) Evaluate(ctx context.Context, evaluation 
 
 func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction) arbitrage.Opportunity {
 	opportunity := arbitrage.Opportunity{
-		Evaluation: evaluation.ID(), Strategy: s.id, Direction: direction,
+		Evaluation: evaluation.ID(), Run: evaluation.Run(), ConfigHash: evaluation.ConfigHash(),
+		Strategy: s.id, Direction: direction,
 		Classification: arbitrage.ClassificationUnclassifiable, SelectedIndex: -1,
-		Threshold: s.threshold,
+		Threshold: s.threshold, TriggeredAt: evaluation.TriggeredAt(), StartedAt: evaluation.StartedAt(),
 	}
 	buySnapshot, buyOK := evaluation.Snapshot(direction.BuyMarket)
 	sellSnapshot, sellOK := evaluation.Snapshot(direction.SellMarket)
@@ -92,6 +93,7 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 		opportunity.Reasons = []string{"missing_market_snapshot"}
 		return s.finish(opportunity)
 	}
+	opportunity.Snapshots = []market.SnapshotMetadata{buySnapshot.Metadata(), sellSnapshot.Metadata()}
 	for _, snapshot := range []market.MarketSnapshot{buySnapshot, sellSnapshot} {
 		metadata := snapshot.Metadata()
 		if metadata.Health != market.HealthHealthy {
@@ -187,7 +189,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	gross, _ := output.Sub(actualInput)
 	net, _ := gross.Sub(evaluation.Cost().Amount)
 	return arbitrage.Candidate{
-		Input: actualInput, Output: output, GrossPnL: gross, Cost: evaluation.Cost().Amount, NetPnL: net,
+		Input: actualInput, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
 		BuyQuote: buy, SellQuote: sell,
 	}, nil
 }

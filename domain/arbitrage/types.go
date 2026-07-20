@@ -150,7 +150,7 @@ type Candidate struct {
 	Input     market.AssetQuantity
 	Output    market.AssetQuantity
 	GrossPnL  market.AssetQuantity
-	Cost      market.AssetQuantity
+	Cost      CostSnapshot
 	NetPnL    market.AssetQuantity
 	BuyQuote  market.Quote
 	SellQuote market.Quote
@@ -158,12 +158,17 @@ type Candidate struct {
 
 type Opportunity struct {
 	Evaluation     EvaluationID
+	Run            ResearchRunID
+	ConfigHash     string
 	Strategy       StrategyID
 	Direction      Direction
 	Classification Classification
+	Snapshots      []market.SnapshotMetadata
 	Candidates     []Candidate
 	SelectedIndex  int
 	Threshold      market.AssetQuantity
 	Reasons        []string
+	TriggeredAt    time.Time
+	StartedAt      time.Time
 	FinishedAt     time.Time
 }
