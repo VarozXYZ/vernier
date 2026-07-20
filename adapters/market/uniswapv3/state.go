@@ -122,6 +122,21 @@ func NewSwapUpdate(sqrtPriceX96 *big.Int, tick int32, liquidity *big.Int) (SwapU
 
 func (SwapUpdate) EventKind() string { return "uniswap_v3/swap/v1" }
 
+// FeeUpdate changes only the current swap fee. It is used by compatible V3
+// variants whose fee is dynamic rather than fixed at pool creation.
+type FeeUpdate struct {
+	feePips uint32
+}
+
+func NewFeeUpdate(feePips uint32) (FeeUpdate, error) {
+	if feePips >= feeDenominator {
+		return FeeUpdate{}, fmt.Errorf("invalid Uniswap V3 fee")
+	}
+	return FeeUpdate{feePips: feePips}, nil
+}
+
+func (FeeUpdate) EventKind() string { return "uniswap_v3/fee/v1" }
+
 type LiquidityUpdate struct {
 	lower int32
 	upper int32
@@ -162,10 +177,13 @@ func NewBlockUpdate(updates ...market.EventData) (BlockUpdate, error) {
 	if len(updates) == 0 {
 		return BlockUpdate{}, fmt.Errorf("uniswap V3 block update requires events")
 	}
-	result := BlockUpdate{updates: append([]market.EventData(nil), updates...)}
-	for _, update := range result.updates {
-		switch update.(type) {
-		case InitializeUpdate, SwapUpdate, LiquidityUpdate:
+	result := BlockUpdate{}
+	for _, update := range updates {
+		switch typed := update.(type) {
+		case InitializeUpdate, SwapUpdate, LiquidityUpdate, FeeUpdate:
+			result.updates = append(result.updates, update)
+		case BlockUpdate:
+			result.updates = append(result.updates, typed.updates...)
 		default:
 			return BlockUpdate{}, fmt.Errorf("unsupported Uniswap V3 block update %T", update)
 		}
@@ -271,6 +289,7 @@ func cloneInt(value *big.Int) *big.Int {
 
 var _ market.EventData = StateUpdate{}
 var _ market.EventData = SwapUpdate{}
+var _ market.EventData = FeeUpdate{}
 var _ market.EventData = LiquidityUpdate{}
 var _ market.EventData = InitializeUpdate{}
 var _ market.EventData = BlockUpdate{}
