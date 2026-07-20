@@ -1,5 +1,5 @@
-// Package ethereum provides the canonical Ethereum mainnet network adapter.
-package ethereum
+// Package base provides the canonical Base mainnet network adapter.
+package base
 
 import (
 	"context"
@@ -9,16 +9,16 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
 )
 
-const ID = "ethereum"
+const ID = "base"
 
-var mainnetChainID = big.NewInt(1)
+var mainnetChainID = big.NewInt(8453)
 
 type Client = evm.Client
 
 type Adapter struct{ *evm.ReadOnlyNetwork }
 
 func Dial(ctx context.Context, httpURL, wsURL string) (*Adapter, error) {
-	network, err := evm.DialReadOnlyNetwork(ctx, ID, "Ethereum", mainnetChainID, httpURL, wsURL)
+	network, err := evm.DialReadOnlyNetwork(ctx, ID, "Base", mainnetChainID, httpURL, wsURL)
 	if err != nil {
 		return nil, err
 	}
@@ -26,9 +26,9 @@ func Dial(ctx context.Context, httpURL, wsURL string) (*Adapter, error) {
 }
 
 func New(httpClient, wsClient Client) (*Adapter, error) {
-	network, err := evm.NewReadOnlyNetwork(ID, "Ethereum", mainnetChainID, httpClient, wsClient)
+	network, err := evm.NewReadOnlyNetwork(ID, "Base", mainnetChainID, httpClient, wsClient)
 	if err != nil {
-		return nil, fmt.Errorf("ethereum: %w", err)
+		return nil, fmt.Errorf("base: %w", err)
 	}
 	return &Adapter{ReadOnlyNetwork: network}, nil
 }
