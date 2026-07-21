@@ -43,11 +43,12 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 	stream := flags.Bool("stream", false, "continuously evaluate both pools from WebSocket log feeds")
 	updates := flags.Int("updates", 0, "reports to emit in stream mode; zero runs until canceled")
 	logLevel := flags.String("log-level", "info", "diagnostic log level: debug, info, warn, or error")
+	calculations := flags.String("calculations", "summary", "calculation output: summary or full")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	validFormat := *format == "text" || (!*stream && *format == "json") || (*stream && *format == "jsonl")
-	if flags.NArg() != 0 || !validFormat || *updates < 0 {
+	if flags.NArg() != 0 || !validFormat || *updates < 0 || (*calculations != string(livecompare.CalculationSummary) && *calculations != string(livecompare.CalculationFull)) {
 		fmt.Fprintln(stderr, "research compare-live: invalid arguments")
 		return 2
 	}
@@ -104,20 +105,22 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		err = runner.RunStream(ctx, livecompare.StreamOptions{
 			Updates: *updates,
 			OnReport: func(report livecompare.Report) error {
+				options := livecompare.OutputOptions{Calculations: livecompare.CalculationDetail(*calculations)}
 				if *format == "jsonl" {
-					return livecompare.WriteJSONLine(stdout, report)
+					return livecompare.WriteJSONLineWithOptions(stdout, report, options)
 				}
-				return livecompare.WriteText(stdout, report)
+				return livecompare.WriteTextWithOptions(stdout, report, options)
 			},
 		})
 	} else {
 		var report livecompare.Report
 		report, err = runner.Run(ctx)
 		if err == nil {
+			options := livecompare.OutputOptions{Calculations: livecompare.CalculationDetail(*calculations)}
 			if *format == "json" {
-				err = livecompare.WriteJSON(stdout, report)
+				err = livecompare.WriteJSONWithOptions(stdout, report, options)
 			} else {
-				err = livecompare.WriteText(stdout, report)
+				err = livecompare.WriteTextWithOptions(stdout, report, options)
 			}
 		}
 	}

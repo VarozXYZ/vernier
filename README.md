@@ -128,16 +128,22 @@ the two streams separately, for example:
 go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --stream --updates 1 --format jsonl > report.jsonl 2> stream.log
 ~~~
 
+The default report is an evaluation summary: it shows the selected size and
+net result for each direction without repeating run/config metadata or every
+sizing sample. Add `--calculations full` when auditing the complete curve,
+quotes, costs, snapshots, and parity evidence. This output switch is separate
+from `--log-level debug`, which is reserved for runtime diagnostics.
+
 Stream mode caches the external cost evidence and never performs venue parity
 RPC calls on the event loop. A healthy WebSocket has no age expiry. Events
 proven older by block evidence are ignored; a confirmed disconnect degrades
 the affected mirror, and reconnect performs a full bootstrap before healthy
 reports resume. Use `--updates 0` to run until canceled.
 
-The report contains configuration and snapshot hashes, exact quantities, cost
-evidence, the complete sizing curve, and parity results. It never includes
-configured addresses or endpoint values. The command is read-only and has no
-signer or broadcast capability.
+With `--calculations full`, the report contains configuration and snapshot
+hashes, exact quantities, cost evidence, the complete sizing curve, and parity
+results. The default summary never includes configured addresses or endpoint
+values. The command is read-only and has no signer or broadcast capability.
 
 Quote evidence states whether each leg is `exact_input` or `exact_output`.
 Uniswap V2 exact-output purchases are checked against router `getAmountsIn`;

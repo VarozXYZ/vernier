@@ -11,7 +11,44 @@ import (
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
 
+// CalculationDetail controls how much of the sizing curve is rendered. It is
+// deliberately separate from diagnostic log levels: debug explains runtime
+// behavior, while full calculation output explains every economic sample.
+type CalculationDetail string
+
+const (
+	CalculationSummary CalculationDetail = "summary"
+	CalculationFull    CalculationDetail = "full"
+)
+
+type OutputOptions struct {
+	Calculations CalculationDetail
+}
+
+func (o OutputOptions) validate() error {
+	if o.Calculations == "" {
+		o.Calculations = CalculationSummary
+	}
+	if o.Calculations != CalculationSummary && o.Calculations != CalculationFull {
+		return fmt.Errorf("invalid calculation detail %q", o.Calculations)
+	}
+	return nil
+}
+
 func WriteText(writer io.Writer, report Report) error {
+	return WriteTextWithOptions(writer, report, OutputOptions{Calculations: CalculationFull})
+}
+
+func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions) error {
+	if options.Calculations == "" {
+		options.Calculations = CalculationSummary
+	}
+	if err := options.validate(); err != nil {
+		return err
+	}
+	if options.Calculations == CalculationSummary {
+		return writeTextSummary(writer, report)
+	}
 	if err := runtimeresearch.WriteText(writer, report.Research); err != nil {
 		return err
 	}
@@ -58,17 +95,61 @@ func WriteText(writer io.Writer, report Report) error {
 	return nil
 }
 
+func writeTextSummary(writer io.Writer, report Report) error {
+	if _, err := fmt.Fprintf(writer, "evaluation: %d\nstatus: %s\nopportunities: %d\ncost: %s %s via %s\nparity_checks: %d\n",
+		report.Research.Evaluations, report.Research.Status, len(report.Research.Opportunities),
+		report.Cost.Cost.Decimal(6), report.Cost.Cost.Asset(), report.Cost.Price.Source(), len(report.Parity)); err != nil {
+		return err
+	}
+	for _, opportunity := range report.Research.Opportunities {
+		selected := "none"
+		if opportunity.SelectedIndex >= 0 && opportunity.SelectedIndex < len(opportunity.Candidates) {
+			candidate := opportunity.Candidates[opportunity.SelectedIndex]
+			selected = fmt.Sprintf("size=%s %s net=%s %s", candidate.Size.Decimal(8), candidate.Size.Asset(), candidate.NetPnL.Decimal(8), candidate.NetPnL.Asset())
+		}
+		if _, err := fmt.Fprintf(writer, "opportunity: %s->%s classification=%s candidates=%d selected=%s\n",
+			opportunity.Direction.BuyMarket, opportunity.Direction.SellMarket, opportunity.Classification,
+			len(opportunity.Candidates), selected); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func WriteJSON(writer io.Writer, report Report) error {
-	return writeJSON(writer, report, true)
+	return WriteJSONWithOptions(writer, report, OutputOptions{Calculations: CalculationFull})
+}
+
+func WriteJSONWithOptions(writer io.Writer, report Report, options OutputOptions) error {
+	if options.Calculations == "" {
+		options.Calculations = CalculationSummary
+	}
+	if err := options.validate(); err != nil {
+		return err
+	}
+	return writeJSON(writer, report, true, options.Calculations)
 }
 
 // WriteJSONLine writes one compact, deterministic JSON report followed by a
 // newline. It is intended for continuous research streams.
 func WriteJSONLine(writer io.Writer, report Report) error {
-	return writeJSON(writer, report, false)
+	return WriteJSONLineWithOptions(writer, report, OutputOptions{Calculations: CalculationFull})
 }
 
-func writeJSON(writer io.Writer, report Report, indent bool) error {
+func WriteJSONLineWithOptions(writer io.Writer, report Report, options OutputOptions) error {
+	if options.Calculations == "" {
+		options.Calculations = CalculationSummary
+	}
+	if err := options.validate(); err != nil {
+		return err
+	}
+	return writeJSON(writer, report, false, options.Calculations)
+}
+
+func writeJSON(writer io.Writer, report Report, indent bool, detail CalculationDetail) error {
+	if detail == CalculationSummary {
+		return writeJSONSummary(writer, report)
+	}
 	var researchJSON bytes.Buffer
 	if err := runtimeresearch.WriteJSON(&researchJSON, report.Research); err != nil {
 		return err
@@ -103,6 +184,65 @@ func writeJSON(writer io.Writer, report Report, indent bool) error {
 	if indent {
 		encoder.SetIndent("", "  ")
 	}
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(payload)
+}
+
+type summaryPayload struct {
+	SchemaVersion int                     `json:"schema_version"`
+	Kind          string                  `json:"kind"`
+	Evaluation    int                     `json:"evaluation"`
+	Status        runtimeresearch.Status  `json:"status"`
+	Opportunities []summaryOpportunityDTO `json:"opportunities"`
+	Cost          summaryCostDTO          `json:"cost"`
+	ParityChecks  int                     `json:"parity_checks"`
+}
+
+type summaryOpportunityDTO struct {
+	Strategy       string               `json:"strategy"`
+	BuyMarket      string               `json:"buy_market"`
+	SellMarket     string               `json:"sell_market"`
+	Classification string               `json:"classification"`
+	Candidates     int                  `json:"candidates"`
+	Selected       *summaryCandidateDTO `json:"selected,omitempty"`
+}
+
+type summaryCandidateDTO struct {
+	Size      string `json:"size"`
+	SizeAsset string `json:"size_asset"`
+	NetPnL    string `json:"net_pnl"`
+	NetAsset  string `json:"net_asset"`
+}
+
+type summaryCostDTO struct {
+	Amount string `json:"amount"`
+	Asset  string `json:"asset"`
+	Source string `json:"source"`
+}
+
+func writeJSONSummary(writer io.Writer, report Report) error {
+	payload := summaryPayload{
+		SchemaVersion: 1, Kind: "evaluation", Evaluation: report.Research.Evaluations,
+		Status: report.Research.Status, Opportunities: make([]summaryOpportunityDTO, 0, len(report.Research.Opportunities)),
+		Cost:         summaryCostDTO{Amount: report.Cost.Cost.Decimal(8), Asset: string(report.Cost.Cost.Asset()), Source: string(report.Cost.Price.Source())},
+		ParityChecks: len(report.Parity),
+	}
+	for _, opportunity := range report.Research.Opportunities {
+		item := summaryOpportunityDTO{
+			Strategy: string(opportunity.Strategy), BuyMarket: string(opportunity.Direction.BuyMarket),
+			SellMarket: string(opportunity.Direction.SellMarket), Classification: string(opportunity.Classification),
+			Candidates: len(opportunity.Candidates),
+		}
+		if opportunity.SelectedIndex >= 0 && opportunity.SelectedIndex < len(opportunity.Candidates) {
+			candidate := opportunity.Candidates[opportunity.SelectedIndex]
+			item.Selected = &summaryCandidateDTO{
+				Size: candidate.Size.Decimal(8), SizeAsset: string(candidate.Size.Asset()),
+				NetPnL: candidate.NetPnL.Decimal(8), NetAsset: string(candidate.NetPnL.Asset()),
+			}
+		}
+		payload.Opportunities = append(payload.Opportunities, item)
+	}
+	encoder := json.NewEncoder(writer)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(payload)
 }
