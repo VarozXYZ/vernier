@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VarozXYZ/vernier/runtime/livecompare"
+	"github.com/VarozXYZ/vernier/runtime/configuration"
 	"github.com/VarozXYZ/vernier/runtime/observev3"
 )
 
@@ -72,7 +72,7 @@ func TestConfigUsesSharedYAMLAndDerivesBothDirections(t *testing.T) {
 		t.Fatalf("unexpected observer configuration: %+v", config)
 	}
 	path := writeObserverFiles(t, strings.Replace(observeTopology, "schema_version: 1", "schema_version: 1\nunexpected: true", 1))
-	if _, err := livecompare.LoadConfig(path); err == nil {
+	if _, err := configuration.LoadConfig(path); err == nil {
 		t.Fatal("unknown YAML field was accepted")
 	}
 }
@@ -88,7 +88,7 @@ func TestEndpointResolutionDoesNotExposeValues(t *testing.T) {
 
 func observerConfig(t *testing.T) observev3.Config {
 	t.Helper()
-	bundle, err := livecompare.LoadConfig(writeObserverFiles(t, observeTopology))
+	bundle, err := configuration.LoadConfig(writeObserverFiles(t, observeTopology))
 	if err != nil {
 		t.Fatal(err)
 	}

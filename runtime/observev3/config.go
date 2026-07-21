@@ -11,7 +11,7 @@ import (
 
 	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
 	"github.com/VarozXYZ/vernier/domain/market"
-	"github.com/VarozXYZ/vernier/runtime/livecompare"
+	"github.com/VarozXYZ/vernier/runtime/configuration"
 )
 
 type QuoteInput struct {
@@ -21,7 +21,7 @@ type QuoteInput struct {
 
 type Config struct {
 	Hash            string
-	Network         livecompare.ResolvedChain
+	Network         configuration.ResolvedChain
 	NetworkAdapter  string
 	VenueAdapter    string
 	MarketID        string
@@ -43,8 +43,8 @@ type Endpoints struct {
 	WS   string
 }
 
-func FromConfig(bundle livecompare.ParsedConfig, selected string) (Config, error) {
-	var configured *livecompare.ResolvedMarket
+func FromConfig(bundle configuration.ParsedConfig, selected string) (Config, error) {
+	var configured *configuration.ResolvedMarket
 	for index := range bundle.Markets {
 		candidate := &bundle.Markets[index]
 		if selected != "" && string(candidate.ID) != selected {
@@ -95,7 +95,7 @@ func FromConfig(bundle livecompare.ParsedConfig, selected string) (Config, error
 	}, nil
 }
 
-func (c Config) ResolveEndpoints(lookup livecompare.LookupEnv) (Endpoints, error) {
+func (c Config) ResolveEndpoints(lookup configuration.LookupEnv) (Endpoints, error) {
 	if lookup == nil {
 		return Endpoints{}, fmt.Errorf("environment lookup is required")
 	}

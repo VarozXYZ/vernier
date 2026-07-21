@@ -68,7 +68,7 @@ func New(config Config) (*Source, error) {
 		return nil, fmt.Errorf("CoinGecko API key and header must be configured together")
 	}
 	if config.Client == nil {
-		config.Client = http.DefaultClient
+		config.Client = &http.Client{Timeout: 10 * time.Second}
 	}
 	if config.Clock == nil {
 		config.Clock = time.Now

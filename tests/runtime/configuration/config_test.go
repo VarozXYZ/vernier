@@ -1,4 +1,4 @@
-package livecompare_test
+package configuration_test
 
 import (
 	"os"
@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/VarozXYZ/vernier/runtime/livecompare"
+	"github.com/VarozXYZ/vernier/runtime/configuration"
 )
 
 const manifestYAML = `schema_version: 1
@@ -70,7 +70,7 @@ research:
 
 func TestLoadConfigResolvesModularYAMLExactly(t *testing.T) {
 	path := writeConfig(t, manifestYAML, topologyYAML, policyYAML)
-	config, err := livecompare.LoadConfig(path)
+	config, err := configuration.LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestLoadConfigRejectsUnknownFieldsAndBrokenReferences(t *testing.T) {
 		"wrong asset":    strings.Replace(topologyYAML, "quote_asset: usd", "quote_asset: weth", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := livecompare.LoadConfig(writeConfig(t, manifestYAML, topology, policyYAML)); err == nil {
+			if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topology, policyYAML)); err == nil {
 				t.Fatal("invalid configuration was accepted")
 			}
 		})
@@ -100,12 +100,12 @@ func TestLoadConfigRejectsUnknownFieldsAndBrokenReferences(t *testing.T) {
 }
 
 func TestConfigurationHashIgnoresYAMLFormatting(t *testing.T) {
-	first, err := livecompare.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, policyYAML))
+	first, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, policyYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondTopology := strings.Replace(topologyYAML, "schema_version: 1\n", "# comment\nschema_version: 1\n\n", 1)
-	second, err := livecompare.LoadConfig(writeConfig(t, manifestYAML, secondTopology, policyYAML))
+	second, err := configuration.LoadConfig(writeConfig(t, manifestYAML, secondTopology, policyYAML))
 	if err != nil {
 		t.Fatal(err)
 	}

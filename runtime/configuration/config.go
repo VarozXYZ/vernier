@@ -1,6 +1,5 @@
-// Package livecompare composes a read-only, point-in-time comparison of two
-// configured markets.
-package livecompare
+// Package configuration loads and resolves Vernier's modular YAML.
+package configuration
 
 import (
 	"crypto/sha256"

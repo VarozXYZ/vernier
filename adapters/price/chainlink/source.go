@@ -25,7 +25,7 @@ type Source struct {
 func NewSource(id market.SourceID, base, quote market.AssetID, network evm.Network, block evm.BlockReference, feed common.Address, clock func() time.Time) (*Source, error) {
 	if id == "" || base == "" || quote == "" || base == quote || network == nil ||
 		block.Hash == (common.Hash{}) || feed == (common.Address{}) {
-		return nil, fmt.Errorf("Chainlink source requires an ID, pair, network, exact block, and feed")
+		return nil, fmt.Errorf("chainlink source requires an ID, pair, network, exact block, and feed")
 	}
 	if clock == nil {
 		clock = time.Now
@@ -37,7 +37,7 @@ func (s *Source) ID() market.SourceID { return s.id }
 
 func (s *Source) Observe(ctx context.Context, request priceport.Request) (market.PriceObservation, error) {
 	if request.Base != s.base || request.Quote != s.quote {
-		return market.PriceObservation{}, fmt.Errorf("Chainlink source %q does not provide %s/%s", s.id, request.Base, request.Quote)
+		return market.PriceObservation{}, fmt.Errorf("chainlink source %q does not provide %s/%s", s.id, request.Base, request.Quote)
 	}
 	value, err := Read(ctx, s.network, s.block, s.feed)
 	if err != nil {
