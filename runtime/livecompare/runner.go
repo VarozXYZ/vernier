@@ -161,7 +161,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	researchReport, err := r.evaluate(ctx, candidate, snapshots, cost, "live-evaluation/"+r.config.ResearchID, startedAt)
+	researchReport, err := r.evaluate(ctx, candidate, snapshots, cost, "live-evaluation/"+r.config.ResearchID, startedAt, nil)
 	if err != nil {
 		return Report{}, err
 	}
@@ -222,7 +222,7 @@ func (r *Runner) sizingAsset() market.AssetID {
 	return r.config.Markets[0].Quote.Token.Asset
 }
 
-func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCrossChainArbitrage, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time) (runtimeresearch.Report, error) {
+func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCrossChainArbitrage, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time, trigger *arbitrage.TriggerMetadata) (runtimeresearch.Report, error) {
 	startedAt := r.clock().UTC()
 	evaluation, err := arbitrage.NewEvaluation(
 		arbitrage.EvaluationID(id), arbitrage.ResearchRunID(r.config.RunID), candidate.ID(),
@@ -230,6 +230,9 @@ func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCros
 	)
 	if err != nil {
 		return runtimeresearch.Report{}, err
+	}
+	if trigger != nil {
+		evaluation = evaluation.WithTrigger(*trigger)
 	}
 	opportunities, err := candidate.Evaluate(ctx, evaluation)
 	if err != nil {

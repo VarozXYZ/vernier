@@ -61,11 +61,21 @@ type opportunityDTO struct {
 	SelectedIndex  int            `json:"selected_index"`
 	Threshold      quantityDTO    `json:"threshold"`
 	Reasons        []string       `json:"reasons"`
+	Trigger        *triggerDTO    `json:"trigger,omitempty"`
 	TriggeredAt    string         `json:"triggered_at"`
 	StartedAt      string         `json:"started_at"`
 	FinishedAt     string         `json:"finished_at"`
 	Snapshots      []snapshotDTO  `json:"snapshots"`
 	Candidates     []candidateDTO `json:"candidates"`
+}
+
+type triggerDTO struct {
+	Market         string             `json:"market"`
+	Source         string             `json:"source"`
+	Position       *sourcePositionDTO `json:"position,omitempty"`
+	ReferenceKind  string             `json:"reference_kind,omitempty"`
+	ReferenceValue string             `json:"reference_value,omitempty"`
+	At             string             `json:"at"`
 }
 
 type snapshotDTO struct {
@@ -187,6 +197,13 @@ func newOpportunityDTO(opportunity arbitrage.Opportunity) opportunityDTO {
 		TriggeredAt: formatTime(opportunity.TriggeredAt), StartedAt: formatTime(opportunity.StartedAt),
 		FinishedAt: formatTime(opportunity.FinishedAt), Snapshots: make([]snapshotDTO, 0, len(opportunity.Snapshots)),
 		Candidates: make([]candidateDTO, 0, len(opportunity.Candidates)),
+	}
+	if opportunity.HasTrigger {
+		dto.Trigger = &triggerDTO{
+			Market: string(opportunity.Trigger.Market), Source: string(opportunity.Trigger.Source),
+			Position: sourcePosition(opportunity.Trigger.Position), ReferenceKind: string(opportunity.Trigger.Reference.Kind),
+			ReferenceValue: opportunity.Trigger.Reference.Value, At: formatTime(opportunity.Trigger.At),
+		}
 	}
 	for _, metadata := range opportunity.Snapshots {
 		dto.Snapshots = append(dto.Snapshots, snapshot(metadata))
