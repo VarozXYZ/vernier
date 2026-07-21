@@ -99,6 +99,11 @@ type venue struct {
 	decoded    []uint64
 }
 
+type singleLogVenue struct {
+	venue
+	decodedLogs []types.Log
+}
+
 func (*venue) ID() string              { return "test" }
 func (v *venue) Filter() evm.LogFilter { return v.filter }
 
@@ -110,6 +115,11 @@ func (v *venue) Bootstrap(_ context.Context, _ evm.Network, block evm.BlockRefer
 func (v *venue) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockReference, _ []types.Log) (market.EventData, error) {
 	v.decoded = append(v.decoded, block.Number)
 	return blockData(block.Number), nil
+}
+
+func (v *singleLogVenue) DecodeLog(_ context.Context, _ evm.Network, _ evm.BlockReference, log types.Log) (market.EventData, error) {
+	v.decodedLogs = append(v.decodedLogs, log)
+	return blockData(log.BlockNumber*100 + uint64(log.Index)), nil
 }
 
 type sink struct {
@@ -213,6 +223,41 @@ func TestDisconnectIsTheOnlyFeedDegradationAndReloadsOnReconnect(t *testing.T) {
 		if states[index] != want[index] {
 			t.Fatalf("health changes %v", states)
 		}
+	}
+}
+
+func TestFilteredFeedAppliesSameBlockLogsInArrivalOrder(t *testing.T) {
+	address := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	topic := common.HexToHash("0x01")
+	hash10 := common.BigToHash(big.NewInt(10))
+	hash15 := common.BigToHash(big.NewInt(15))
+	chain := &network{
+		current: []evm.BlockReference{{Number: 10, Hash: hash10}},
+		sessionLogs: [][]types.Log{{
+			{BlockNumber: 15, BlockHash: hash15, TxHash: common.BigToHash(big.NewInt(2)), Index: 2},
+			{BlockNumber: 15, BlockHash: hash15, TxHash: common.BigToHash(big.NewInt(1)), Index: 1},
+			{BlockNumber: 15, BlockHash: hash15, TxHash: common.BigToHash(big.NewInt(2)), Index: 2},
+			{BlockNumber: 14, BlockHash: common.BigToHash(big.NewInt(14)), TxHash: common.BigToHash(big.NewInt(3)), Index: 0},
+		}},
+	}
+	protocol := &singleLogVenue{venue: venue{filter: evm.LogFilter{Address: address, Topics: []common.Hash{topic}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	collector := &sink{cancel: cancel, cancelAt: 3}
+	feed, err := evmlogs.New(evmlogs.Config{Market: "market", Source: "source", Network: chain, Venue: protocol})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := feed.Run(ctx, collector); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation, got %v", err)
+	}
+	if got := positions(collector.events); !equalUint64(got, []uint64{10, 15, 15}) {
+		t.Fatalf("published blocks %v", got)
+	}
+	if len(protocol.decodedLogs) != 2 || protocol.decodedLogs[0].Index != 2 || protocol.decodedLogs[1].Index != 1 {
+		t.Fatalf("logs were not decoded in arrival order: %+v", protocol.decodedLogs)
+	}
+	if len(chain.logBlocks) != 0 {
+		t.Fatalf("single-log decoder unexpectedly queried exact blocks: %v", chain.logBlocks)
 	}
 }
 

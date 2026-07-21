@@ -154,6 +154,33 @@ func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockR
 	return a.update(a.info.Token0, reserve0, reserve1)
 }
 
+// DecodeLog decodes one filtered Sync notification. The feed invokes this
+// capability in WebSocket arrival order, so multiple events in one block are
+// applied one at a time rather than collapsed into a block-level read.
+func (a *Adapter) DecodeLog(_ context.Context, _ evm.Network, block evm.BlockReference, event types.Log) (market.EventData, error) {
+	if !a.loaded {
+		return nil, fmt.Errorf("uniswap V2 pool metadata is unavailable")
+	}
+	if event.Address != a.config.Pool || event.BlockHash != block.Hash ||
+		event.BlockNumber != block.Number || event.Removed || len(event.Topics) != 1 ||
+		event.Topics[0] != pairABI.Events["Sync"].ID {
+		return nil, fmt.Errorf("uniswap V2 log does not belong to pool and block")
+	}
+	values, err := pairABI.Events["Sync"].Inputs.NonIndexed().Unpack(event.Data)
+	if err != nil {
+		return nil, fmt.Errorf("decode Uniswap V2 Sync event: %w", err)
+	}
+	reserve0, err := integer(values[0], "reserve0")
+	if err != nil {
+		return nil, err
+	}
+	reserve1, err := integer(values[1], "reserve1")
+	if err != nil {
+		return nil, err
+	}
+	return a.update(a.info.Token0, reserve0, reserve1)
+}
+
 func (a *Adapter) update(token0 common.Address, reserve0, reserve1 *big.Int) (constantproduct.ReserveUpdate, error) {
 	base, quote := reserve0, reserve1
 	if token0 != a.config.BaseToken {
