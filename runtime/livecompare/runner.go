@@ -212,21 +212,54 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured ResolvedMarket,
 		return marketRuntime{config: configured, snapshot: snapshot, source: local, reference: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
 			return reference.QuoteExactInput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
 		}}, nil
+	case "uniswap_v3":
+		maxBase, initialQuote, baseToQuoteZero, err := v3Inputs(configured, maximum)
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		adapter, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{
+			Pool: configured.Venue.Pool, MaxTickWords: configured.Venue.MaxTickWords,
+			Probes: []uniswapv3.CoverageProbe{{ZeroForOne: baseToQuoteZero, AmountIn: maxBase}, {ZeroForOne: !baseToQuoteZero, AmountIn: initialQuote}},
+		})
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		data, err := adapter.Bootstrap(ctx, network, block)
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		snapshot, err := snapshotAt(ctx, configured.ID, sourceID, block, uniswapv3.Reducer{}, data, now)
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		info, ok := adapter.PoolInfo()
+		if !ok {
+			return marketRuntime{}, fmt.Errorf("Uniswap V3 pool metadata is unavailable")
+		}
+		token0, token1 := configured.Base.Token.ID, configured.Quote.Token.ID
+		if info.Token0 == configured.Quote.Address {
+			token0, token1 = token1, token0
+		}
+		local, err := uniswapv3.NewQuoter(market.SourceID(configured.Venue.ID+"/local"), domainMarket, token0, token1)
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		reference, err := uniswapv3.NewReferenceQuoter(configured.Venue.Reference)
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		return marketRuntime{config: configured, snapshot: snapshot, source: local, reference: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+			return reference.QuoteExactInputSingle(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount, info.Fee)
+		}}, nil
 	case "aerodrome_slipstream":
-		maxBase, err := maximum.ToTokenAmount(configured.Base.Token)
+		maxBase, initialQuote, baseToQuoteZero, err := v3Inputs(configured, maximum)
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		oneQuote, _ := market.NewAssetQuantity(configured.Quote.Token.Asset, big.NewRat(1, 1))
-		initialQuote, err := oneQuote.ToTokenAmount(configured.Quote.Token)
-		if err != nil {
-			return marketRuntime{}, err
-		}
-		baseToQuoteZero := bytes.Compare(configured.Base.Address.Bytes(), configured.Quote.Address.Bytes()) < 0
 		adapter, err := aerodromeslipstream.NewAdapter(aerodromeslipstream.Config{
 			Pool: configured.Venue.Pool, Factory: configured.Venue.Factory,
 			BaseToken: configured.Base.Address, QuoteToken: configured.Quote.Address, MaxTickWords: configured.Venue.MaxTickWords,
-			Probes: []uniswapv3.CoverageProbe{{ZeroForOne: baseToQuoteZero, AmountIn: maxBase.Units()}, {ZeroForOne: !baseToQuoteZero, AmountIn: initialQuote.Units()}},
+			Probes: []uniswapv3.CoverageProbe{{ZeroForOne: baseToQuoteZero, AmountIn: maxBase}, {ZeroForOne: !baseToQuoteZero, AmountIn: initialQuote}},
 		})
 		if err != nil {
 			return marketRuntime{}, err
@@ -264,6 +297,19 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured ResolvedMarket,
 	}
 }
 
+func v3Inputs(configured ResolvedMarket, maximum market.AssetQuantity) (*big.Int, *big.Int, bool, error) {
+	maxBase, err := maximum.ToTokenAmount(configured.Base.Token)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	oneQuote, _ := market.NewAssetQuantity(configured.Quote.Token.Asset, big.NewRat(1, 1))
+	initialQuote, err := oneQuote.ToTokenAmount(configured.Quote.Token)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return maxBase.Units(), initialQuote.Units(), bytes.Compare(configured.Base.Address.Bytes(), configured.Quote.Address.Bytes()) < 0, nil
+}
+
 func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) {
 	chains := make([]market.Chain, 0, len(r.config.Markets))
 	assets := make([]market.Asset, 0, 2)
@@ -292,7 +338,9 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 		poolID := market.PoolID(configured.Venue.ID + "/pool")
 		pathID := market.PathID(string(configured.ID) + "/path")
 		adapterID := uniswapv2.ID
-		if configured.Venue.Kind == "aerodrome_slipstream" {
+		if configured.Venue.Kind == "uniswap_v3" {
+			adapterID = uniswapv3.ID
+		} else if configured.Venue.Kind == "aerodrome_slipstream" {
 			adapterID = aerodromeslipstream.ID
 		}
 		venues = append(venues, market.Venue{ID: venueID})

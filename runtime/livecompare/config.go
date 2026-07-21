@@ -373,16 +373,19 @@ func resolveToken(id string, config TokenConfig, chain string, assets map[market
 }
 
 func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
-	if config.Kind != "uniswap_v2" && config.Kind != "aerodrome_slipstream" {
+	if config.Kind != "uniswap_v2" && config.Kind != "uniswap_v3" && config.Kind != "aerodrome_slipstream" {
 		return ResolvedVenue{}, fmt.Errorf("venue %q has unsupported kind %q", id, config.Kind)
 	}
 	pool, err := address(config.PoolAddress)
 	if err != nil {
 		return ResolvedVenue{}, fmt.Errorf("venue %q pool: %w", id, err)
 	}
-	factory, err := address(config.FactoryAddress)
-	if err != nil {
-		return ResolvedVenue{}, fmt.Errorf("venue %q factory: %w", id, err)
+	factory := common.Address{}
+	if config.Kind != "uniswap_v3" || config.FactoryAddress != "" {
+		factory, err = address(config.FactoryAddress)
+		if err != nil {
+			return ResolvedVenue{}, fmt.Errorf("venue %q factory: %w", id, err)
+		}
 	}
 	reference, err := address(config.ReferenceAddress)
 	if err != nil {
@@ -391,7 +394,7 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 	if config.Kind == "uniswap_v2" && (config.FeeBPS == 0 || config.FeeBPS >= 10_000) {
 		return ResolvedVenue{}, fmt.Errorf("venue %q requires a valid fee", id)
 	}
-	if config.Kind == "aerodrome_slipstream" {
+	if config.Kind == "uniswap_v3" || config.Kind == "aerodrome_slipstream" {
 		if config.MaxTickWords == 0 {
 			config.MaxTickWords = 64
 		}

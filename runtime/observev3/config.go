@@ -1,147 +1,107 @@
-// Package observev3 composes the read-only Ethereum and Uniswap V3 research
-// vertical.
+// Package observev3 composes read-only canonical Uniswap V3 observation.
 package observev3
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
-	"regexp"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
-)
 
-const (
-	NetworkAdapterID = "ethereum"
-	VenueAdapterID   = "uniswap-v3"
+	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
+	"github.com/VarozXYZ/vernier/domain/market"
+	"github.com/VarozXYZ/vernier/runtime/livecompare"
 )
-
-var environmentName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 
 type QuoteInput struct {
-	TokenIn string `json:"token_in"`
-	Amount  string `json:"amount"`
+	TokenIn string
+	Amount  string
 }
 
 type Config struct {
-	SchemaVersion   int          `json:"schema_version"`
-	NetworkAdapter  string       `json:"network_adapter"`
-	VenueAdapter    string       `json:"venue_adapter"`
-	MarketID        string       `json:"market_id"`
-	PoolAddress     string       `json:"pool_address"`
-	QuoterV2Address string       `json:"quoter_v2_address"`
-	HTTPURLEnv      string       `json:"http_url_env"`
-	WSURLEnv        string       `json:"ws_url_env"`
-	Token0ID        string       `json:"token0_id"`
-	Token1ID        string       `json:"token1_id"`
-	QuoteInputs     []QuoteInput `json:"quote_inputs"`
-	MaxTickWords    int          `json:"max_tick_words"`
+	Hash            string
+	Network         livecompare.ResolvedChain
+	NetworkAdapter  string
+	VenueAdapter    string
+	MarketID        string
+	PoolAddress     string
+	QuoterV2Address string
+	Token0ID        string
+	Token1ID        string
+	QuoteInputs     []QuoteInput
+	MaxTickWords    int
+	Pool            common.Address
+	QuoterV2        common.Address
+	ProbeInput      []*big.Int
 }
 
-type ParsedConfig struct {
-	Config
-	Hash       string
-	Pool       common.Address
-	QuoterV2   common.Address
-	ProbeInput []*big.Int
-}
+type ParsedConfig = Config
 
 type Endpoints struct {
 	HTTP string
 	WS   string
 }
 
-type LookupEnv func(string) (string, bool)
-
-func ParseConfig(data []byte) (ParsedConfig, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var config Config
-	if err := decoder.Decode(&config); err != nil {
-		return ParsedConfig{}, fmt.Errorf("decode observe-v3 configuration: %w", err)
-	}
-	if err := requireEOF(decoder); err != nil {
-		return ParsedConfig{}, err
-	}
-	if config.SchemaVersion != 1 {
-		return ParsedConfig{}, fmt.Errorf("unsupported observe-v3 schema version %d", config.SchemaVersion)
-	}
-	if config.NetworkAdapter != NetworkAdapterID || config.VenueAdapter != VenueAdapterID {
-		return ParsedConfig{}, fmt.Errorf("unsupported adapter composition %q + %q", config.NetworkAdapter, config.VenueAdapter)
-	}
-	if strings.TrimSpace(config.MarketID) == "" || strings.TrimSpace(config.Token0ID) == "" ||
-		strings.TrimSpace(config.Token1ID) == "" || config.Token0ID == config.Token1ID {
-		return ParsedConfig{}, fmt.Errorf("market ID and distinct token IDs are required")
-	}
-	if !common.IsHexAddress(config.PoolAddress) || !common.IsHexAddress(config.QuoterV2Address) {
-		return ParsedConfig{}, fmt.Errorf("pool and QuoterV2 must be hexadecimal addresses")
-	}
-	pool := common.HexToAddress(config.PoolAddress)
-	quoter := common.HexToAddress(config.QuoterV2Address)
-	if pool == (common.Address{}) || quoter == (common.Address{}) {
-		return ParsedConfig{}, fmt.Errorf("pool and QuoterV2 addresses cannot be zero")
-	}
-	if !environmentName.MatchString(config.HTTPURLEnv) || !environmentName.MatchString(config.WSURLEnv) ||
-		config.HTTPURLEnv == config.WSURLEnv {
-		return ParsedConfig{}, fmt.Errorf("distinct valid HTTP and WebSocket environment variable names are required")
-	}
-	if config.MaxTickWords == 0 {
-		config.MaxTickWords = 64
-	}
-	if config.MaxTickWords < 1 || config.MaxTickWords > 512 {
-		return ParsedConfig{}, fmt.Errorf("max_tick_words must be between 1 and 512")
-	}
-	if len(config.QuoteInputs) < 2 {
-		return ParsedConfig{}, fmt.Errorf("quote_inputs requires both token directions")
-	}
-	amounts := make([]*big.Int, len(config.QuoteInputs))
-	directions := map[string]bool{config.Token0ID: false, config.Token1ID: false}
-	for index, input := range config.QuoteInputs {
-		if _, supported := directions[input.TokenIn]; !supported {
-			return ParsedConfig{}, fmt.Errorf("quote input %d has unknown token %q", index, input.TokenIn)
+func FromConfig(bundle livecompare.ParsedConfig, selected string) (Config, error) {
+	var configured *livecompare.ResolvedMarket
+	for index := range bundle.Markets {
+		candidate := &bundle.Markets[index]
+		if selected != "" && string(candidate.ID) != selected {
+			continue
 		}
-		amount, ok := new(big.Int).SetString(input.Amount, 10)
-		if !ok || amount.Sign() <= 0 || amount.BitLen() > 256 {
-			return ParsedConfig{}, fmt.Errorf("quote input %d amount must be a positive uint256 decimal", index)
+		if candidate.Venue.Kind != "uniswap_v3" {
+			if selected != "" {
+				return Config{}, fmt.Errorf("market %q is not canonical Uniswap V3", selected)
+			}
+			continue
 		}
-		amounts[index] = amount
-		directions[input.TokenIn] = true
+		if configured != nil {
+			return Config{}, fmt.Errorf("multiple Uniswap V3 markets require an explicit selection")
+		}
+		configured = candidate
 	}
-	if !directions[config.Token0ID] || !directions[config.Token1ID] {
-		return ParsedConfig{}, fmt.Errorf("quote_inputs requires at least one probe per direction")
+	if configured == nil {
+		return Config{}, fmt.Errorf("configuration has no selected canonical Uniswap V3 market")
 	}
-	sum := sha256.Sum256(data)
-	return ParsedConfig{
-		Config: config, Hash: hex.EncodeToString(sum[:]), Pool: pool, QuoterV2: quoter, ProbeInput: amounts,
+	chain, ok := bundle.Chains[configured.Venue.Chain]
+	if !ok {
+		return Config{}, fmt.Errorf("market network profile is unavailable")
+	}
+	maximum, _ := market.NewAssetQuantity(configured.Base.Token.Asset, bundle.MaximumSize)
+	baseAmount, err := maximum.ToTokenAmount(configured.Base.Token)
+	if err != nil || baseAmount.IsZero() {
+		return Config{}, fmt.Errorf("maximum sizing probe is invalid")
+	}
+	oneQuote, _ := market.NewAssetQuantity(configured.Quote.Token.Asset, big.NewRat(1, 1))
+	quoteAmount, err := oneQuote.ToTokenAmount(configured.Quote.Token)
+	if err != nil || quoteAmount.IsZero() {
+		return Config{}, fmt.Errorf("quote-asset probe is invalid")
+	}
+	token0, token1 := configured.Base, configured.Quote
+	if bytes.Compare(token0.Address.Bytes(), token1.Address.Bytes()) > 0 {
+		token0, token1 = token1, token0
+	}
+	amountByToken := map[market.TokenID]*big.Int{
+		configured.Base.Token.ID: baseAmount.Units(), configured.Quote.Token.ID: quoteAmount.Units(),
+	}
+	return Config{
+		Hash: bundle.Hash, Network: chain, NetworkAdapter: chain.ID, VenueAdapter: uniswapv3.ID,
+		MarketID: string(configured.ID), PoolAddress: configured.Venue.Pool.Hex(), QuoterV2Address: configured.Venue.Reference.Hex(),
+		Token0ID: string(token0.Token.ID), Token1ID: string(token1.Token.ID), MaxTickWords: configured.Venue.MaxTickWords,
+		Pool: configured.Venue.Pool, QuoterV2: configured.Venue.Reference,
+		QuoteInputs: []QuoteInput{{TokenIn: string(token0.Token.ID), Amount: amountByToken[token0.Token.ID].String()}, {TokenIn: string(token1.Token.ID), Amount: amountByToken[token1.Token.ID].String()}},
+		ProbeInput:  []*big.Int{new(big.Int).Set(amountByToken[token0.Token.ID]), new(big.Int).Set(amountByToken[token1.Token.ID])},
 	}, nil
 }
 
-func (c ParsedConfig) ResolveEndpoints(lookup LookupEnv) (Endpoints, error) {
+func (c Config) ResolveEndpoints(lookup livecompare.LookupEnv) (Endpoints, error) {
 	if lookup == nil {
 		return Endpoints{}, fmt.Errorf("environment lookup is required")
 	}
-	httpURL, httpFound := lookup(c.HTTPURLEnv)
-	wsURL, wsFound := lookup(c.WSURLEnv)
-	if !httpFound || strings.TrimSpace(httpURL) == "" {
-		return Endpoints{}, fmt.Errorf("required HTTP endpoint environment variable is unset")
+	value, ok := lookup(c.Network.RPCURLEnv)
+	if !ok || strings.TrimSpace(value) == "" {
+		return Endpoints{}, fmt.Errorf("required RPC endpoint for market network is unset")
 	}
-	if !wsFound || strings.TrimSpace(wsURL) == "" {
-		return Endpoints{}, fmt.Errorf("required WebSocket endpoint environment variable is unset")
-	}
-	return Endpoints{HTTP: httpURL, WS: wsURL}, nil
-}
-
-func requireEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); err == io.EOF {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("decode observe-v3 configuration trailer: %w", err)
-	}
-	return fmt.Errorf("observe-v3 configuration contains multiple JSON values")
+	return Endpoints{HTTP: value, WS: value}, nil
 }

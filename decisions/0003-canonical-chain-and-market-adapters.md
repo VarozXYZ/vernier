@@ -1,5 +1,9 @@
 # ADR 0003: Canonical chain and market adapters
 
+Status: superseded in part by [ADR 0004](0004-modular-composition.md). Compatible
+EVM networks now share configured profiles; explicit implementations remain
+reserved for semantic differences.
+
 ## Context
 
 EVM-compatible networks can differ in transport, ordering, finality, and RPC

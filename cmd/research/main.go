@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/VarozXYZ/vernier/adapters/chain/ethereum"
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
 	"github.com/VarozXYZ/vernier/runtime/observev3"
@@ -200,7 +199,8 @@ func runSynthetic(ctx context.Context, args []string, stdout, stderr io.Writer) 
 func runObserveV3(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("research observe-v3", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "config/local/pool.local.json", "path to private pool configuration")
+	configPath := flags.String("config", "config/local/vernier.yaml", "path to private YAML configuration manifest")
+	marketID := flags.String("market", "", "configured canonical Uniswap V3 market ID")
 	format := flags.String("format", "text", "output format: text or jsonl")
 	updates := flags.Int("updates", 0, "active pool blocks to observe; zero runs until canceled")
 	if err := flags.Parse(args); err != nil {
@@ -210,12 +210,12 @@ func runObserveV3(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintln(stderr, "research observe-v3: invalid arguments")
 		return 2
 	}
-	data, err := os.ReadFile(*configPath)
+	bundle, err := livecompare.LoadConfig(*configPath)
 	if err != nil {
-		fmt.Fprintln(stderr, "research observe-v3: cannot read private configuration")
+		fmt.Fprintf(stderr, "research observe-v3: %v\n", err)
 		return 2
 	}
-	config, err := observev3.ParseConfig(data)
+	config, err := observev3.FromConfig(bundle, *marketID)
 	if err != nil {
 		fmt.Fprintf(stderr, "research observe-v3: %v\n", err)
 		return 2
@@ -225,7 +225,7 @@ func runObserveV3(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintf(stderr, "research observe-v3: %v\n", err)
 		return 2
 	}
-	network, err := ethereum.Dial(ctx, endpoints.HTTP, endpoints.WS)
+	network, err := evm.DialReadOnlyNetwork(ctx, config.Network.ID, config.Network.Label, config.Network.ChainID, endpoints.HTTP, endpoints.WS)
 	if err != nil {
 		fmt.Fprintf(stderr, "research observe-v3: %v\n", err)
 		return 1
