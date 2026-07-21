@@ -37,6 +37,21 @@ func MinimumInputForOutput(
 		request.InitialHigh.IsZero() || request.Purpose == "" || request.QuotedAt.IsZero() {
 		return market.Quote{}, fmt.Errorf("invalid exact-output sizing request")
 	}
+	if native, ok := source.(quoteport.ExactOutputSource); ok {
+		candidate, err := native.QuoteExactOutput(ctx, quoteport.ExactOutputInput{
+			Snapshot: request.Snapshot, TokenIn: request.TokenIn, TokenOut: request.TokenOut,
+			AmountOut: request.TargetOut, Purpose: request.Purpose, QuotedAt: request.QuotedAt,
+		})
+		if err != nil {
+			return market.Quote{}, err
+		}
+		if candidate.AmountIn.Token() != request.TokenIn || candidate.AmountIn.IsZero() ||
+			candidate.AmountOut.Token() != request.TokenOut ||
+			candidate.AmountOut.Units().Cmp(request.TargetOut.Units()) != 0 {
+			return market.Quote{}, fmt.Errorf("native source returned inconsistent exact-output evidence")
+		}
+		return candidate, nil
+	}
 
 	quoteAt := func(units *big.Int) (market.Quote, error) {
 		amount, err := market.NewTokenAmount(request.TokenIn, units)

@@ -143,6 +143,26 @@ func TestQuoterMatchesConstantProductGoldenVector(t *testing.T) {
 	}
 }
 
+func TestQuoterUsesNativeExactOutputFormula(t *testing.T) {
+	mirror := newMirror(t, "market", func() time.Time { return time.Unix(2, 0).UTC() })
+	snapshot := apply(t, mirror, event(t, 1, 1_000_000, 1_000_000))
+	quoter, err := constantproduct.NewQuoter("local", market.Market{ID: "market", BaseToken: "base", QuoteToken: "quote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := market.NewTokenAmount("base", big.NewInt(10_000))
+	quote, err := quoter.QuoteExactOutput(context.Background(), quoteport.ExactOutputInput{
+		Snapshot: snapshot, TokenIn: "quote", TokenOut: "base", AmountOut: target,
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Unix(3, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.AmountIn.Units().Cmp(big.NewInt(10_132)) != 0 || quote.AmountOut.Units().Cmp(big.NewInt(10_000)) != 0 {
+		t.Fatalf("exact output quote in=%s out=%s", quote.AmountIn.String(), quote.AmountOut.String())
+	}
+}
+
 func TestQuoterRejectsWrongMarketSnapshot(t *testing.T) {
 	mirror := newMirror(t, "other", func() time.Time { return time.Now().UTC() })
 	snapshot := apply(t, mirror, eventForMarket(t, "other", 1, 1_000_000, 2_000_000))
