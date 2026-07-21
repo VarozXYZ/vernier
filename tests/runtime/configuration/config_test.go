@@ -114,6 +114,20 @@ func TestConfigurationHashIgnoresYAMLFormatting(t *testing.T) {
 	}
 }
 
+func TestPublicVirtualSetupResolves(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "examples", "setups", "virtual", "vernier.yaml")
+	config, err := configuration.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ResearchID != "virtual_cross_chain" || config.SetupID != "virtual_wealth" ||
+		config.Chains["robinhood"].ChainID.String() != "4663" || config.Chains["base"].ChainID.String() != "8453" ||
+		config.Markets[0].Venue.Kind != "uniswap_v2" || config.Markets[1].Venue.Kind != "aerodrome_slipstream" ||
+		config.MinimumSize.RatString() != "100" || config.MaximumSize.RatString() != "5000" || config.SizeSamples != 10 {
+		t.Fatalf("unexpected public VIRTUAL setup: %+v", config)
+	}
+}
+
 func writeConfig(t *testing.T, manifest, topology, policy string) string {
 	t.Helper()
 	directory := t.TempDir()

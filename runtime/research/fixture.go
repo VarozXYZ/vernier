@@ -5,144 +5,145 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Fixture is the experimental schema used by the synthetic Research demo.
 // It is test data, not Vernier's stable public configuration API.
 type Fixture struct {
-	SchemaVersion int               `json:"schema_version"`
-	RunID         string            `json:"run_id"`
-	FixedCost     string            `json:"fixed_cost"`
-	Catalog       CatalogFixture    `json:"catalog"`
-	Setup         SetupFixture      `json:"setup"`
-	Strategies    []StrategyFixture `json:"strategies"`
-	Feeds         []FeedFixture     `json:"feeds"`
+	SchemaVersion int               `yaml:"schema_version"`
+	RunID         string            `yaml:"run_id"`
+	FixedCost     string            `yaml:"fixed_cost"`
+	Catalog       CatalogFixture    `yaml:"catalog"`
+	Setup         SetupFixture      `yaml:"setup"`
+	Strategies    []StrategyFixture `yaml:"strategies"`
+	Feeds         []FeedFixture     `yaml:"feeds"`
 }
 
 type CatalogFixture struct {
-	Chains  []ChainFixture  `json:"chains"`
-	Assets  []AssetFixture  `json:"assets"`
-	Tokens  []TokenFixture  `json:"tokens"`
-	Venues  []VenueFixture  `json:"venues"`
-	Pairs   []PairFixture   `json:"pairs"`
-	Pools   []PoolFixture   `json:"pools"`
-	Paths   []PathFixture   `json:"paths"`
-	Markets []MarketFixture `json:"markets"`
+	Chains  []ChainFixture  `yaml:"chains"`
+	Assets  []AssetFixture  `yaml:"assets"`
+	Tokens  []TokenFixture  `yaml:"tokens"`
+	Venues  []VenueFixture  `yaml:"venues"`
+	Pairs   []PairFixture   `yaml:"pairs"`
+	Pools   []PoolFixture   `yaml:"pools"`
+	Paths   []PathFixture   `yaml:"paths"`
+	Markets []MarketFixture `yaml:"markets"`
 }
 
 type ChainFixture struct {
-	ID string `json:"id"`
+	ID string `yaml:"id"`
 }
 
 type AssetFixture struct {
-	ID     string `json:"id"`
-	Symbol string `json:"symbol"`
+	ID     string `yaml:"id"`
+	Symbol string `yaml:"symbol"`
 }
 
 type TokenFixture struct {
-	ID       string `json:"id"`
-	Asset    string `json:"asset"`
-	Chain    string `json:"chain"`
-	Decimals uint8  `json:"decimals"`
-	Symbol   string `json:"symbol"`
+	ID       string `yaml:"id"`
+	Asset    string `yaml:"asset"`
+	Chain    string `yaml:"chain"`
+	Decimals uint8  `yaml:"decimals"`
+	Symbol   string `yaml:"symbol"`
 }
 
 type VenueFixture struct {
-	ID string `json:"id"`
+	ID string `yaml:"id"`
 }
 
 type PairFixture struct {
-	ID         string `json:"id"`
-	BaseAsset  string `json:"base_asset"`
-	QuoteAsset string `json:"quote_asset"`
+	ID         string `yaml:"id"`
+	BaseAsset  string `yaml:"base_asset"`
+	QuoteAsset string `yaml:"quote_asset"`
 }
 
 type PoolFixture struct {
-	ID      string   `json:"id"`
-	Venue   string   `json:"venue"`
-	Chain   string   `json:"chain"`
-	Tokens  []string `json:"tokens"`
-	Adapter string   `json:"adapter"`
+	ID      string   `yaml:"id"`
+	Venue   string   `yaml:"venue"`
+	Chain   string   `yaml:"chain"`
+	Tokens  []string `yaml:"tokens"`
+	Adapter string   `yaml:"adapter"`
 }
 
 type HopFixture struct {
-	Pool     string `json:"pool"`
-	TokenIn  string `json:"token_in"`
-	TokenOut string `json:"token_out"`
+	Pool     string `yaml:"pool"`
+	TokenIn  string `yaml:"token_in"`
+	TokenOut string `yaml:"token_out"`
 }
 
 type PathFixture struct {
-	ID    string       `json:"id"`
-	Chain string       `json:"chain"`
-	Hops  []HopFixture `json:"hops"`
+	ID    string       `yaml:"id"`
+	Chain string       `yaml:"chain"`
+	Hops  []HopFixture `yaml:"hops"`
 }
 
 type MarketFixture struct {
-	ID         string `json:"id"`
-	Pair       string `json:"pair"`
-	Chain      string `json:"chain"`
-	Path       string `json:"path"`
-	BaseToken  string `json:"base_token"`
-	QuoteToken string `json:"quote_token"`
+	ID         string `yaml:"id"`
+	Pair       string `yaml:"pair"`
+	Chain      string `yaml:"chain"`
+	Path       string `yaml:"path"`
+	BaseToken  string `yaml:"base_token"`
+	QuoteToken string `yaml:"quote_token"`
 }
 
 type SetupFixture struct {
-	ID      string   `json:"id"`
-	Pair    string   `json:"pair"`
-	Markets []string `json:"markets"`
+	ID      string   `yaml:"id"`
+	Pair    string   `yaml:"pair"`
+	Markets []string `yaml:"markets"`
 }
 
 type StrategyFixture struct {
-	ID        string   `json:"id"`
-	Sizes     []string `json:"sizes"`
-	Threshold string   `json:"threshold"`
+	ID        string   `yaml:"id"`
+	Sizes     []string `yaml:"sizes"`
+	Threshold string   `yaml:"threshold"`
 }
 
 type FeedFixture struct {
-	Market     string             `json:"market"`
-	Source     string             `json:"source"`
-	Events     []EventFixture     `json:"events"`
-	Disconnect *DisconnectFixture `json:"disconnect,omitempty"`
+	Market     string             `yaml:"market"`
+	Source     string             `yaml:"source"`
+	Events     []EventFixture     `yaml:"events"`
+	Disconnect *DisconnectFixture `yaml:"disconnect,omitempty"`
 }
 
 type EventFixture struct {
-	BlockNumber          *uint64       `json:"block_number,omitempty"`
-	Finality             string        `json:"finality"`
-	SourceTime           string        `json:"source_time,omitempty"`
-	ReceivedAt           string        `json:"received_at"`
-	AppliedAt            string        `json:"applied_at"`
-	EvaluationStartedAt  string        `json:"evaluation_started_at"`
-	EvaluationFinishedAt string        `json:"evaluation_finished_at"`
-	BaseReserve          string        `json:"base_reserve,omitempty"`
-	QuoteReserve         string        `json:"quote_reserve,omitempty"`
-	FeeBPS               uint16        `json:"fee_bps,omitempty"`
-	SqrtPriceX96         string        `json:"sqrt_price_x96,omitempty"`
-	Tick                 *int32        `json:"tick,omitempty"`
-	Liquidity            string        `json:"liquidity,omitempty"`
-	FeePips              *uint32       `json:"fee_pips,omitempty"`
-	TickSpacing          *int32        `json:"tick_spacing,omitempty"`
-	InitializedTicks     []TickFixture `json:"initialized_ticks,omitempty"`
+	BlockNumber          *uint64       `yaml:"block_number,omitempty"`
+	Finality             string        `yaml:"finality"`
+	SourceTime           string        `yaml:"source_time,omitempty"`
+	ReceivedAt           string        `yaml:"received_at"`
+	AppliedAt            string        `yaml:"applied_at"`
+	EvaluationStartedAt  string        `yaml:"evaluation_started_at"`
+	EvaluationFinishedAt string        `yaml:"evaluation_finished_at"`
+	BaseReserve          string        `yaml:"base_reserve,omitempty"`
+	QuoteReserve         string        `yaml:"quote_reserve,omitempty"`
+	FeeBPS               uint16        `yaml:"fee_bps,omitempty"`
+	SqrtPriceX96         string        `yaml:"sqrt_price_x96,omitempty"`
+	Tick                 *int32        `yaml:"tick,omitempty"`
+	Liquidity            string        `yaml:"liquidity,omitempty"`
+	FeePips              *uint32       `yaml:"fee_pips,omitempty"`
+	TickSpacing          *int32        `yaml:"tick_spacing,omitempty"`
+	InitializedTicks     []TickFixture `yaml:"initialized_ticks,omitempty"`
 }
 
 type TickFixture struct {
-	Index          int32  `json:"index"`
-	LiquidityGross string `json:"liquidity_gross"`
-	LiquidityNet   string `json:"liquidity_net"`
+	Index          int32  `yaml:"index"`
+	LiquidityGross string `yaml:"liquidity_gross"`
+	LiquidityNet   string `yaml:"liquidity_net"`
 }
 
 type DisconnectFixture struct {
-	Reason               string `json:"reason"`
-	ObservedAt           string `json:"observed_at"`
-	EvaluationStartedAt  string `json:"evaluation_started_at"`
-	EvaluationFinishedAt string `json:"evaluation_finished_at"`
+	Reason               string `yaml:"reason"`
+	ObservedAt           string `yaml:"observed_at"`
+	EvaluationStartedAt  string `yaml:"evaluation_started_at"`
+	EvaluationFinishedAt string `yaml:"evaluation_finished_at"`
 }
 
 func ParseFixture(data []byte) (Fixture, string, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
 	var fixture Fixture
 	if err := decoder.Decode(&fixture); err != nil {
 		return Fixture{}, "", fmt.Errorf("decode fixture: %w", err)
@@ -157,11 +158,11 @@ func ParseFixture(data []byte) (Fixture, string, error) {
 	return fixture, hex.EncodeToString(hash[:]), nil
 }
 
-func ensureEOF(decoder *json.Decoder) error {
+func ensureEOF(decoder *yaml.Decoder) error {
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return fmt.Errorf("fixture contains multiple JSON values")
+			return fmt.Errorf("fixture contains multiple YAML documents")
 		}
 		return fmt.Errorf("decode trailing fixture data: %w", err)
 	}

@@ -1,12 +1,13 @@
 schema_version: 1
 setups:
-  synthetic_setup: {markets: [market_alpha, market_beta]}
+  virtual_wealth:
+    markets: [virtual_robinhood, virtual_base]
 research:
-  synthetic_cross_chain:
-    run_id: synthetic-live-run
-    setup: synthetic_setup
+  virtual_cross_chain:
+    run_id: virtual-wealth-live
+    setup: virtual_wealth
     inventory_mode: prepositioned
-    price_source: wrapped_native_usd
+    price_source: weth_usd
     fixed_cost: {asset: usd, amount: "0.5"}
     min_net_profit: "0"
     sizing: {kind: linear_range, min: "100", max: "5000", samples: 10}

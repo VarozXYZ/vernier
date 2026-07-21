@@ -41,6 +41,7 @@ func TestFixtureProducesDeterministicReport(t *testing.T) {
 	}
 	for _, required := range []string{
 		hash, `"run_id": "synthetic-two-market"`, `"triggered_at"`, `"snapshot_version"`,
+		`"mode": "exact_input"`, `"mode": "exact_output"`,
 		`"kind": "liquidity_provider"`, `"included_in_amounts": true`,
 	} {
 		if !strings.Contains(firstJSON.String(), required) {
@@ -129,9 +130,9 @@ func TestOlderBlockIsIgnoredWithoutDegradingOrEvaluating(t *testing.T) {
 
 func TestFixtureDecoderIsStrict(t *testing.T) {
 	for name, data := range map[string]string{
-		"unknown field": `{"schema_version":1,"unknown":true}`,
-		"wrong version": `{"schema_version":2}`,
-		"second value":  `{"schema_version":1} {}`,
+		"unknown field": "schema_version: 1\nunknown: true\n",
+		"wrong version": "schema_version: 2\n",
+		"second value":  "schema_version: 1\n---\nschema_version: 1\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := runtimeresearch.ParseFixture([]byte(data)); err == nil {
@@ -157,7 +158,7 @@ func TestRunnerIsSingleUse(t *testing.T) {
 
 func loadExample(t *testing.T) (runtimeresearch.Fixture, string) {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "..", "examples", "synthetic", "two-market.json"))
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "examples", "synthetic", "two-market.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
