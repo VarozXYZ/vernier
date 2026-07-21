@@ -14,13 +14,13 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify / Go 1.26 / Linux
+    name: Verify / Go 1.26.5 / Linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
         with:
-          go-version: 1.26.x
+          go-version: 1.26.5
           cache: true
       - run: go run ./tools/verify
 
@@ -36,12 +36,12 @@ jobs:
       - run: go test ./...
 
   windows:
-    name: Verify / Go 1.26 / Windows
+    name: Verify / Go 1.26.5 / Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
         with:
-          go-version: 1.26.x
+          go-version: 1.26.5
           cache: true
       - run: go run ./tools/verify
