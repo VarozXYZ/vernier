@@ -47,7 +47,7 @@ func MinimumInputForOutput(
 		}
 		if candidate.AmountIn.Token() != request.TokenIn || candidate.AmountIn.IsZero() ||
 			candidate.AmountOut.Token() != request.TokenOut ||
-			candidate.AmountOut.Units().Cmp(request.TargetOut.Units()) != 0 {
+			candidate.AmountOut.Units().Cmp(request.TargetOut.Units()) != 0 || candidate.Mode != market.QuoteModeExactOutput {
 			return market.Quote{}, fmt.Errorf("native source returned inconsistent exact-output evidence")
 		}
 		return candidate, nil
@@ -66,7 +66,7 @@ func MinimumInputForOutput(
 			return market.Quote{}, err
 		}
 		if candidate.AmountIn.Token() != request.TokenIn || candidate.AmountIn.Units().Cmp(units) != 0 ||
-			candidate.AmountOut.Token() != request.TokenOut {
+			candidate.AmountOut.Token() != request.TokenOut || candidate.Mode != market.QuoteModeExactInput {
 			return market.Quote{}, fmt.Errorf("quote source returned inconsistent exact-output evidence")
 		}
 		return candidate, nil

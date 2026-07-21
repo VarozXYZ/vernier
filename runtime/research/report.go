@@ -118,6 +118,7 @@ type quoteDTO struct {
 	SnapshotVersion uint64        `json:"snapshot_version"`
 	SnapshotHash    string        `json:"snapshot_hash"`
 	Purpose         string        `json:"purpose"`
+	Mode            string        `json:"mode"`
 	TokenIn         string        `json:"token_in"`
 	AmountIn        string        `json:"amount_in"`
 	TokenOut        string        `json:"token_out"`
@@ -230,7 +231,7 @@ func quantity(value market.AssetQuantity) quantityDTO {
 func quote(value market.Quote) quoteDTO {
 	dto := quoteDTO{
 		Source: string(value.Source), Market: string(value.Market), SnapshotVersion: value.SnapshotVersion,
-		SnapshotHash: hex.EncodeToString(value.SnapshotHash[:]), Purpose: string(value.Purpose),
+		SnapshotHash: hex.EncodeToString(value.SnapshotHash[:]), Purpose: string(value.Purpose), Mode: string(value.Mode),
 		TokenIn: string(value.AmountIn.Token()), AmountIn: value.AmountIn.String(),
 		TokenOut: string(value.AmountOut.Token()), AmountOut: value.AmountOut.String(),
 		Fees: make([]quoteFeeDTO, 0, len(value.Fees())), QuotedAt: formatTime(value.QuotedAt),

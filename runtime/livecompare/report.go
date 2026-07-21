@@ -83,8 +83,8 @@ func WriteJSON(writer io.Writer, report Report) error {
 	}
 	for _, value := range report.Parity {
 		payload.Parity = append(payload.Parity, parityDTO{
-			Market: string(value.Market), Leg: value.Leg,
-			TokenIn: string(value.AmountIn.Token()), AmountIn: value.AmountIn.String(),
+			Market: string(value.Market), Leg: value.Leg, Mode: string(value.Mode),
+			TokenIn: string(value.LocalIn.Token()), LocalIn: value.LocalIn.String(), ReferenceIn: value.ReferenceIn.String(),
 			TokenOut: string(value.LocalOut.Token()), LocalOut: value.LocalOut.String(),
 			ReferenceOut: value.ReferenceOut.String(), Matches: value.Matches,
 		})
@@ -112,8 +112,10 @@ type costDTO struct {
 type parityDTO struct {
 	Market       string `json:"market"`
 	Leg          string `json:"leg"`
+	Mode         string `json:"mode"`
 	TokenIn      string `json:"token_in"`
-	AmountIn     string `json:"amount_in"`
+	LocalIn      string `json:"local_in"`
+	ReferenceIn  string `json:"reference_in"`
 	TokenOut     string `json:"token_out"`
 	LocalOut     string `json:"local_out"`
 	ReferenceOut string `json:"reference_out"`
