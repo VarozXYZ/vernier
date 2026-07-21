@@ -200,7 +200,7 @@ func NewRunner(fixture Fixture, configHash string) (*Runner, error) {
 		}
 		candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
 			ID: arbitrage.StrategyID(configuredStrategy.ID), Setup: setup, Registry: registry,
-			Sources: quoteSources, Grid: grid, Threshold: threshold, Clock: strategyClock.Now,
+			Sources: quoteSources, Grid: grid, Threshold: threshold, Clock: strategyClock.Now, SizingAsset: strategy.SizingAssetBase,
 		})
 		if err != nil {
 			return nil, err

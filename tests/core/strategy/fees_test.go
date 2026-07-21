@@ -47,7 +47,7 @@ func TestUnmodeledQuoteFeeClosesClassification(t *testing.T) {
 	}
 	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
 		ID: "strategy-fees", Setup: setup, Registry: fixture.registry, Sources: sources,
-		Grid: grid, Threshold: quantity(t, "1"), Clock: func() time.Time { return fixture.now.Add(time.Millisecond) },
+		Grid: grid, Threshold: quantity(t, "1"), Clock: func() time.Time { return fixture.now.Add(time.Millisecond) }, SizingAsset: strategy.SizingAssetBase,
 	})
 	if err != nil {
 		t.Fatal(err)

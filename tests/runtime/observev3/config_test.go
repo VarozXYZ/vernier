@@ -62,7 +62,7 @@ research:
     price_source: weth_usd
     fixed_cost: {asset: usd, amount: "0.5"}
     min_net_profit: "0"
-    sizing: {kind: linear_range, min: "1", max: "1000000", samples: 2}
+    sizing: {kind: linear_range, asset: base, min: "1", max: "1000000", samples: 2}
 `
 
 func TestConfigUsesSharedYAMLAndDerivesBothDirections(t *testing.T) {
@@ -74,6 +74,27 @@ func TestConfigUsesSharedYAMLAndDerivesBothDirections(t *testing.T) {
 	path := writeObserverFiles(t, strings.Replace(observeTopology, "schema_version: 1", "schema_version: 1\nunexpected: true", 1))
 	if _, err := configuration.LoadConfig(path); err == nil {
 		t.Fatal("unknown YAML field was accepted")
+	}
+}
+
+func TestConfigUsesQuoteBudgetForQuoteSizing(t *testing.T) {
+	policy := strings.Replace(observePolicy, "asset: base", "asset: quote", 1)
+	directory := t.TempDir()
+	for name, data := range map[string]string{"vernier.yaml": observeManifest, "topology.yaml": observeTopology, "policy.yaml": policy} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bundle, err := configuration.LoadConfig(filepath.Join(directory, "vernier.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := observev3.FromConfig(bundle, "local_market")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.QuoteInputs[0].Amount != "1000000000000" || config.QuoteInputs[1].Amount != "1000000000000" {
+		t.Fatalf("quote sizing did not drive observer probes: %+v", config.QuoteInputs)
 	}
 }
 
