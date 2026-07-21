@@ -128,7 +128,10 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	maximum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MaximumSize)
+	maximum, err := market.NewAssetQuantity(r.sizingAsset(), r.config.MaximumSize)
+	if err != nil {
+		return Report{}, err
+	}
 	runtimes := make([]marketRuntime, 0, len(r.config.Markets))
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
@@ -195,8 +198,8 @@ func blockSummary(blocks map[string]evm.BlockReference) map[string]uint64 {
 }
 
 func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.ArbitrageSetup, sources map[market.MarketID]quoteport.Source) (*strategy.TwoMarketCrossChainArbitrage, error) {
-	minimum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MinimumSize)
-	maximum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MaximumSize)
+	minimum, _ := market.NewAssetQuantity(r.sizingAsset(), r.config.MinimumSize)
+	maximum, _ := market.NewAssetQuantity(r.sizingAsset(), r.config.MaximumSize)
 	grid, err := sizing.NewLinearRange(minimum, maximum, r.config.SizeSamples)
 	if err != nil {
 		return nil, err
@@ -207,8 +210,15 @@ func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.Arbitrag
 	}
 	return strategy.NewTwoMarket(strategy.TwoMarketConfig{
 		ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
-		Sources: sources, Grid: grid, Threshold: threshold, Clock: r.clock,
+		Sources: sources, Grid: grid, Threshold: threshold, Clock: r.clock, SizingAsset: strategy.SizingAsset(r.config.SizingAsset),
 	})
+}
+
+func (r *Runner) sizingAsset() market.AssetID {
+	if r.config.SizingAsset == string(strategy.SizingAssetBase) {
+		return r.config.Markets[0].Base.Token.Asset
+	}
+	return r.config.Markets[0].Quote.Token.Asset
 }
 
 func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCrossChainArbitrage, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time) (runtimeresearch.Report, error) {
@@ -362,16 +372,35 @@ func (r *Runner) composeMarket(configured configuration.ResolvedMarket, registry
 }
 
 func v3Inputs(configured configuration.ResolvedMarket, maximum market.AssetQuantity) (*big.Int, *big.Int, bool, error) {
-	maxBase, err := maximum.ToTokenAmount(configured.Base.Token)
-	if err != nil {
-		return nil, nil, false, err
+	var baseProbe, quoteProbe market.TokenAmount
+	switch maximum.Asset() {
+	case configured.Base.Token.Asset:
+		var err error
+		baseProbe, err = maximum.ToTokenAmount(configured.Base.Token)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		oneQuote, _ := market.NewAssetQuantity(configured.Quote.Token.Asset, big.NewRat(1, 1))
+		quoteProbe, err = oneQuote.ToTokenAmount(configured.Quote.Token)
+		if err != nil {
+			return nil, nil, false, err
+		}
+	case configured.Quote.Token.Asset:
+		var err error
+		quoteProbe, err = maximum.ToTokenAmount(configured.Quote.Token)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		// The opposite-direction probe uses the same raw upper bound. It is a
+		// conservative coverage hint; exact sizing remains quote-driven.
+		baseProbe, err = market.NewTokenAmount(configured.Base.Token.ID, quoteProbe.Units())
+		if err != nil {
+			return nil, nil, false, err
+		}
+	default:
+		return nil, nil, false, fmt.Errorf("maximum sizing asset %q does not belong to market", maximum.Asset())
 	}
-	oneQuote, _ := market.NewAssetQuantity(configured.Quote.Token.Asset, big.NewRat(1, 1))
-	initialQuote, err := oneQuote.ToTokenAmount(configured.Quote.Token)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	return maxBase.Units(), initialQuote.Units(), bytes.Compare(configured.Base.Address.Bytes(), configured.Quote.Address.Bytes()) < 0, nil
+	return baseProbe.Units(), quoteProbe.Units(), bytes.Compare(configured.Base.Address.Bytes(), configured.Quote.Address.Bytes()) < 0, nil
 }
 
 func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) {

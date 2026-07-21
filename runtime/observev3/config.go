@@ -68,15 +68,39 @@ func FromConfig(bundle configuration.ParsedConfig, selected string) (Config, err
 	if !ok {
 		return Config{}, fmt.Errorf("market network profile is unavailable")
 	}
-	maximum, _ := market.NewAssetQuantity(configured.Base.Token.Asset, bundle.MaximumSize)
-	baseAmount, err := maximum.ToTokenAmount(configured.Base.Token)
-	if err != nil || baseAmount.IsZero() {
-		return Config{}, fmt.Errorf("maximum sizing probe is invalid")
-	}
-	oneQuote, _ := market.NewAssetQuantity(configured.Quote.Token.Asset, big.NewRat(1, 1))
-	quoteAmount, err := oneQuote.ToTokenAmount(configured.Quote.Token)
-	if err != nil || quoteAmount.IsZero() {
-		return Config{}, fmt.Errorf("quote-asset probe is invalid")
+	var baseAmount, quoteAmount market.TokenAmount
+	if bundle.SizingAsset == "base" {
+		maximum, err := market.NewAssetQuantity(configured.Base.Token.Asset, bundle.MaximumSize)
+		if err != nil {
+			return Config{}, fmt.Errorf("maximum sizing probe is invalid")
+		}
+		baseAmount, err = maximum.ToTokenAmount(configured.Base.Token)
+		if err != nil || baseAmount.IsZero() {
+			return Config{}, fmt.Errorf("maximum sizing probe is invalid")
+		}
+		oneQuote, err := market.NewAssetQuantity(configured.Quote.Token.Asset, big.NewRat(1, 1))
+		if err != nil {
+			return Config{}, fmt.Errorf("quote-asset probe is invalid")
+		}
+		quoteAmount, err = oneQuote.ToTokenAmount(configured.Quote.Token)
+		if err != nil || quoteAmount.IsZero() {
+			return Config{}, fmt.Errorf("quote-asset probe is invalid")
+		}
+	} else {
+		maximum, err := market.NewAssetQuantity(configured.Quote.Token.Asset, bundle.MaximumSize)
+		if err != nil {
+			return Config{}, fmt.Errorf("maximum sizing probe is invalid")
+		}
+		quoteAmount, err = maximum.ToTokenAmount(configured.Quote.Token)
+		if err != nil || quoteAmount.IsZero() {
+			return Config{}, fmt.Errorf("maximum sizing probe is invalid")
+		}
+		// The opposite-token probe is a deterministic coverage hint. Exact
+		// quote sizing remains the responsibility of the local quoter.
+		baseAmount, err = market.NewTokenAmount(configured.Base.Token.ID, quoteAmount.Units())
+		if err != nil || baseAmount.IsZero() {
+			return Config{}, fmt.Errorf("base-asset probe is invalid")
+		}
 	}
 	token0, token1 := configured.Base, configured.Quote
 	if bytes.Compare(token0.Address.Bytes(), token1.Address.Bytes()) > 0 {

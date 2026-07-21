@@ -137,7 +137,7 @@ func newStrategyFixture(t *testing.T, thresholdText, costText string) strategyFi
 	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
 		ID: "strategy", Setup: setup, Registry: registry,
 		Sources: map[market.MarketID]quoteport.Source{"market-a": quoterA, "market-b": quoterB},
-		Grid:    grid, Threshold: threshold, Clock: func() time.Time { return now.Add(5 * time.Millisecond) },
+		Grid:    grid, Threshold: threshold, Clock: func() time.Time { return now.Add(5 * time.Millisecond) }, SizingAsset: strategy.SizingAssetBase,
 	})
 	if err != nil {
 		t.Fatal(err)

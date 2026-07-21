@@ -122,6 +122,7 @@ type AmountConfig struct {
 
 type SizingConfig struct {
 	Kind    string `yaml:"kind"`
+	Asset   string `yaml:"asset"`
 	Minimum string `yaml:"min"`
 	Maximum string `yaml:"max"`
 	Samples int    `yaml:"samples"`
@@ -180,6 +181,7 @@ type ParsedConfig struct {
 	MinimumSize   *big.Rat
 	MaximumSize   *big.Rat
 	SizeSamples   int
+	SizingAsset   string
 	MinimumNet    *big.Rat
 }
 
@@ -297,6 +299,13 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 		return ParsedConfig{}, err
 	}
 	maximum, err := positive(research.Sizing.Maximum, "maximum size")
+	sizingAsset := strings.TrimSpace(research.Sizing.Asset)
+	if sizingAsset == "" {
+		sizingAsset = "quote"
+	}
+	if sizingAsset != "base" && sizingAsset != "quote" {
+		return ParsedConfig{}, fmt.Errorf("sizing asset must be base or quote")
+	}
 	if err != nil || maximum.Cmp(minimum) <= 0 || research.Sizing.Kind != "linear_range" || research.Sizing.Samples < 2 {
 		return ParsedConfig{}, fmt.Errorf("linear sizing requires increasing positive bounds and at least two samples")
 	}
@@ -318,7 +327,7 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 		Hash: hex.EncodeToString(sum[:]), ResearchID: manifest.ActiveResearch, RunID: research.RunID,
 		SetupID: research.Setup, InventoryMode: research.InventoryMode, Assets: assets, Chains: chains, Markets: markets,
 		PriceSource: ResolvedPriceSource{ID: market.SourceID(research.PriceSource), Base: market.AssetID(priceConfig.BaseAsset), Quote: market.AssetID(priceConfig.QuoteAsset), Primary: priceConfig.Primary, Fallback: priceConfig.Fallback},
-		FixedCost:   fixedCost, MinimumSize: minimum, MaximumSize: maximum, SizeSamples: research.Sizing.Samples, MinimumNet: minimumNet,
+		FixedCost:   fixedCost, MinimumSize: minimum, MaximumSize: maximum, SizeSamples: research.Sizing.Samples, SizingAsset: sizingAsset, MinimumNet: minimumNet,
 	}, nil
 }
 

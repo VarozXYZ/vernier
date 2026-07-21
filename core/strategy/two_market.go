@@ -14,25 +14,34 @@ import (
 
 type Clock func() time.Time
 
+type SizingAsset string
+
+const (
+	SizingAssetBase  SizingAsset = "base"
+	SizingAssetQuote SizingAsset = "quote"
+)
+
 type TwoMarketConfig struct {
-	ID        arbitrage.StrategyID
-	Setup     arbitrage.ArbitrageSetup
-	Registry  *market.Registry
-	Sources   map[market.MarketID]quoteport.Source
-	Grid      sizing.Grid
-	Threshold market.AssetQuantity
-	Clock     Clock
+	ID          arbitrage.StrategyID
+	Setup       arbitrage.ArbitrageSetup
+	Registry    *market.Registry
+	Sources     map[market.MarketID]quoteport.Source
+	Grid        sizing.Grid
+	Threshold   market.AssetQuantity
+	Clock       Clock
+	SizingAsset SizingAsset
 }
 
 type TwoMarketCrossChainArbitrage struct {
-	id        arbitrage.StrategyID
-	setup     arbitrage.ArbitrageSetup
-	registry  *market.Registry
-	sources   map[market.MarketID]quoteport.Source
-	grid      sizing.Grid
-	threshold market.AssetQuantity
-	clock     Clock
-	cache     quoteCache
+	id          arbitrage.StrategyID
+	setup       arbitrage.ArbitrageSetup
+	registry    *market.Registry
+	sources     map[market.MarketID]quoteport.Source
+	grid        sizing.Grid
+	threshold   market.AssetQuantity
+	clock       Clock
+	cache       quoteCache
+	sizingAsset market.AssetID
 }
 
 func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error) {
@@ -46,8 +55,21 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	if !ok {
 		return nil, fmt.Errorf("setup references unknown pair %q", config.Setup.Pair())
 	}
-	if config.Grid.Asset() != pair.BaseAsset {
-		return nil, fmt.Errorf("sizing grid must use base asset %q", pair.BaseAsset)
+	basis := config.SizingAsset
+	if basis == "" {
+		basis = SizingAssetQuote
+	}
+	var sizingAsset market.AssetID
+	switch basis {
+	case SizingAssetBase:
+		sizingAsset = pair.BaseAsset
+	case SizingAssetQuote:
+		sizingAsset = pair.QuoteAsset
+	default:
+		return nil, fmt.Errorf("unsupported sizing asset %q", basis)
+	}
+	if config.Grid.Asset() != sizingAsset {
+		return nil, fmt.Errorf("sizing grid must use %s asset %q", basis, sizingAsset)
 	}
 	if config.Threshold.Asset() != pair.QuoteAsset || config.Threshold.Sign() < 0 {
 		return nil, fmt.Errorf("non-negative threshold must use quote asset %q", pair.QuoteAsset)
@@ -62,7 +84,7 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	}
 	return &TwoMarketCrossChainArbitrage{
 		id: config.ID, setup: config.Setup, registry: config.Registry, sources: sources,
-		grid: config.Grid, threshold: config.Threshold, clock: config.Clock,
+		grid: config.Grid, threshold: config.Threshold, clock: config.Clock, sizingAsset: sizingAsset,
 		cache: newQuoteCache(),
 	}, nil
 }
@@ -156,6 +178,9 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 }
 
 func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, size market.AssetQuantity) (arbitrage.Candidate, error) {
+	if s.sizingAsset == buyQuote.Asset {
+		return s.quoteSizedCandidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size)
+	}
 	targetBase, err := size.ToTokenAmount(buyBase)
 	if err != nil || targetBase.IsZero() {
 		return arbitrage.Candidate{}, fmt.Errorf("size_rounds_to_zero")
@@ -199,6 +224,52 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	net, _ := gross.Sub(evaluation.Cost().Amount)
 	return arbitrage.Candidate{
 		Size: actualSize, Input: actualInput, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
+		BuyQuote: buy, SellQuote: sell,
+	}, nil
+}
+
+func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, budget market.AssetQuantity) (arbitrage.Candidate, error) {
+	buyInput, err := budget.ToTokenAmount(buyQuote)
+	if err != nil || buyInput.IsZero() {
+		return arbitrage.Candidate{}, fmt.Errorf("size_rounds_to_zero")
+	}
+	buy, err := s.input(ctx, s.sources[direction.BuyMarket], quoteport.Input{
+		Snapshot: buySnapshot, TokenIn: buyQuote.ID, TokenOut: buyBase.ID, AmountIn: buyInput,
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
+	})
+	if err != nil {
+		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed")
+	}
+	if hasUnmodeledFee(buy) {
+		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_has_unmodeled_fee")
+	}
+	baseReceived, err := buy.AmountOut.ToAssetQuantity(buyBase)
+	if err != nil || baseReceived.Sign() <= 0 {
+		return arbitrage.Candidate{}, fmt.Errorf("buy_output_invalid")
+	}
+	sellInput, err := baseReceived.ToTokenAmount(sellBase)
+	if err != nil || sellInput.IsZero() {
+		return arbitrage.Candidate{}, fmt.Errorf("sell_input_rounds_to_zero")
+	}
+	sell, err := s.input(ctx, s.sources[direction.SellMarket], quoteport.Input{
+		Snapshot: sellSnapshot, TokenIn: sellBase.ID, TokenOut: sellQuote.ID, AmountIn: sellInput,
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
+	})
+	if err != nil {
+		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed")
+	}
+	if hasUnmodeledFee(sell) {
+		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_has_unmodeled_fee")
+	}
+	output, err := sell.AmountOut.ToAssetQuantity(sellQuote)
+	if err != nil {
+		return arbitrage.Candidate{}, fmt.Errorf("sell_output_invalid")
+	}
+	input, _ := buyInput.ToAssetQuantity(buyQuote)
+	gross, _ := output.Sub(input)
+	net, _ := gross.Sub(evaluation.Cost().Amount)
+	return arbitrage.Candidate{
+		Size: budget, Input: input, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
 		BuyQuote: buy, SellQuote: sell,
 	}, nil
 }

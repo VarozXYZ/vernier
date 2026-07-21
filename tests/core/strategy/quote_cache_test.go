@@ -22,7 +22,7 @@ func TestTwoMarketCachesUnchangedPoolQuotesAndInvalidatesChangedPool(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	grid, err := sizing.NewGrid([]market.AssetQuantity{baseQuantity(t, "10"), baseQuantity(t, "20")})
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "10"), quantity(t, "20")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestTwoMarketCachesUnchangedPoolQuotesAndInvalidatesChangedPool(t *testing.
 	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
 		ID: "strategy", Setup: setup, Registry: registry,
 		Sources: map[market.MarketID]quoteport.Source{"market-a": sourceA, "market-b": sourceB},
-		Grid:    grid, Threshold: threshold, Clock: func() time.Time { return now.Add(5 * time.Millisecond) },
+		Grid:    grid, Threshold: threshold, Clock: func() time.Time { return now.Add(5 * time.Millisecond) }, SizingAsset: strategy.SizingAssetQuote,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -61,6 +61,14 @@ func TestTwoMarketCachesUnchangedPoolQuotesAndInvalidatesChangedPool(t *testing.
 	if firstA == 0 || firstB == 0 {
 		t.Fatal("initial evaluation did not quote both markets")
 	}
+	initial := evaluate("quote-sized", []market.MarketSnapshot{snapshotA, snapshotB})
+	for _, opportunity := range initial {
+		for _, candidate := range opportunity.Candidates {
+			if candidate.Size.Asset() != "quote" || candidate.BuyQuote.Mode != market.QuoteModeExactInput {
+				t.Fatalf("quote sizing did not use quote budget and exact-input buy: size=%s mode=%s", candidate.Size, candidate.BuyQuote.Mode)
+			}
+		}
+	}
 	evaluate("same", []market.MarketSnapshot{snapshotA, snapshotB})
 	if sourceA.inputCalls+sourceA.outputCalls != firstA || sourceB.inputCalls+sourceB.outputCalls != firstB {
 		t.Fatal("unchanged snapshots caused quote recomputation")
@@ -81,8 +89,10 @@ func TestTwoMarketCachesUnchangedPoolQuotesAndInvalidatesChangedPool(t *testing.
 
 	changed := strategySnapshot(t, "market-a", "1100000000", "1800000000", now)
 	evaluate("changed", []market.MarketSnapshot{changed, snapshotB})
-	if sourceA.inputCalls+sourceA.outputCalls <= firstA || sourceB.inputCalls+sourceB.outputCalls != firstB {
-		t.Fatal("cache did not invalidate only the changed market")
+	currentA := sourceA.inputCalls + sourceA.outputCalls
+	currentB := sourceB.inputCalls + sourceB.outputCalls
+	if currentA <= firstA || currentB <= firstB || currentB >= firstB*2 {
+		t.Fatalf("cache did not reuse the unchanged market's fixed-budget leg: A=%d B=%d firstA=%d firstB=%d", currentA, currentB, firstA, firstB)
 	}
 }
 

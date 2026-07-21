@@ -55,7 +55,10 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 	if err != nil {
 		return err
 	}
-	maximum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MaximumSize)
+	maximum, err := market.NewAssetQuantity(r.sizingAsset(), r.config.MaximumSize)
+	if err != nil {
+		return err
+	}
 	markets := make(map[market.MarketID]*streamMarket, len(r.config.Markets))
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	now := r.clock().UTC()
