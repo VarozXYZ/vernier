@@ -20,7 +20,8 @@ func (linearSource) Quote(_ context.Context, input quoteport.Input) (market.Quot
 	output, _ := market.NewTokenAmount(input.TokenOut, new(big.Int).Mul(input.AmountIn.Units(), big.NewInt(3)))
 	return market.NewQuote(market.Quote{
 		Source: "linear", Market: "market", SnapshotVersion: 1,
-		Purpose: input.Purpose, AmountIn: input.AmountIn, AmountOut: output, QuotedAt: input.QuotedAt,
+		Purpose: input.Purpose, Mode: market.QuoteModeExactInput,
+		AmountIn: input.AmountIn, AmountOut: output, QuotedAt: input.QuotedAt,
 	})
 }
 
@@ -35,7 +36,8 @@ func (s *nativeSource) QuoteExactOutput(_ context.Context, input quoteport.Exact
 	return market.NewQuote(market.Quote{
 		Source: "native", Market: input.Snapshot.Metadata().Market,
 		SnapshotVersion: input.Snapshot.Metadata().Version, SnapshotHash: input.Snapshot.Metadata().StateHash,
-		Purpose: input.Purpose, AmountIn: amountIn, AmountOut: input.AmountOut, QuotedAt: input.QuotedAt,
+		Purpose: input.Purpose, Mode: market.QuoteModeExactOutput,
+		AmountIn: amountIn, AmountOut: input.AmountOut, QuotedAt: input.QuotedAt,
 	})
 }
 

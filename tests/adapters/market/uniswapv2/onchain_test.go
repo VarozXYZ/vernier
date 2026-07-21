@@ -90,7 +90,8 @@ func TestAdapterBootstrapsAndMapsPoolOrderToMarketOrder(t *testing.T) {
 func TestReferenceQuoterDecodesRouterAmounts(t *testing.T) {
 	router := address(10)
 	chain := &network{responses: map[string][]byte{
-		"d06ca61f": routerResult(t, big.NewInt(100), big.NewInt(97)),
+		"d06ca61f": routerResult(t, "getAmountsOut", big.NewInt(100), big.NewInt(97)),
+		"1f00ca74": routerResult(t, "getAmountsIn", big.NewInt(104), big.NewInt(100)),
 	}}
 	quoter, err := uniswapv2.NewReferenceQuoter(router)
 	if err != nil {
@@ -105,6 +106,16 @@ func TestReferenceQuoterDecodesRouterAmounts(t *testing.T) {
 	}
 	if result.Cmp(big.NewInt(97)) != 0 || len(chain.calls) != 1 || chain.calls[0] != router {
 		t.Fatalf("unexpected router quote %s via %v", result, chain.calls)
+	}
+	exactOutput, err := quoter.QuoteExactOutput(
+		context.Background(), chain, evm.BlockReference{Hash: common.BigToHash(big.NewInt(1))},
+		address(1), address(2), big.NewInt(100),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exactOutput.Cmp(big.NewInt(104)) != 0 || len(chain.calls) != 2 {
+		t.Fatalf("unexpected exact-output router quote %s via %v", exactOutput, chain.calls)
 	}
 }
 
@@ -127,14 +138,17 @@ func words(values ...*big.Int) []byte {
 	return result
 }
 
-func routerResult(t *testing.T, values ...*big.Int) []byte {
+func routerResult(t *testing.T, method string, values ...*big.Int) []byte {
 	t.Helper()
-	definition := `[{"type":"function","name":"getAmountsOut","stateMutability":"view","inputs":[{"type":"uint256"},{"type":"address[]"}],"outputs":[{"type":"uint256[]"}]}]`
+	definition := `[
+		{"type":"function","name":"getAmountsOut","stateMutability":"view","inputs":[{"type":"uint256"},{"type":"address[]"}],"outputs":[{"type":"uint256[]"}]},
+		{"type":"function","name":"getAmountsIn","stateMutability":"view","inputs":[{"type":"uint256"},{"type":"address[]"}],"outputs":[{"type":"uint256[]"}]}
+	]`
 	parsed, err := abi.JSON(strings.NewReader(definition))
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := parsed.Methods["getAmountsOut"].Outputs.Pack(values)
+	result, err := parsed.Methods[method].Outputs.Pack(values)
 	if err != nil {
 		t.Fatal(err)
 	}

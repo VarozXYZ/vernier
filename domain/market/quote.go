@@ -11,6 +11,13 @@ const (
 	QuotePurposeResearchDiscovery QuotePurpose = "research_discovery"
 )
 
+type QuoteMode string
+
+const (
+	QuoteModeExactInput  QuoteMode = "exact_input"
+	QuoteModeExactOutput QuoteMode = "exact_output"
+)
+
 type QuoteFeeEffect string
 
 const (
@@ -48,6 +55,7 @@ type Quote struct {
 	SnapshotVersion uint64
 	SnapshotHash    [32]byte
 	Purpose         QuotePurpose
+	Mode            QuoteMode
 	AmountIn        TokenAmount
 	AmountOut       TokenAmount
 	QuotedAt        time.Time
@@ -58,8 +66,8 @@ func NewQuote(quote Quote, fees ...QuoteFee) (Quote, error) {
 	if quote.Source == "" || quote.Market == "" || quote.SnapshotVersion == 0 {
 		return Quote{}, fmt.Errorf("quote source, market, and snapshot version are required")
 	}
-	if quote.Purpose == "" || quote.QuotedAt.IsZero() {
-		return Quote{}, fmt.Errorf("quote purpose and timestamp are required")
+	if quote.Purpose == "" || quote.QuotedAt.IsZero() || quote.Mode != QuoteModeExactInput && quote.Mode != QuoteModeExactOutput {
+		return Quote{}, fmt.Errorf("quote purpose, mode, and timestamp are required")
 	}
 	if quote.AmountIn.Token() == "" || quote.AmountOut.Token() == "" {
 		return Quote{}, fmt.Errorf("quote amounts are required")

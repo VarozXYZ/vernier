@@ -60,7 +60,9 @@ type CostEvidence struct {
 type ParityEvidence struct {
 	Market       market.MarketID
 	Leg          string
-	AmountIn     market.TokenAmount
+	Mode         market.QuoteMode
+	LocalIn      market.TokenAmount
+	ReferenceIn  *big.Int
 	LocalOut     market.TokenAmount
 	ReferenceOut *big.Int
 	Matches      bool
@@ -73,10 +75,11 @@ type Report struct {
 }
 
 type marketRuntime struct {
-	config    configuration.ResolvedMarket
-	snapshot  market.MarketSnapshot
-	source    quoteport.Source
-	reference func(context.Context, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
+	config   configuration.ResolvedMarket
+	snapshot market.MarketSnapshot
+	source   quoteport.Source
+	exactIn  func(context.Context, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
+	exactOut func(context.Context, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
 }
 
 func New(config configuration.ParsedConfig, networks Networks, options Options) (*Runner, error) {
@@ -206,9 +209,15 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		return marketRuntime{config: configured, snapshot: snapshot, source: local, reference: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
-			return reference.QuoteExactInput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
-		}}, nil
+		return marketRuntime{
+			config: configured, snapshot: snapshot, source: local,
+			exactIn: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+				return reference.QuoteExactInput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
+			},
+			exactOut: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+				return reference.QuoteExactOutput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
+			},
+		}, nil
 	case "uniswap_v3":
 		maxBase, initialQuote, baseToQuoteZero, err := v3Inputs(configured, maximum)
 		if err != nil {
@@ -245,7 +254,7 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		return marketRuntime{config: configured, snapshot: snapshot, source: local, reference: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+		return marketRuntime{config: configured, snapshot: snapshot, source: local, exactIn: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
 			return reference.QuoteExactInputSingle(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount, info.Fee)
 		}}, nil
 	case "aerodrome_slipstream":
@@ -286,7 +295,7 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 			return marketRuntime{}, err
 		}
 		tickSpacing := snapshot.Data().(uniswapv3.Snapshot).TickSpacing()
-		return marketRuntime{config: configured, snapshot: snapshot, source: local, reference: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+		return marketRuntime{config: configured, snapshot: snapshot, source: local, exactIn: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
 			return reference.QuoteExactInputSingle(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount, tickSpacing)
 		}}, nil
 	default:
@@ -422,14 +431,40 @@ func validateParity(ctx context.Context, opportunities []arbitrage.Opportunity, 
 				if !ok {
 					return evidence, fmt.Errorf("unknown parity market %q", leg.quote.Market)
 				}
-				reference, err := runtime.reference(ctx, leg.quote.AmountIn.Token(), leg.quote.AmountOut.Token(), leg.quote.AmountIn.Units())
-				if err != nil {
-					return evidence, err
+				var referenceIn, referenceOut *big.Int
+				switch leg.quote.Mode {
+				case market.QuoteModeExactInput:
+					referenceIn = leg.quote.AmountIn.Units()
+					var err error
+					referenceOut, err = runtime.exactIn(ctx, leg.quote.AmountIn.Token(), leg.quote.AmountOut.Token(), referenceIn)
+					if err != nil {
+						return evidence, err
+					}
+				case market.QuoteModeExactOutput:
+					if runtime.exactOut == nil {
+						return evidence, fmt.Errorf("market %q has no exact-output reference", leg.quote.Market)
+					}
+					referenceOut = leg.quote.AmountOut.Units()
+					var err error
+					referenceIn, err = runtime.exactOut(ctx, leg.quote.AmountIn.Token(), leg.quote.AmountOut.Token(), referenceOut)
+					if err != nil {
+						return evidence, err
+					}
+				default:
+					return evidence, fmt.Errorf("market %q returned quote with invalid mode", leg.quote.Market)
 				}
-				matches := leg.quote.AmountOut.Units().Cmp(reference) == 0
-				evidence = append(evidence, ParityEvidence{Market: leg.quote.Market, Leg: leg.name, AmountIn: leg.quote.AmountIn, LocalOut: leg.quote.AmountOut, ReferenceOut: new(big.Int).Set(reference), Matches: matches})
+				matches := leg.quote.AmountIn.Units().Cmp(referenceIn) == 0 && leg.quote.AmountOut.Units().Cmp(referenceOut) == 0
+				evidence = append(evidence, ParityEvidence{
+					Market: leg.quote.Market, Leg: leg.name, Mode: leg.quote.Mode,
+					LocalIn: leg.quote.AmountIn, ReferenceIn: new(big.Int).Set(referenceIn),
+					LocalOut: leg.quote.AmountOut, ReferenceOut: new(big.Int).Set(referenceOut), Matches: matches,
+				})
 				if !matches {
-					return evidence, ErrParityMismatch
+					return evidence, fmt.Errorf(
+						"%w: market=%s leg=%s mode=%s local_in=%s reference_in=%s local_out=%s reference_out=%s",
+						ErrParityMismatch, leg.quote.Market, leg.name, leg.quote.Mode,
+						leg.quote.AmountIn.Units(), referenceIn, leg.quote.AmountOut.Units(), referenceOut,
+					)
 				}
 			}
 		}

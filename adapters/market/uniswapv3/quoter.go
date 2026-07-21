@@ -65,7 +65,7 @@ func (q *Quoter) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	}
 	return market.NewQuote(market.Quote{
 		Source: q.id, Market: q.market.ID, SnapshotVersion: metadata.Version, SnapshotHash: metadata.StateHash,
-		Purpose: input.Purpose, AmountIn: input.AmountIn, AmountOut: amountOut, QuotedAt: input.QuotedAt,
+		Purpose: input.Purpose, Mode: market.QuoteModeExactInput, AmountIn: input.AmountIn, AmountOut: amountOut, QuotedAt: input.QuotedAt,
 	}, feeComponent)
 }
 
