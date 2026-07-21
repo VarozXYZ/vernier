@@ -105,6 +105,21 @@ variables:
 go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --format text
 ~~~
 
+For continuous read-only observation, use the same setup with pool-filtered
+WebSocket logs. The first report is emitted after both pools complete their
+current-state bootstrap; subsequent reports are triggered by accepted events
+or an explicit disconnect health change:
+
+~~~console
+go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --stream --updates 1 --format jsonl
+~~~
+
+Stream mode caches the external cost evidence and never performs venue parity
+RPC calls on the event loop. A healthy WebSocket has no age expiry. Events
+proven older by block evidence are ignored; a confirmed disconnect degrades
+the affected mirror, and reconnect performs a full bootstrap before healthy
+reports resume. Use `--updates 0` to run until canceled.
+
 The report contains configuration and snapshot hashes, exact quantities, cost
 evidence, the complete sizing curve, and parity results. It never includes
 configured addresses or endpoint values. The command is read-only and has no

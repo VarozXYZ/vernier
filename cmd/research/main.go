@@ -38,11 +38,14 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "examples/setups/virtual/vernier.yaml", "path to YAML configuration manifest")
 	envPath := flags.String("env-file", ".env", "path to local environment file")
-	format := flags.String("format", "text", "output format: text or json")
+	format := flags.String("format", "text", "output format: text or json (jsonl in stream mode)")
+	stream := flags.Bool("stream", false, "continuously evaluate both pools from WebSocket log feeds")
+	updates := flags.Int("updates", 0, "reports to emit in stream mode; zero runs until canceled")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	if flags.NArg() != 0 || (*format != "text" && *format != "json") {
+	validFormat := *format == "text" || (!*stream && *format == "json") || (*stream && *format == "jsonl")
+	if flags.NArg() != 0 || !validFormat || *updates < 0 {
 		fmt.Fprintln(stderr, "research compare-live: invalid arguments")
 		return 2
 	}
@@ -86,18 +89,29 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "research compare-live: invalid composition: %v\n", err)
 		return 2
 	}
-	report, err := runner.Run(ctx)
+	if *stream {
+		err = runner.RunStream(ctx, livecompare.StreamOptions{
+			Updates: *updates,
+			OnReport: func(report livecompare.Report) error {
+				if *format == "jsonl" {
+					return livecompare.WriteJSONLine(stdout, report)
+				}
+				return livecompare.WriteText(stdout, report)
+			},
+		})
+	} else {
+		var report livecompare.Report
+		report, err = runner.Run(ctx)
+		if err == nil {
+			if *format == "json" {
+				err = livecompare.WriteJSON(stdout, report)
+			} else {
+				err = livecompare.WriteText(stdout, report)
+			}
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: run failed: %v\n", err)
-		return 1
-	}
-	if *format == "json" {
-		err = livecompare.WriteJSON(stdout, report)
-	} else {
-		err = livecompare.WriteText(stdout, report)
-	}
-	if err != nil {
-		fmt.Fprintf(stderr, "research compare-live: write report: %v\n", err)
 		return 1
 	}
 	return 0

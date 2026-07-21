@@ -59,6 +59,16 @@ func WriteText(writer io.Writer, report Report) error {
 }
 
 func WriteJSON(writer io.Writer, report Report) error {
+	return writeJSON(writer, report, true)
+}
+
+// WriteJSONLine writes one compact, deterministic JSON report followed by a
+// newline. It is intended for continuous research streams.
+func WriteJSONLine(writer io.Writer, report Report) error {
+	return writeJSON(writer, report, false)
+}
+
+func writeJSON(writer io.Writer, report Report, indent bool) error {
 	var researchJSON bytes.Buffer
 	if err := runtimeresearch.WriteJSON(&researchJSON, report.Research); err != nil {
 		return err
@@ -90,7 +100,9 @@ func WriteJSON(writer io.Writer, report Report) error {
 		})
 	}
 	encoder := json.NewEncoder(writer)
-	encoder.SetIndent("", "  ")
+	if indent {
+		encoder.SetIndent("", "  ")
+	}
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(payload)
 }

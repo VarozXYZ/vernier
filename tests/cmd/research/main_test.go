@@ -71,9 +71,11 @@ func TestRunTextMatchesGolden(t *testing.T) {
 func TestRunExitCodes(t *testing.T) {
 	fixture := filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.yaml")
 	for name, args := range map[string][]string{
-		"missing fixture":    {"--fixture", filepath.Join(t.TempDir(), "missing.yaml")},
-		"bad format":         {"--fixture", fixture, "--format", "yaml"},
-		"bad observe format": {"observe-v3", "--format", "json"},
+		"missing fixture":                   {"--fixture", filepath.Join(t.TempDir(), "missing.yaml")},
+		"bad format":                        {"--fixture", fixture, "--format", "yaml"},
+		"bad observe format":                {"observe-v3", "--format", "json"},
+		"stream requires jsonl":             {"compare-live", "--stream", "--format", "json"},
+		"stream updates cannot be negative": {"compare-live", "--stream", "--updates", "-1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code, _, _ := runCLI(t, args...)
