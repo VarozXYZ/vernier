@@ -51,7 +51,7 @@ func TestPublicSetupMatchesVenueReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Research.Status != runtimeresearch.StatusHealthy || len(report.Research.Opportunities) != 2 || len(report.Parity) != 40 {
+	if report.Research.Status != runtimeresearch.StatusHealthy || len(report.Research.Opportunities) != 2 || len(report.Parity) != 20 {
 		t.Fatalf("unexpected VIRTUAL report summary: status=%s opportunities=%d parity=%d", report.Research.Status, len(report.Research.Opportunities), len(report.Parity))
 	}
 	for _, evidence := range report.Parity {

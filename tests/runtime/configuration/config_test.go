@@ -129,7 +129,8 @@ func TestPublicVirtualSetupResolves(t *testing.T) {
 	}
 	if config.ResearchID != "virtual_cross_chain" || config.SetupID != "virtual_wealth" ||
 		config.Chains["robinhood"].ChainID.String() != "4663" || config.Chains["base"].ChainID.String() != "8453" ||
-		config.Markets[0].Venue.Kind != "uniswap_v2" || config.Markets[1].Venue.Kind != "aerodrome_slipstream" ||
+		config.Markets[0].Venue.Kind != "uniswap_v2" || config.Markets[1].Venue.Kind != "aerodrome_volatile" ||
+		config.Markets[1].Venue.FeeBPS != 100 || !strings.EqualFold(config.Markets[1].Venue.Pool.Hex(), "0x21594b992f68495dd28d605834b58889d0a727c7") ||
 		config.SizingAsset != "quote" || config.MinimumSize.RatString() != "1/100" || config.MaximumSize.RatString() != "1" || config.SizeSamples != 5 {
 		t.Fatalf("unexpected public VIRTUAL setup: %+v", config)
 	}

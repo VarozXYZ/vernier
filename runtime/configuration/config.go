@@ -74,6 +74,7 @@ type VenueConfig struct {
 	FactoryAddress   string `yaml:"factory_address"`
 	ReferenceAddress string `yaml:"reference_address"`
 	FeeBPS           uint16 `yaml:"fee_bps"`
+	Stable           bool   `yaml:"stable"`
 	MaxTickWords     int    `yaml:"max_tick_words"`
 }
 
@@ -149,6 +150,7 @@ type ResolvedVenue struct {
 	Factory      common.Address
 	Reference    common.Address
 	FeeBPS       uint16
+	Stable       bool
 	MaxTickWords int
 }
 
@@ -381,7 +383,7 @@ func resolveToken(id string, config TokenConfig, chain string, assets map[market
 }
 
 func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
-	if config.Kind != "uniswap_v2" && config.Kind != "uniswap_v3" && config.Kind != "aerodrome_slipstream" {
+	if config.Kind != "uniswap_v2" && config.Kind != "uniswap_v3" && config.Kind != "aerodrome_slipstream" && config.Kind != "aerodrome_volatile" {
 		return ResolvedVenue{}, fmt.Errorf("venue %q has unsupported kind %q", id, config.Kind)
 	}
 	pool, err := address(config.PoolAddress)
@@ -399,8 +401,14 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 	if err != nil {
 		return ResolvedVenue{}, fmt.Errorf("venue %q reference: %w", id, err)
 	}
-	if config.Kind == "uniswap_v2" && (config.FeeBPS == 0 || config.FeeBPS >= 10_000) {
+	if (config.Kind == "uniswap_v2" || config.Kind == "aerodrome_volatile") && (config.FeeBPS == 0 || config.FeeBPS >= 10_000) {
 		return ResolvedVenue{}, fmt.Errorf("venue %q requires a valid fee", id)
+	}
+	if config.Kind != "aerodrome_volatile" && config.Stable {
+		return ResolvedVenue{}, fmt.Errorf("venue %q stable flag is only valid for Aerodrome volatile profiles", id)
+	}
+	if config.Kind == "aerodrome_volatile" && config.Stable {
+		return ResolvedVenue{}, fmt.Errorf("venue %q is volatile and cannot set stable: true", id)
 	}
 	if config.Kind == "uniswap_v3" || config.Kind == "aerodrome_slipstream" {
 		if config.MaxTickWords == 0 {
@@ -410,7 +418,7 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 			return ResolvedVenue{}, fmt.Errorf("venue %q has invalid tick coverage", id)
 		}
 	}
-	return ResolvedVenue{ID: id, Kind: config.Kind, Chain: config.Chain, Pool: pool, Factory: factory, Reference: reference, FeeBPS: config.FeeBPS, MaxTickWords: config.MaxTickWords}, nil
+	return ResolvedVenue{ID: id, Kind: config.Kind, Chain: config.Chain, Pool: pool, Factory: factory, Reference: reference, FeeBPS: config.FeeBPS, Stable: config.Stable, MaxTickWords: config.MaxTickWords}, nil
 }
 
 func validateProvider(config ProviderConfig, chains map[string]ChainConfig) error {

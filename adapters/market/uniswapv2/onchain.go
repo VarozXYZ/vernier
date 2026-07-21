@@ -37,6 +37,7 @@ type Config struct {
 	BaseToken  common.Address
 	QuoteToken common.Address
 	FeeBPS     uint16
+	SyncTopic  common.Hash
 }
 
 type PoolInfo struct {
@@ -49,6 +50,7 @@ type Adapter struct {
 	config Config
 	info   PoolInfo
 	loaded bool
+	topic  common.Hash
 }
 
 func NewAdapter(config Config) (*Adapter, error) {
@@ -63,13 +65,16 @@ func NewAdapter(config Config) (*Adapter, error) {
 	if config.FeeBPS >= 10_000 {
 		return nil, fmt.Errorf("uniswap V2 fee must be below 10000 basis points")
 	}
-	return &Adapter{config: config}, nil
+	if config.SyncTopic == (common.Hash{}) {
+		config.SyncTopic = pairABI.Events["Sync"].ID
+	}
+	return &Adapter{config: config, topic: config.SyncTopic}, nil
 }
 
 func (*Adapter) ID() string { return ID }
 
 func (a *Adapter) Filter() evm.LogFilter {
-	return evm.LogFilter{Address: a.config.Pool, Topics: []common.Hash{pairABI.Events["Sync"].ID}}
+	return evm.LogFilter{Address: a.config.Pool, Topics: []common.Hash{a.topic}}
 }
 
 func (a *Adapter) PoolInfo() (PoolInfo, bool) { return a.info, a.loaded }
@@ -131,7 +136,7 @@ func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockR
 		candidate := &ordered[index]
 		if candidate.Address != a.config.Pool || candidate.BlockHash != block.Hash ||
 			candidate.BlockNumber != block.Number || candidate.Removed || len(candidate.Topics) != 1 ||
-			candidate.Topics[0] != pairABI.Events["Sync"].ID {
+			candidate.Topics[0] != a.topic {
 			continue
 		}
 		latest = candidate
@@ -163,7 +168,7 @@ func (a *Adapter) DecodeLog(_ context.Context, _ evm.Network, block evm.BlockRef
 	}
 	if event.Address != a.config.Pool || event.BlockHash != block.Hash ||
 		event.BlockNumber != block.Number || event.Removed || len(event.Topics) != 1 ||
-		event.Topics[0] != pairABI.Events["Sync"].ID {
+		event.Topics[0] != a.topic {
 		return nil, fmt.Errorf("uniswap V2 log does not belong to pool and block")
 	}
 	values, err := pairABI.Events["Sync"].Inputs.NonIndexed().Unpack(event.Data)

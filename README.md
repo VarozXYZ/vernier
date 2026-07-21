@@ -101,7 +101,9 @@ not to either market adapter.
 Configuration is modular YAML: a manifest selects topology and policy files,
 while endpoint values and API keys remain in an ignored `.env` file. VIRTUAL
 across Robinhood Chain and Base is the deliberately public reference setup in
-[examples/setups/virtual](examples/setups/virtual/). Run it with local endpoint
+[examples/setups/virtual](examples/setups/virtual/). Its Base market uses the
+canonical Aerodrome volatile pool adapter; changing the pool, factory, router,
+fee, or adapter kind is a topology-only change. Run it with local endpoint
 variables:
 
 The sizing policy uses `asset: quote` by default, so the configured bounds are
