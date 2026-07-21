@@ -53,6 +53,23 @@ func TestTwoMarketEvaluatesBothDirectionsWithExactDecimals(t *testing.T) {
 	}
 }
 
+func TestTwoMarketCarriesStreamTriggerIntoOpportunities(t *testing.T) {
+	fixture := newStrategyFixture(t, "1", "0.5")
+	evaluation := fixture.evaluation(t, fixture.snapshots, fixture.now)
+	evaluation = evaluation.WithTrigger(arbitrage.TriggerMetadata{
+		Market: "market-a", Source: "chain/pool-logs",
+		Position:  market.SourcePosition{Kind: "block", Value: 42},
+		Reference: market.SourceReference{Kind: "block_hash", Value: "0xabc"}, At: fixture.now,
+	})
+	opportunities, err := fixture.strategy.Evaluate(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opportunities[0].HasTrigger || opportunities[0].Trigger.Market != "market-a" || opportunities[0].Trigger.Position.Value != 42 {
+		t.Fatalf("trigger was not carried into opportunity: %+v", opportunities[0])
+	}
+}
+
 func TestTwoMarketSeparatesEconomicClassifications(t *testing.T) {
 	tests := []struct {
 		name      string
