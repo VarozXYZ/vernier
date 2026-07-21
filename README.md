@@ -122,6 +122,21 @@ or an explicit disconnect health change:
 go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --stream --updates 1 --format jsonl
 ~~~
 
+Stream mode persists only economically meaningful opportunity windows. The
+default local store is `.vernier/opportunities.sqlite`; override it with
+`--opportunity-store` or pass an empty value to disable persistence. Events,
+snapshots, quote curves, and reconnect attempts are not stored. A window opens
+on `economic` or `policy_qualified`, records its best observed trade, and
+closes when profitability disappears. A confirmed WebSocket disconnect marks
+the active window failed; the reconnect bootstrap starts a new continuity.
+
+Inspect the persisted history without starting a network feed:
+
+~~~console
+go run ./cmd/research windows --store .vernier/opportunities.sqlite --format text
+go run ./cmd/research windows --store .vernier/opportunities.sqlite --status failed --format json
+~~~
+
 Diagnostics are written to stderr so they never alter the report on stdout.
 Their timestamp prefix is compact and local: `YYYY-MM-DD/HH:MM:SS/milliseconds`;
 the `time=` label, timezone suffix, and extra precision are intentionally

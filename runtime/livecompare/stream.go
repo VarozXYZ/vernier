@@ -10,8 +10,11 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/feed/evmlogs"
 	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
 	"github.com/VarozXYZ/vernier/core/marketstate"
+	coreresearch "github.com/VarozXYZ/vernier/core/research"
+	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/market"
 	feedport "github.com/VarozXYZ/vernier/ports/feed"
+	persistence "github.com/VarozXYZ/vernier/ports/persistence"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 )
 
@@ -19,8 +22,9 @@ import (
 // the number of evaluations to emit after both markets have a snapshot; zero
 // keeps the stream running until its context is canceled.
 type StreamOptions struct {
-	Updates  int
-	OnReport func(Report) error
+	Updates          int
+	OnReport         func(Report) error
+	OpportunityStore persistence.OpportunityStore
 }
 
 type streamMarket struct {
@@ -30,8 +34,10 @@ type streamMarket struct {
 }
 
 type streamSignal struct {
-	market    market.MarketID
-	triggered time.Time
+	market     market.MarketID
+	triggered  time.Time
+	trigger    arbitrage.TriggerMetadata
+	hasTrigger bool
 }
 
 // RunStream subscribes to every configured pool and evaluates the shared
@@ -96,10 +102,25 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 		return err
 	}
 	r.logger.Info("stream strategy ready", "strategy", strategy.ID())
+	var tracker *coreresearch.WindowTracker
+	if options.OpportunityStore != nil {
+		tracker, err = coreresearch.NewWindowTracker(options.OpportunityStore, r.clock)
+		if err != nil {
+			return err
+		}
+		if err := tracker.Start(ctx); err != nil {
+			return fmt.Errorf("initialize opportunity windows: %w", err)
+		}
+		r.logger.Info("opportunity window store ready")
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	signals := make(chan streamSignal)
-	feedErrors := make(chan error, len(markets))
+	type feedFailure struct {
+		market market.MarketID
+		err    error
+	}
+	feedErrors := make(chan feedFailure, len(markets))
 	var feedWG sync.WaitGroup
 	for _, state := range markets {
 		state := state
@@ -108,7 +129,7 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 			defer feedWG.Done()
 			err := state.feed.Run(runCtx, &streamSink{market: state.runtime.config.ID, mirror: state.mirror, signals: signals})
 			if err != nil && !errors.Is(err, context.Canceled) {
-				feedErrors <- err
+				feedErrors <- feedFailure{market: state.runtime.config.ID, err: err}
 			}
 		}()
 	}
@@ -122,9 +143,14 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case err := <-feedErrors:
-			r.logger.Error("stream feed failed", "error", err)
-			return err
+		case failure := <-feedErrors:
+			r.logger.Error("stream feed failed", "market", failure.market, "error", failure.err)
+			if tracker != nil {
+				if err := tracker.FailMarket(runCtx, failure.market, "feed_failed", r.clock().UTC()); err != nil {
+					return err
+				}
+			}
+			return failure.err
 		case signal := <-signals:
 			snapshots := make([]market.MarketSnapshot, 0, len(markets))
 			ready := true
@@ -148,12 +174,20 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 			research, evaluateErr := r.evaluate(
 				runCtx, strategy, snapshots, cost,
 				fmt.Sprintf("stream-evaluation/%s/%d", r.config.ResearchID, evaluations+1), signal.triggered,
+				triggerPointer(signal),
 			)
 			if evaluateErr != nil {
 				return evaluateErr
 			}
 			research.Evaluations = evaluations + 1
 			report := Report{Research: research, Cost: costEvidence}
+			if tracker != nil {
+				for _, opportunity := range research.Opportunities {
+					if err := tracker.Observe(runCtx, opportunity); err != nil {
+						return fmt.Errorf("persist opportunity window: %w", err)
+					}
+				}
+			}
 			if callbackErr := options.OnReport(report); callbackErr != nil {
 				return callbackErr
 			}
@@ -181,11 +215,21 @@ func (s *streamSink) Publish(ctx context.Context, event market.MarketEvent) erro
 		return nil
 	}
 	select {
-	case s.signals <- streamSignal{market: s.market, triggered: event.ReceivedAt.UTC()}:
+	case s.signals <- streamSignal{market: s.market, triggered: event.ReceivedAt.UTC(), trigger: arbitrage.TriggerMetadata{
+		Market: event.Market, Source: event.Source, Position: event.Position, Reference: event.Reference, At: event.ReceivedAt.UTC(),
+	}, hasTrigger: true}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func triggerPointer(signal streamSignal) *arbitrage.TriggerMetadata {
+	if !signal.hasTrigger {
+		return nil
+	}
+	trigger := signal.trigger
+	return &trigger
 }
 
 func (s *streamSink) SetHealth(ctx context.Context, update feedport.HealthUpdate) error {

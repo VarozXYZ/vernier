@@ -28,8 +28,14 @@ degradation explicitly.
 
 ## 3. Durable Research
 
-Persist runs and market history, reconstruct opportunity windows, compare
-settings, and make source health and data-quality incidents explicit.
+Persist only economically meaningful opportunity windows and their compact
+best-observation evidence. Keep market events, snapshots, quotes, and
+reconnect attempts ephemeral; a confirmed WebSocket disconnect fails the
+active window and a later bootstrap starts a new continuity.
+
+Status: minimal SQLite window persistence is implemented experimentally. Run
+`research windows` to inspect it. Full event history, replay, and recovery
+durability remain intentionally out of scope.
 
 ## 4. Generality
 
