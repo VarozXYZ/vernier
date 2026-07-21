@@ -77,10 +77,14 @@ type Report struct {
 type marketRuntime struct {
 	config   configuration.ResolvedMarket
 	snapshot market.MarketSnapshot
+	venue    evmlogs.Venue
+	reducer  marketstate.Reducer
 	source   quoteport.Source
-	exactIn  func(context.Context, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
-	exactOut func(context.Context, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
+	exactIn  referenceQuote
+	exactOut referenceQuote
 }
+
+type referenceQuote func(context.Context, evm.BlockReference, market.MarketSnapshot, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
 
 func New(config configuration.ParsedConfig, networks Networks, options Options) (*Runner, error) {
 	if options.Clock == nil {
@@ -106,24 +110,15 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
 	startedAt := r.clock().UTC()
-	blocks := make(map[string]evm.BlockReference, len(r.networks))
-	for id, network := range r.networks {
-		block, err := network.CurrentBlock(ctx)
-		if err != nil {
-			return Report{}, err
-		}
-		blocks[id] = block
+	blocks, err := r.currentBlocks(ctx)
+	if err != nil {
+		return Report{}, err
 	}
 	registry, setup, err := r.registry()
 	if err != nil {
 		return Report{}, err
 	}
-	minimum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MinimumSize)
 	maximum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MaximumSize)
-	grid, err := sizing.NewLinearRange(minimum, maximum, r.config.SizeSamples)
-	if err != nil {
-		return Report{}, err
-	}
 	runtimes := make([]marketRuntime, 0, len(r.config.Markets))
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
@@ -140,46 +135,103 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	threshold, err := market.NewAssetQuantity(r.config.Markets[0].Quote.Token.Asset, r.config.MinimumNet)
+	candidate, err := r.newStrategy(registry, setup, sources)
 	if err != nil {
 		return Report{}, err
 	}
-	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
-		ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
-		Sources: sources, Grid: grid, Threshold: threshold, Clock: r.clock,
-	})
+	researchReport, err := r.evaluate(ctx, candidate, snapshots, cost, "live-evaluation/"+r.config.ResearchID, startedAt)
 	if err != nil {
 		return Report{}, err
 	}
-	evaluation, err := arbitrage.NewEvaluation(
-		arbitrage.EvaluationID("live-evaluation/"+r.config.ResearchID), arbitrage.ResearchRunID(r.config.RunID), candidate.ID(),
-		r.config.Hash, snapshots, cost, startedAt, startedAt,
-	)
-	if err != nil {
-		return Report{}, err
-	}
-	opportunities, err := candidate.Evaluate(ctx, evaluation)
-	if err != nil {
-		return Report{}, err
-	}
-	report := Report{Research: runtimeresearch.Report{
-		RunID: arbitrage.ResearchRunID(r.config.RunID), ConfigHash: r.config.Hash,
-		Status: runtimeresearch.StatusHealthy, Evaluations: 1, Opportunities: opportunities,
-	}, Cost: costEvidence}
-	report.Parity, err = validateParity(ctx, opportunities, runtimes)
+	report := Report{Research: researchReport, Cost: costEvidence}
+	report.Parity, err = validateParity(ctx, researchReport.Opportunities, runtimes)
 	if err != nil {
 		return report, err
 	}
 	return report, nil
 }
 
+func (r *Runner) currentBlocks(ctx context.Context) (map[string]evm.BlockReference, error) {
+	blocks := make(map[string]evm.BlockReference, len(r.networks))
+	for id, network := range r.networks {
+		block, err := network.CurrentBlock(ctx)
+		if err != nil {
+			return nil, err
+		}
+		blocks[id] = block
+	}
+	return blocks, nil
+}
+
+func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.ArbitrageSetup, sources map[market.MarketID]quoteport.Source) (*strategy.TwoMarketCrossChainArbitrage, error) {
+	minimum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MinimumSize)
+	maximum, _ := market.NewAssetQuantity(r.config.Markets[0].Base.Token.Asset, r.config.MaximumSize)
+	grid, err := sizing.NewLinearRange(minimum, maximum, r.config.SizeSamples)
+	if err != nil {
+		return nil, err
+	}
+	threshold, err := market.NewAssetQuantity(r.config.Markets[0].Quote.Token.Asset, r.config.MinimumNet)
+	if err != nil {
+		return nil, err
+	}
+	return strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
+		Sources: sources, Grid: grid, Threshold: threshold, Clock: r.clock,
+	})
+}
+
+func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCrossChainArbitrage, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time) (runtimeresearch.Report, error) {
+	startedAt := r.clock().UTC()
+	evaluation, err := arbitrage.NewEvaluation(
+		arbitrage.EvaluationID(id), arbitrage.ResearchRunID(r.config.RunID), candidate.ID(),
+		r.config.Hash, snapshots, cost, triggeredAt, startedAt,
+	)
+	if err != nil {
+		return runtimeresearch.Report{}, err
+	}
+	opportunities, err := candidate.Evaluate(ctx, evaluation)
+	if err != nil {
+		return runtimeresearch.Report{}, err
+	}
+	status := runtimeresearch.StatusHealthy
+	for _, snapshot := range snapshots {
+		if snapshot.Metadata().Health != market.HealthHealthy {
+			status = runtimeresearch.StatusDegraded
+			break
+		}
+	}
+	return runtimeresearch.Report{
+		RunID: arbitrage.ResearchRunID(r.config.RunID), ConfigHash: r.config.Hash,
+		Status: status, Evaluations: 1, Opportunities: opportunities,
+	}, nil
+}
+
 func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.ResolvedMarket, registry *market.Registry, block evm.BlockReference, maximum market.AssetQuantity, now time.Time) (marketRuntime, error) {
+	candidate, err := r.composeMarket(configured, registry, maximum)
+	if err != nil {
+		return marketRuntime{}, err
+	}
+	data, err := candidate.venue.Bootstrap(ctx, r.networks[configured.Venue.Chain], block)
+	if err != nil {
+		return marketRuntime{}, err
+	}
+	snapshot, err := snapshotAt(
+		ctx, configured.ID, market.SourceID(configured.Venue.Chain+"/pool-logs"),
+		block, candidate.reducer, data, now,
+	)
+	if err != nil {
+		return marketRuntime{}, err
+	}
+	candidate.snapshot = snapshot
+	return candidate, nil
+}
+
+func (r *Runner) composeMarket(configured configuration.ResolvedMarket, registry *market.Registry, maximum market.AssetQuantity) (marketRuntime, error) {
 	network := r.networks[configured.Venue.Chain]
 	domainMarket, ok := registry.Market(configured.ID)
 	if !ok {
 		return marketRuntime{}, fmt.Errorf("registry is missing market %q", configured.ID)
 	}
-	sourceID := market.SourceID(configured.Venue.Chain + "/pool-logs")
 	addresses := map[market.TokenID]common.Address{
 		configured.Base.Token.ID:  configured.Base.Address,
 		configured.Quote.Token.ID: configured.Quote.Address,
@@ -193,14 +245,6 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		data, err := adapter.Bootstrap(ctx, network, block)
-		if err != nil {
-			return marketRuntime{}, err
-		}
-		snapshot, err := snapshotAt(ctx, configured.ID, sourceID, block, constantproduct.Reducer{}, data, now)
-		if err != nil {
-			return marketRuntime{}, err
-		}
 		local, err := constantproduct.NewQuoter(market.SourceID(configured.Venue.ID+"/local"), domainMarket)
 		if err != nil {
 			return marketRuntime{}, err
@@ -210,11 +254,11 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 			return marketRuntime{}, err
 		}
 		return marketRuntime{
-			config: configured, snapshot: snapshot, source: local,
-			exactIn: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+			config: configured, venue: adapter, reducer: constantproduct.Reducer{}, source: local,
+			exactIn: func(ctx context.Context, block evm.BlockReference, _ market.MarketSnapshot, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
 				return reference.QuoteExactInput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
 			},
-			exactOut: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+			exactOut: func(ctx context.Context, block evm.BlockReference, _ market.MarketSnapshot, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
 				return reference.QuoteExactOutput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
 			},
 		}, nil
@@ -230,20 +274,8 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		data, err := adapter.Bootstrap(ctx, network, block)
-		if err != nil {
-			return marketRuntime{}, err
-		}
-		snapshot, err := snapshotAt(ctx, configured.ID, sourceID, block, uniswapv3.Reducer{}, data, now)
-		if err != nil {
-			return marketRuntime{}, err
-		}
-		info, ok := adapter.PoolInfo()
-		if !ok {
-			return marketRuntime{}, fmt.Errorf("uniswap V3 pool metadata is unavailable")
-		}
 		token0, token1 := configured.Base.Token.ID, configured.Quote.Token.ID
-		if info.Token0 == configured.Quote.Address {
+		if !baseToQuoteZero {
 			token0, token1 = token1, token0
 		}
 		local, err := uniswapv3.NewQuoter(market.SourceID(configured.Venue.ID+"/local"), domainMarket, token0, token1)
@@ -254,7 +286,11 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		return marketRuntime{config: configured, snapshot: snapshot, source: local, exactIn: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+		return marketRuntime{config: configured, venue: adapter, reducer: uniswapv3.Reducer{}, source: local, exactIn: func(ctx context.Context, block evm.BlockReference, _ market.MarketSnapshot, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+			info, ok := adapter.PoolInfo()
+			if !ok {
+				return nil, fmt.Errorf("uniswap V3 pool metadata is unavailable")
+			}
 			return reference.QuoteExactInputSingle(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount, info.Fee)
 		}}, nil
 	case "aerodrome_slipstream":
@@ -270,20 +306,8 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		data, err := adapter.Bootstrap(ctx, network, block)
-		if err != nil {
-			return marketRuntime{}, err
-		}
-		snapshot, err := snapshotAt(ctx, configured.ID, sourceID, block, uniswapv3.Reducer{}, data, now)
-		if err != nil {
-			return marketRuntime{}, err
-		}
-		info, ok := adapter.PoolInfo()
-		if !ok {
-			return marketRuntime{}, fmt.Errorf("slipstream pool metadata is unavailable")
-		}
 		token0, token1 := configured.Base.Token.ID, configured.Quote.Token.ID
-		if info.Token0 == configured.Quote.Address {
+		if !baseToQuoteZero {
 			token0, token1 = token1, token0
 		}
 		local, err := uniswapv3.NewQuoter(market.SourceID(configured.Venue.ID+"/local"), domainMarket, token0, token1)
@@ -294,9 +318,12 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 		if err != nil {
 			return marketRuntime{}, err
 		}
-		tickSpacing := snapshot.Data().(uniswapv3.Snapshot).TickSpacing()
-		return marketRuntime{config: configured, snapshot: snapshot, source: local, exactIn: func(ctx context.Context, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
-			return reference.QuoteExactInputSingle(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount, tickSpacing)
+		return marketRuntime{config: configured, venue: adapter, reducer: uniswapv3.Reducer{}, source: local, exactIn: func(ctx context.Context, block evm.BlockReference, snapshot market.MarketSnapshot, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+			state, ok := snapshot.Data().(uniswapv3.Snapshot)
+			if !ok {
+				return nil, fmt.Errorf("slipstream snapshot is incompatible")
+			}
+			return reference.QuoteExactInputSingle(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount, state.TickSpacing())
 		}}, nil
 	default:
 		return marketRuntime{}, fmt.Errorf("unsupported venue kind %q", configured.Venue.Kind)
@@ -431,12 +458,14 @@ func validateParity(ctx context.Context, opportunities []arbitrage.Opportunity, 
 				if !ok {
 					return evidence, fmt.Errorf("unknown parity market %q", leg.quote.Market)
 				}
+				metadata := runtime.snapshot.Metadata()
+				block := evm.BlockReference{Number: metadata.EventPosition.Value, Hash: common.HexToHash(metadata.EventReference.Value)}
 				var referenceIn, referenceOut *big.Int
 				switch leg.quote.Mode {
 				case market.QuoteModeExactInput:
 					referenceIn = leg.quote.AmountIn.Units()
 					var err error
-					referenceOut, err = runtime.exactIn(ctx, leg.quote.AmountIn.Token(), leg.quote.AmountOut.Token(), referenceIn)
+					referenceOut, err = runtime.exactIn(ctx, block, runtime.snapshot, leg.quote.AmountIn.Token(), leg.quote.AmountOut.Token(), referenceIn)
 					if err != nil {
 						return evidence, err
 					}
@@ -446,7 +475,7 @@ func validateParity(ctx context.Context, opportunities []arbitrage.Opportunity, 
 					}
 					referenceOut = leg.quote.AmountOut.Units()
 					var err error
-					referenceIn, err = runtime.exactOut(ctx, leg.quote.AmountIn.Token(), leg.quote.AmountOut.Token(), referenceOut)
+					referenceIn, err = runtime.exactOut(ctx, block, runtime.snapshot, leg.quote.AmountIn.Token(), leg.quote.AmountOut.Token(), referenceOut)
 					if err != nil {
 						return evidence, err
 					}
