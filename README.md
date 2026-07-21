@@ -143,6 +143,12 @@ proven older by block evidence are ignored; a confirmed disconnect degrades
 the affected mirror, and reconnect performs a full bootstrap before healthy
 reports resume. Use `--updates 0` to run until canceled.
 
+The strategy also caches local quote results per market state, direction, and
+sizing amount. An event on one pool invalidates only that pool's quote curve;
+the unchanged market is reused and only the cross-market profitability is
+recomputed. The cache retains the latest state per market, and reused quotes
+are rebound to the current snapshot version for auditability.
+
 With `--calculations full`, the report contains configuration and snapshot
 hashes, exact quantities, cost evidence, the complete sizing curve, and parity
 results. The default summary never includes configured addresses or endpoint

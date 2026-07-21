@@ -32,6 +32,7 @@ type TwoMarketCrossChainArbitrage struct {
 	grid      sizing.Grid
 	threshold market.AssetQuantity
 	clock     Clock
+	cache     quoteCache
 }
 
 func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error) {
@@ -62,6 +63,7 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	return &TwoMarketCrossChainArbitrage{
 		id: config.ID, setup: config.Setup, registry: config.Registry, sources: sources,
 		grid: config.Grid, threshold: config.Threshold, clock: config.Clock,
+		cache: newQuoteCache(),
 	}, nil
 }
 
@@ -160,7 +162,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	}
 	actualSize, _ := targetBase.ToAssetQuantity(buyBase)
 	initialHigh, _ := market.NewTokenAmount(buyQuote.ID, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(buyQuote.Decimals)), nil))
-	buy, err := sizing.MinimumInputForOutput(ctx, s.sources[direction.BuyMarket], sizing.ExactOutputRequest{
+	buy, err := s.exactOutput(ctx, s.sources[direction.BuyMarket], sizing.ExactOutputRequest{
 		Snapshot: buySnapshot, TokenIn: buyQuote.ID, TokenOut: buyBase.ID,
 		TargetOut: targetBase, InitialHigh: initialHigh,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
@@ -179,7 +181,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	if err != nil || sellInput.IsZero() {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_input_rounds_to_zero")
 	}
-	sell, err := s.sources[direction.SellMarket].Quote(ctx, quoteport.Input{
+	sell, err := s.input(ctx, s.sources[direction.SellMarket], quoteport.Input{
 		Snapshot: sellSnapshot, TokenIn: sellBase.ID, TokenOut: sellQuote.ID, AmountIn: sellInput,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	})
@@ -199,6 +201,18 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 		Size: actualSize, Input: actualInput, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
 		BuyQuote: buy, SellQuote: sell,
 	}, nil
+}
+
+func (s *TwoMarketCrossChainArbitrage) exactOutput(ctx context.Context, source quoteport.Source, request sizing.ExactOutputRequest) (market.Quote, error) {
+	return s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactOutput, request.TokenIn, request.TokenOut, request.TargetOut, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
+		return sizing.MinimumInputForOutput(ctx, source, request)
+	})
+}
+
+func (s *TwoMarketCrossChainArbitrage) input(ctx context.Context, source quoteport.Source, request quoteport.Input) (market.Quote, error) {
+	return s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactInput, request.TokenIn, request.TokenOut, request.AmountIn, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
+		return source.Quote(ctx, request)
+	})
 }
 
 func hasUnmodeledFee(quote market.Quote) bool {
