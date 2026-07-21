@@ -3,6 +3,12 @@
 .env.*
 /config/local/
 
+# Local Research opportunity-window store
+.vernier/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
 # Go build and test artifacts
 /bin/
 *.test

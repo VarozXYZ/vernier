@@ -8,7 +8,20 @@ tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
 
-require github.com/ethereum/go-ethereum v1.17.4
+require (
+	github.com/ethereum/go-ethereum v1.17.4
+	modernc.org/sqlite v1.54.0
+)
+
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	modernc.org/libc v1.74.1 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.11.0 // indirect
+)
 
 require (
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c // indirect
