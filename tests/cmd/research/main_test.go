@@ -2,7 +2,6 @@ package research_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
@@ -52,7 +53,7 @@ func TestMain(m *testing.M) {
 
 func TestRunTextMatchesGolden(t *testing.T) {
 	code, stdout, stderr := runCLI(t,
-		"--fixture", filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.json"),
+		"--fixture", filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.yaml"),
 		"--format", "text",
 	)
 	if code != 0 {
@@ -68,9 +69,9 @@ func TestRunTextMatchesGolden(t *testing.T) {
 }
 
 func TestRunExitCodes(t *testing.T) {
-	fixture := filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.json")
+	fixture := filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.yaml")
 	for name, args := range map[string][]string{
-		"missing fixture":    {"--fixture", filepath.Join(t.TempDir(), "missing.json")},
+		"missing fixture":    {"--fixture", filepath.Join(t.TempDir(), "missing.yaml")},
 		"bad format":         {"--fixture", fixture, "--format", "yaml"},
 		"bad observe format": {"observe-v3", "--format", "json"},
 	} {
@@ -84,7 +85,7 @@ func TestRunExitCodes(t *testing.T) {
 }
 
 func TestRunReturnsSuccessForExplicitDegradation(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.json"))
+	data, err := os.ReadFile(filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,11 +98,11 @@ func TestRunReturnsSuccessForExplicitDegradation(t *testing.T) {
 		EvaluationStartedAt:  "2026-01-01T00:00:03.120Z",
 		EvaluationFinishedAt: "2026-01-01T00:00:03.130Z",
 	}
-	degraded, err := json.MarshalIndent(configured, "", "  ")
+	degraded, err := yaml.Marshal(configured)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := filepath.Join(t.TempDir(), "degraded.json")
+	fixture := filepath.Join(t.TempDir(), "degraded.yaml")
 	if err := os.WriteFile(fixture, degraded, 0o600); err != nil {
 		t.Fatal(err)
 	}

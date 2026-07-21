@@ -1,0 +1,106 @@
+schema_version: 1
+run_id: synthetic-two-market
+fixed_cost: "0.5"
+catalog:
+  chains:
+    - id: chain-alpha
+    - id: chain-beta
+  assets:
+    - {id: base, symbol: BASE}
+    - {id: quote, symbol: QUOTE}
+  tokens:
+    - {id: base-alpha, asset: base, chain: chain-alpha, decimals: 6, symbol: BASE-A}
+    - {id: quote-alpha, asset: quote, chain: chain-alpha, decimals: 6, symbol: QUOTE-A}
+    - {id: base-beta, asset: base, chain: chain-beta, decimals: 8, symbol: BASE-B}
+    - {id: quote-beta, asset: quote, chain: chain-beta, decimals: 6, symbol: QUOTE-B}
+  venues:
+    - id: synthetic-amm
+  pairs:
+    - {id: base-quote, base_asset: base, quote_asset: quote}
+  pools:
+    - id: pool-alpha
+      venue: synthetic-amm
+      chain: chain-alpha
+      tokens: [base-alpha, quote-alpha]
+      adapter: constant_product
+    - id: pool-beta
+      venue: synthetic-amm
+      chain: chain-beta
+      tokens: [base-beta, quote-beta]
+      adapter: uniswap_v3
+  paths:
+    - id: path-alpha
+      chain: chain-alpha
+      hops:
+        - {pool: pool-alpha, token_in: base-alpha, token_out: quote-alpha}
+    - id: path-beta
+      chain: chain-beta
+      hops:
+        - {pool: pool-beta, token_in: base-beta, token_out: quote-beta}
+  markets:
+    - id: market-alpha
+      pair: base-quote
+      chain: chain-alpha
+      path: path-alpha
+      base_token: base-alpha
+      quote_token: quote-alpha
+    - id: market-beta
+      pair: base-quote
+      chain: chain-beta
+      path: path-beta
+      base_token: base-beta
+      quote_token: quote-beta
+setup:
+  id: synthetic-setup
+  pair: base-quote
+  markets: [market-alpha, market-beta]
+strategies:
+  - {id: baseline, sizes: ["10", "20"], threshold: "1"}
+  - {id: conservative, sizes: ["10", "20"], threshold: "7"}
+feeds:
+  - market: market-alpha
+    source: fixture/alpha
+    events:
+      - block_number: 100
+        finality: finalized
+        source_time: "2026-01-01T00:00:00Z"
+        received_at: "2026-01-01T00:00:00.100Z"
+        applied_at: "2026-01-01T00:00:00.110Z"
+        evaluation_started_at: "2026-01-01T00:00:00.120Z"
+        evaluation_finished_at: "2026-01-01T00:00:00.130Z"
+        base_reserve: "1000000000"
+        quote_reserve: "1800000000"
+        fee_bps: 30
+  - market: market-beta
+    source: fixture/beta
+    events:
+      - block_number: 200
+        finality: finalized
+        source_time: "2026-01-01T00:00:01Z"
+        received_at: "2026-01-01T00:00:01.100Z"
+        applied_at: "2026-01-01T00:00:01.110Z"
+        evaluation_started_at: "2026-01-01T00:00:01.120Z"
+        evaluation_finished_at: "2026-01-01T00:00:01.130Z"
+        sqrt_price_x96: "11751457072291319085750132610"
+        tick: -38169
+        liquidity: "1000000000000"
+        fee_pips: 3000
+        tick_spacing: 60
+        initialized_ticks:
+          - {index: -60000, liquidity_gross: "1000000000000", liquidity_net: "1000000000000"}
+          - {index: 0, liquidity_gross: "1000000000000", liquidity_net: "-1000000000000"}
+      - block_number: 201
+        finality: finalized
+        source_time: "2026-01-01T00:00:02Z"
+        received_at: "2026-01-01T00:00:02.100Z"
+        applied_at: "2026-01-01T00:00:02.110Z"
+        evaluation_started_at: "2026-01-01T00:00:02.120Z"
+        evaluation_finished_at: "2026-01-01T00:00:02.130Z"
+        sqrt_price_x96: "10326193275265597883880897907"
+        tick: -40755
+        liquidity: "1000000000000"
+        fee_pips: 3000
+        tick_spacing: 60
+        initialized_ticks:
+          - {index: -60000, liquidity_gross: "1000000000000", liquidity_net: "1000000000000"}
+          - {index: 0, liquidity_gross: "1000000000000", liquidity_net: "-1000000000000"}

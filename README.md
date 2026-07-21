@@ -26,11 +26,12 @@ See [ROADMAP.md](ROADMAP.md) for the public delivery sequence.
 Run the versioned synthetic scenario without network access or external state:
 
 ```console
-go run ./cmd/research --fixture examples/synthetic/two-market.json --format text
+go run ./cmd/research --fixture examples/synthetic/two-market.yaml --format text
 ```
 
-Use `--format json` for the deterministic audit report. The fixture format is
-deliberately experimental and is not the future public configuration contract.
+Use `--format json` for the deterministic audit report. All maintained input
+files are YAML; JSON remains an output and external-protocol format. The fixture
+schema is deliberately experimental and is not the stable configuration contract.
 The report records its fixture hash, strategy and direction, exact quantities,
 snapshot versions and hashes, local quotes, costs, classifications, and times.
 
@@ -87,7 +88,7 @@ Canonical adapter reuse and network/fork boundaries are recorded in
 
 ## Experimental live cross-chain comparison
 
-The private `compare-live` composition reads two configured markets at explicit
+The `compare-live` composition reads two configured markets at explicit
 block hashes. It sizes in the base asset, models prepositioned inventory,
 converts a fixed external cost through CoinGecko with Chainlink fallback,
 evaluates both directions, and checks every local leg against the venue
@@ -95,19 +96,25 @@ reference quoter. Provider request pacing belongs to the EVM network layer,
 not to either market adapter.
 
 Configuration is modular YAML: a manifest selects topology and policy files,
-while endpoint values and API keys remain in an ignored `.env` file. The
-synthetic schema example under [examples/configuration](examples/configuration/)
-contains no working networks or operational addresses. Private files belong
-under ignored `config/local/`:
+while endpoint values and API keys remain in an ignored `.env` file. VIRTUAL
+across Robinhood Chain and Base is the deliberately public reference setup in
+[examples/setups/virtual](examples/setups/virtual/). Run it with local endpoint
+variables:
 
 ~~~console
-go run ./cmd/research compare-live --config config/local/vernier.yaml --env-file .env --format text
+go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --format text
 ~~~
 
 The report contains configuration and snapshot hashes, exact quantities, cost
 evidence, the complete sizing curve, and parity results. It never includes
 configured addresses or endpoint values. The command is read-only and has no
 signer or broadcast capability.
+
+Quote evidence states whether each leg is `exact_input` or `exact_output`.
+Uniswap V2 exact-output purchases are checked against router `getAmountsIn`;
+exact-input legs are checked against the corresponding venue output function.
+Results and classifications depend on the market snapshot and are not a claim
+that an opportunity exists.
 
 Compatible EVM networks share one implementation and differ through configured
 identity, chain ID, and endpoint profiles. Protocol or network-specific code is

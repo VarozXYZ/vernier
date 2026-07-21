@@ -19,6 +19,9 @@ snapshot lifecycle, health, provenance, and quote evidence are shared.
 - Quote fees are typed components and may use different tokens or represent a
   cost or credit. A strategy must reject a quote when a component is not
   already reflected in its amounts unless that strategy explicitly models it.
+- Every Quote records whether its fixed side is exact input or exact output.
+  Reference parity compares the corresponding variable side rather than
+  treating the two modes as interchangeable.
 - Runtime composition selects and wires feed, ordering, reducer, and quoter
   capabilities. Strategies depend only on canonical domain and port types.
 

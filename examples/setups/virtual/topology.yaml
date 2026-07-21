@@ -1,0 +1,79 @@
+schema_version: 1
+chains:
+  robinhood:
+    kind: evm
+    label: Robinhood Chain
+    chain_id: "4663"
+    rpc_url_env: VERNIER_ROBINHOOD_WS_URL
+    rpc_min_interval_ms: 100
+  base:
+    kind: evm
+    label: Base
+    chain_id: "8453"
+    rpc_url_env: VERNIER_BASE_WS_URL
+    rpc_min_interval_ms: 350
+assets:
+  virtual: {symbol: VIRTUAL}
+  weth: {symbol: WETH}
+  usd: {symbol: USD}
+tokens:
+  virtual_robinhood:
+    asset: virtual
+    chain: robinhood
+    address: "0xc6911796042b15d7fa4f6cde69e245ddcd3d9c31"
+    decimals: 18
+    symbol: VIRTUAL
+  weth_robinhood:
+    asset: weth
+    chain: robinhood
+    address: "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+    decimals: 18
+    symbol: WETH
+  virtual_base:
+    asset: virtual
+    chain: base
+    address: "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b"
+    decimals: 18
+    symbol: VIRTUAL
+  weth_base:
+    asset: weth
+    chain: base
+    address: "0x4200000000000000000000000000000000000006"
+    decimals: 18
+    symbol: WETH
+venues:
+  robinhood_uniswap_v2:
+    kind: uniswap_v2
+    chain: robinhood
+    pool_address: "0xd95e8e2cd04c207625c6f23c974d365a5f3a91d3"
+    factory_address: "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f"
+    reference_address: "0x89e5db8b5aa49aa85ac63f691524311aeb649eba"
+    fee_bps: 30
+  base_aerodrome_slipstream:
+    kind: aerodrome_slipstream
+    chain: base
+    pool_address: "0x3f0296bf652e19bca772ec3df08b32732f93014a"
+    factory_address: "0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a"
+    reference_address: "0x254cf9e1e6e233aa1ac962cb9b05b2cfeaae15b0"
+    max_tick_words: 64
+markets:
+  virtual_robinhood:
+    venue: robinhood_uniswap_v2
+    base_token: virtual_robinhood
+    quote_token: weth_robinhood
+  virtual_base:
+    venue: base_aerodrome_slipstream
+    base_token: virtual_base
+    quote_token: weth_base
+price_sources:
+  weth_usd:
+    base_asset: weth
+    quote_asset: usd
+    primary:
+      kind: coingecko
+      coin_id: weth
+      currency: usd
+    fallback:
+      kind: chainlink
+      chain: base
+      feed_address: "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70"

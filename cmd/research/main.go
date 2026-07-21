@@ -36,8 +36,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("research compare-live", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "config/local/vernier.yaml", "path to private YAML configuration manifest")
-	envPath := flags.String("env-file", ".env", "path to private environment file")
+	configPath := flags.String("config", "examples/setups/virtual/vernier.yaml", "path to YAML configuration manifest")
+	envPath := flags.String("env-file", ".env", "path to local environment file")
 	format := flags.String("format", "text", "output format: text or json")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -47,7 +47,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		return 2
 	}
 	if err := loadEnvFile(*envPath, os.LookupEnv, os.Setenv); err != nil {
-		fmt.Fprintln(stderr, "research compare-live: cannot load private environment")
+		fmt.Fprintln(stderr, "research compare-live: cannot load local environment")
 		return 2
 	}
 	config, err := configuration.LoadConfig(*configPath)
@@ -151,7 +151,7 @@ func loadEnvFile(path string, lookup func(string) (string, bool), set func(strin
 func runSynthetic(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("research", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	fixturePath := flags.String("fixture", "examples/synthetic/two-market.json", "path to the experimental fixture")
+	fixturePath := flags.String("fixture", "examples/synthetic/two-market.yaml", "path to the experimental YAML fixture")
 	format := flags.String("format", "text", "report format: text or json")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -200,7 +200,7 @@ func runSynthetic(ctx context.Context, args []string, stdout, stderr io.Writer) 
 func runObserveV3(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("research observe-v3", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "config/local/vernier.yaml", "path to private YAML configuration manifest")
+	configPath := flags.String("config", "config/local/vernier.yaml", "path to YAML configuration manifest")
 	marketID := flags.String("market", "", "configured canonical Uniswap V3 market ID")
 	format := flags.String("format", "text", "output format: text or jsonl")
 	updates := flags.Int("updates", 0, "active pool blocks to observe; zero runs until canceled")
