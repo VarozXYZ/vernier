@@ -80,8 +80,8 @@ type HealthRecord struct {
 }
 
 func New(config ParsedConfig, network evm.Network, options Options) (*Observer, error) {
-	if network == nil || network.ID() != NetworkAdapterID {
-		return nil, fmt.Errorf("observe-v3 requires the canonical Ethereum network adapter")
+	if network == nil || network.ID() != config.Network.ID {
+		return nil, fmt.Errorf("observe-v3 requires configured network %q", config.Network.ID)
 	}
 	if options.Output == nil {
 		return nil, fmt.Errorf("observe-v3 output is required")
@@ -109,14 +109,14 @@ func New(config ParsedConfig, network evm.Network, options Options) (*Observer, 
 		return nil, err
 	}
 	mirror, err := marketstate.NewMirror(
-		market.MarketID(config.MarketID), market.SourceID("ethereum/logs"),
+		market.MarketID(config.MarketID), market.SourceID(config.Network.ID+"/logs"),
 		uniswapv3.Reducer{}, sourceorder.NewMonotonic(evmlogs.BlockPositionKind, false), options.Clock,
 	)
 	if err != nil {
 		return nil, err
 	}
 	feed, err := evmlogs.New(evmlogs.Config{
-		Market: market.MarketID(config.MarketID), Source: market.SourceID("ethereum/logs"),
+		Market: market.MarketID(config.MarketID), Source: market.SourceID(config.Network.ID + "/logs"),
 		Network: network, Venue: venue, Clock: options.Clock,
 	})
 	if err != nil {

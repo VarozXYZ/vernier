@@ -56,39 +56,20 @@ part of Research.
 The adapter boundary is recorded in
 [ADR 0001](decisions/0001-market-adapter-boundaries.md).
 
-## Experimental Ethereum observation
+## Experimental Uniswap V3 observation
 
-The read-only observer uses the canonical Ethereum and Uniswap V3 adapters. Its
-WebSocket subscription is restricted to one pool address and the Initialize,
-Swap, Mint, and Burn topics. It does not subscribe to new heads, poll inactive
-blocks, infer gaps from non-contiguous event blocks, sign, or broadcast.
+The read-only observer selects a canonical `uniswap_v3` market from the same
+modular YAML used by cross-chain Research. Its WebSocket subscription is
+restricted to one pool address and the Initialize, Swap, Mint, and Burn topics.
+It does not subscribe to new heads, poll inactive blocks, infer gaps from
+non-contiguous event blocks, sign, or broadcast.
 
-Create a private ignored file under config/local/:
-
-~~~json
-{
-  "schema_version": 1,
-  "network_adapter": "ethereum",
-  "venue_adapter": "uniswap-v3",
-  "market_id": "local-market",
-  "pool_address": "0x...",
-  "quoter_v2_address": "0x...",
-  "http_url_env": "VERNIER_ETHEREUM_HTTP_URL",
-  "ws_url_env": "VERNIER_ETHEREUM_WS_URL",
-  "token0_id": "token-0",
-  "token1_id": "token-1",
-  "quote_inputs": [
-    {"token_in": "token-0", "amount": "1000000"},
-    {"token_in": "token-1", "amount": "1000000"}
-  ],
-  "max_tick_words": 64
-}
-~~~
-
-Set the named environment variables locally, then run:
+Configure the chain, tokens, venue, and market in the private topology file;
+the maximum sizing bound supplies the base-token coverage probe. Set the named
+endpoint environment variable locally, then run:
 
 ~~~console
-go run ./cmd/research observe-v3 --config config/local/pool.local.json --format jsonl --updates 1
+go run ./cmd/research observe-v3 --config config/local/vernier.yaml --market market_id --format jsonl --updates 1
 ~~~
 
 The value updates=1 emits the bootstrap snapshot and waits for one block

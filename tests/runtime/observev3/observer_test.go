@@ -76,10 +76,7 @@ func (*liveNetwork) CodeAt(context.Context, evm.BlockReference, common.Address) 
 func (*liveNetwork) Close() {}
 
 func TestObserverEmitsRedactedParityRecordsAndStopsAfterUpdate(t *testing.T) {
-	config, err := observev3.ParseConfig([]byte(validConfig))
-	if err != nil {
-		t.Fatal(err)
-	}
+	config := observerConfig(t)
 	token0 := common.HexToAddress("0x3000000000000000000000000000000000000003")
 	token1 := common.HexToAddress("0x4000000000000000000000000000000000000004")
 	activeHash := common.HexToHash("0x11")

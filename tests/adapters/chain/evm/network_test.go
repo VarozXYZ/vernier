@@ -1,4 +1,4 @@
-package ethereum_test
+package evm_test
 
 import (
 	"context"
@@ -9,7 +9,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
-	"github.com/VarozXYZ/vernier/adapters/chain/ethereum"
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
 )
 
@@ -20,15 +19,12 @@ func (*subscription) Unsubscribe()        {}
 
 type client struct {
 	chainID *big.Int
-	header  *types.Header
 	query   geth.FilterQuery
 	closed  bool
 }
 
-func (c *client) ChainID(context.Context) (*big.Int, error) { return new(big.Int).Set(c.chainID), nil }
-func (c *client) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
-	return c.header, nil
-}
+func (c *client) ChainID(context.Context) (*big.Int, error)                     { return new(big.Int).Set(c.chainID), nil }
+func (*client) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) { return nil, nil }
 func (c *client) SubscribeFilterLogs(_ context.Context, query geth.FilterQuery, _ chan<- types.Log) (geth.Subscription, error) {
 	c.query = query
 	return &subscription{errors: make(chan error)}, nil
@@ -45,47 +41,39 @@ func (*client) CodeAtHash(context.Context, common.Address, common.Hash) ([]byte,
 }
 func (c *client) Close() { c.closed = true }
 
-func TestAdapterValidatesEthereumAndUsesNarrowLogQueries(t *testing.T) {
-	httpClient := &client{chainID: big.NewInt(1), header: &types.Header{Number: big.NewInt(42)}}
-	wsClient := &client{chainID: big.NewInt(1)}
-	adapter, err := ethereum.New(httpClient, wsClient)
+func TestConfiguredNetworkValidatesIdentityAndUsesNarrowLogQueries(t *testing.T) {
+	httpClient := &client{chainID: big.NewInt(8453)}
+	wsClient := &client{chainID: big.NewInt(8453)}
+	network, err := evm.NewReadOnlyNetwork("configured", "Configured Chain", big.NewInt(8453), httpClient, wsClient)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := adapter.Validate(context.Background()); err != nil {
+	if err := network.Validate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	address := common.HexToAddress("0x1000000000000000000000000000000000000001")
-	topics := []common.Hash{common.HexToHash("0x01"), common.HexToHash("0x02")}
-	filter := evm.LogFilter{Address: address, Topics: topics}
-	subscription, err := adapter.SubscribeLogs(context.Background(), filter, make(chan types.Log))
+	filter := evm.LogFilter{Address: address, Topics: []common.Hash{common.HexToHash("0x01"), common.HexToHash("0x02")}}
+	subscription, err := network.SubscribeLogs(context.Background(), filter, make(chan types.Log))
 	if err != nil {
 		t.Fatal(err)
 	}
 	subscription.Unsubscribe()
-	if len(wsClient.query.Addresses) != 1 || wsClient.query.Addresses[0] != address ||
-		len(wsClient.query.Topics) != 1 || len(wsClient.query.Topics[0]) != 2 || wsClient.query.BlockHash != nil {
+	if len(wsClient.query.Addresses) != 1 || wsClient.query.Addresses[0] != address || len(wsClient.query.Topics[0]) != 2 {
 		t.Fatalf("unexpected subscription query: %+v", wsClient.query)
 	}
 	block := evm.BlockReference{Number: 42, Hash: common.HexToHash("0x42")}
-	if _, err := adapter.LogsAt(context.Background(), block, filter); err != nil {
+	if _, err := network.LogsAt(context.Background(), block, filter); err != nil {
 		t.Fatal(err)
 	}
 	if httpClient.query.BlockHash == nil || *httpClient.query.BlockHash != block.Hash {
 		t.Fatalf("log query did not use exact block hash: %+v", httpClient.query)
 	}
-	adapter.Close()
+	wsClient.chainID = big.NewInt(1)
+	if err := network.Validate(context.Background()); err == nil {
+		t.Fatal("wrong configured chain ID was accepted")
+	}
+	network.Close()
 	if !httpClient.closed || !wsClient.closed {
-		t.Fatal("adapter did not close both clients")
-	}
-}
-
-func TestAdapterRejectsNonEthereumEndpoint(t *testing.T) {
-	adapter, err := ethereum.New(&client{chainID: big.NewInt(1)}, &client{chainID: big.NewInt(8453)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := adapter.Validate(context.Background()); err == nil {
-		t.Fatal("expected chain ID mismatch")
+		t.Fatal("network did not close both clients")
 	}
 }
