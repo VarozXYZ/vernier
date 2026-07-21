@@ -15,6 +15,7 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
+	"github.com/VarozXYZ/vernier/runtime/observability"
 	"github.com/VarozXYZ/vernier/runtime/observev3"
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
@@ -41,6 +42,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 	format := flags.String("format", "text", "output format: text or json (jsonl in stream mode)")
 	stream := flags.Bool("stream", false, "continuously evaluate both pools from WebSocket log feeds")
 	updates := flags.Int("updates", 0, "reports to emit in stream mode; zero runs until canceled")
+	logLevel := flags.String("log-level", "info", "diagnostic log level: debug, info, warn, or error")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -49,6 +51,12 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "research compare-live: invalid arguments")
 		return 2
 	}
+	logger, err := observability.NewLogger(stderr, *logLevel)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
+		return 2
+	}
+	logger.Info("loading live configuration", "path", *configPath, "mode", map[bool]string{true: "stream", false: "point_in_time"}[*stream])
 	if err := loadEnvFile(*envPath, os.LookupEnv, os.Setenv); err != nil {
 		fmt.Fprintln(stderr, "research compare-live: cannot load local environment")
 		return 2
@@ -58,6 +66,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
 		return 2
 	}
+	logger.Info("configuration loaded", "chains", len(config.Chains), "markets", len(config.Markets), "config_hash", config.Hash)
 	endpoints, err := config.ResolveEndpoints(os.LookupEnv)
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
@@ -65,6 +74,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	networks := make(livecompare.Networks, len(config.Chains))
 	for id, profile := range config.Chains {
+		logger.Info("dialing network", "chain", id, "label", profile.Label)
 		network, dialErr := evm.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, profile.ChainID, endpoints[id], endpoints[id])
 		if dialErr != nil {
 			for _, opened := range networks {
@@ -76,6 +86,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 			return 1
 		}
 		networks[id] = network
+		logger.Info("network ready", "chain", id)
 	}
 	defer func() {
 		for _, network := range networks {
@@ -84,7 +95,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 			}
 		}
 	}()
-	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv})
+	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger})
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: invalid composition: %v\n", err)
 		return 2
