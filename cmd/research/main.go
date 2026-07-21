@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
+	"github.com/VarozXYZ/vernier/runtime/configuration"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
 	"github.com/VarozXYZ/vernier/runtime/observev3"
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
@@ -49,7 +50,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "research compare-live: cannot load private environment")
 		return 2
 	}
-	config, err := livecompare.LoadConfig(*configPath)
+	config, err := configuration.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
 		return 2
@@ -210,7 +211,7 @@ func runObserveV3(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintln(stderr, "research observe-v3: invalid arguments")
 		return 2
 	}
-	bundle, err := livecompare.LoadConfig(*configPath)
+	bundle, err := configuration.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "research observe-v3: %v\n", err)
 		return 2

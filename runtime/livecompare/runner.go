@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net/http"
 	"strings"
 	"time"
 
@@ -29,6 +28,7 @@ import (
 	"github.com/VarozXYZ/vernier/domain/market"
 	priceport "github.com/VarozXYZ/vernier/ports/price"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
+	"github.com/VarozXYZ/vernier/runtime/configuration"
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
 
@@ -38,15 +38,15 @@ type Networks map[string]evm.Network
 
 type Options struct {
 	Clock       func() time.Time
-	LookupEnv   LookupEnv
+	LookupEnv   configuration.LookupEnv
 	PriceClient coingecko.Client
 }
 
 type Runner struct {
-	config   ParsedConfig
+	config   configuration.ParsedConfig
 	networks Networks
 	clock    func() time.Time
-	lookup   LookupEnv
+	lookup   configuration.LookupEnv
 	client   coingecko.Client
 }
 
@@ -73,21 +73,18 @@ type Report struct {
 }
 
 type marketRuntime struct {
-	config    ResolvedMarket
+	config    configuration.ResolvedMarket
 	snapshot  market.MarketSnapshot
 	source    quoteport.Source
 	reference func(context.Context, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
 }
 
-func New(config ParsedConfig, networks Networks, options Options) (*Runner, error) {
+func New(config configuration.ParsedConfig, networks Networks, options Options) (*Runner, error) {
 	if options.Clock == nil {
 		options.Clock = time.Now
 	}
 	if options.LookupEnv == nil {
 		options.LookupEnv = func(string) (string, bool) { return "", false }
-	}
-	if options.PriceClient == nil {
-		options.PriceClient = http.DefaultClient
 	}
 	limited := make(Networks, len(config.Chains))
 	for id, profile := range config.Chains {
@@ -173,7 +170,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	return report, nil
 }
 
-func (r *Runner) bootstrapMarket(ctx context.Context, configured ResolvedMarket, registry *market.Registry, block evm.BlockReference, maximum market.AssetQuantity, now time.Time) (marketRuntime, error) {
+func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.ResolvedMarket, registry *market.Registry, block evm.BlockReference, maximum market.AssetQuantity, now time.Time) (marketRuntime, error) {
 	network := r.networks[configured.Venue.Chain]
 	domainMarket, ok := registry.Market(configured.ID)
 	if !ok {
@@ -234,7 +231,7 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured ResolvedMarket,
 		}
 		info, ok := adapter.PoolInfo()
 		if !ok {
-			return marketRuntime{}, fmt.Errorf("Uniswap V3 pool metadata is unavailable")
+			return marketRuntime{}, fmt.Errorf("uniswap V3 pool metadata is unavailable")
 		}
 		token0, token1 := configured.Base.Token.ID, configured.Quote.Token.ID
 		if info.Token0 == configured.Quote.Address {
@@ -274,7 +271,7 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured ResolvedMarket,
 		}
 		info, ok := adapter.PoolInfo()
 		if !ok {
-			return marketRuntime{}, fmt.Errorf("Slipstream pool metadata is unavailable")
+			return marketRuntime{}, fmt.Errorf("slipstream pool metadata is unavailable")
 		}
 		token0, token1 := configured.Base.Token.ID, configured.Quote.Token.ID
 		if info.Token0 == configured.Quote.Address {
@@ -297,7 +294,7 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured ResolvedMarket,
 	}
 }
 
-func v3Inputs(configured ResolvedMarket, maximum market.AssetQuantity) (*big.Int, *big.Int, bool, error) {
+func v3Inputs(configured configuration.ResolvedMarket, maximum market.AssetQuantity) (*big.Int, *big.Int, bool, error) {
 	maxBase, err := maximum.ToTokenAmount(configured.Base.Token)
 	if err != nil {
 		return nil, nil, false, err
