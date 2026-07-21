@@ -74,7 +74,7 @@ func TestLoadConfigResolvesModularYAMLExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.FixedCost.RatString() != "1/2" || config.MinimumSize.RatString() != "100" ||
+	if config.FixedCost.RatString() != "1/2" || config.SizingAsset != "quote" || config.MinimumSize.RatString() != "100" ||
 		config.MaximumSize.RatString() != "5000" || config.SizeSamples != 10 || len(config.Hash) != 64 ||
 		len(config.Chains) != 2 || config.Markets[0].Venue.Kind != "uniswap_v2" {
 		t.Fatalf("unexpected parsed configuration: %+v", config)
@@ -96,6 +96,13 @@ func TestLoadConfigRejectsUnknownFieldsAndBrokenReferences(t *testing.T) {
 				t.Fatal("invalid configuration was accepted")
 			}
 		})
+	}
+}
+
+func TestLoadConfigRejectsUnsupportedSizingAsset(t *testing.T) {
+	policy := strings.Replace(policyYAML, "sizing: {kind: linear_range, min: \"100\", max: \"5000\", samples: 10}", "sizing: {kind: linear_range, asset: notional, min: \"100\", max: \"5000\", samples: 10}", 1)
+	if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, policy)); err == nil {
+		t.Fatal("unsupported sizing asset was accepted")
 	}
 }
 
@@ -123,7 +130,7 @@ func TestPublicVirtualSetupResolves(t *testing.T) {
 	if config.ResearchID != "virtual_cross_chain" || config.SetupID != "virtual_wealth" ||
 		config.Chains["robinhood"].ChainID.String() != "4663" || config.Chains["base"].ChainID.String() != "8453" ||
 		config.Markets[0].Venue.Kind != "uniswap_v2" || config.Markets[1].Venue.Kind != "aerodrome_slipstream" ||
-		config.MinimumSize.RatString() != "100" || config.MaximumSize.RatString() != "5000" || config.SizeSamples != 10 {
+		config.SizingAsset != "quote" || config.MinimumSize.RatString() != "1/100" || config.MaximumSize.RatString() != "1" || config.SizeSamples != 5 {
 		t.Fatalf("unexpected public VIRTUAL setup: %+v", config)
 	}
 }

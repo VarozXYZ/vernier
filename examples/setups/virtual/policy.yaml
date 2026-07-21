@@ -8,6 +8,6 @@ research:
     setup: virtual_wealth
     inventory_mode: prepositioned
     price_source: weth_usd
-    fixed_cost: {asset: usd, amount: "0.5"}
+    fixed_cost: {asset: usd, amount: "0"}
     min_net_profit: "0"
-    sizing: {kind: linear_range, min: "100", max: "5000", samples: 10}
+    sizing: {kind: linear_range, asset: quote, min: "0.01", max: "1", samples: 5}

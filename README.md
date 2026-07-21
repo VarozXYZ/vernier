@@ -66,7 +66,7 @@ It does not subscribe to new heads, poll inactive blocks, infer gaps from
 non-contiguous event blocks, sign, or broadcast.
 
 Configure the chain, tokens, venue, and market in the private topology file;
-the maximum sizing bound supplies the base-token coverage probe. Set the named
+the maximum sizing bound supplies the coverage probes. Set the named
 endpoint environment variable locally, then run:
 
 ~~~console
@@ -92,7 +92,7 @@ Canonical adapter reuse and network/fork boundaries are recorded in
 ## Experimental live cross-chain comparison
 
 The `compare-live` composition reads two configured markets at explicit
-block hashes. It sizes in the base asset, models prepositioned inventory,
+block hashes. It sizes in the quote asset by default, models prepositioned inventory,
 converts a fixed external cost through CoinGecko with Chainlink fallback,
 evaluates both directions, and checks every local leg against the venue
 reference quoter. Provider request pacing belongs to the EVM network layer,
@@ -103,6 +103,9 @@ while endpoint values and API keys remain in an ignored `.env` file. VIRTUAL
 across Robinhood Chain and Base is the deliberately public reference setup in
 [examples/setups/virtual](examples/setups/virtual/). Run it with local endpoint
 variables:
+
+The sizing policy uses `asset: quote` by default, so the configured bounds are
+WETH budgets for this VIRTUAL/WETH setup rather than VIRTUAL or ETH quantities.
 
 ~~~console
 go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --format text
