@@ -13,9 +13,16 @@ type EventSink interface {
 	Publish(context.Context, market.MarketEvent) error
 }
 
+// Sink receives market events and explicit feed-liveness changes. Ordering and
+// health remain independent signals.
+type Sink interface {
+	EventSink
+	SetHealth(context.Context, HealthUpdate) error
+}
+
 type Feed interface {
 	MarketID() market.MarketID
-	Run(context.Context, EventSink) error
+	Run(context.Context, Sink) error
 }
 
 type Mirror interface {

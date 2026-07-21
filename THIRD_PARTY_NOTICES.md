@@ -29,3 +29,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## go-ethereum
+
+Vernier uses the go-ethereum client libraries for Ethereum JSON-RPC, WebSocket,
+log, ABI, and EVM data types.
+
+Source: <https://github.com/ethereum/go-ethereum>
+
+The go-ethereum libraries are licensed under the GNU Lesser General Public
+License version 3. See
+[licenses/go-ethereum-LGPL-3.0.txt](licenses/go-ethereum-LGPL-3.0.txt).

@@ -291,6 +291,10 @@ func (s *runtimeSink) Publish(ctx context.Context, event market.MarketEvent) err
 	}
 }
 
+func (s *runtimeSink) SetHealth(ctx context.Context, update feedport.HealthUpdate) error {
+	return s.mirror.SetHealth(ctx, update)
+}
+
 func (r *Runner) evaluate(ctx context.Context, triggeredAt time.Time, timing eventTiming) error {
 	snapshots := make([]market.MarketSnapshot, 0, len(r.setup.Markets()))
 	for _, marketID := range r.setup.Markets() {

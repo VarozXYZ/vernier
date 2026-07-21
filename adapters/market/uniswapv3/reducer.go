@@ -22,7 +22,7 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 		next = Snapshot{
 			schemaVersion: snapshotSchemaVersion, sqrtPriceX96: cloneInt(update.sqrtPriceX96), tick: update.tick,
 			liquidity: cloneInt(update.liquidity), feePips: update.feePips,
-			tickSpacing: update.tickSpacing, ticks: cloneTicks(update.ticks),
+			tickSpacing: update.tickSpacing, ticks: cloneTicks(update.ticks), coverage: update.coverage,
 		}
 	case SwapUpdate:
 		current, err := requireSnapshot(previous)
@@ -42,6 +42,26 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 		if err != nil {
 			return nil, [sha256.Size]byte{}, err
 		}
+	case InitializeUpdate:
+		current, err := requireSnapshot(previous)
+		if err != nil {
+			return nil, [sha256.Size]byte{}, err
+		}
+		next = current
+		next.sqrtPriceX96 = cloneInt(update.sqrtPriceX96)
+		next.tick = update.tick
+		next.liquidity = new(big.Int)
+	case BlockUpdate:
+		current := previous
+		var hash [sha256.Size]byte
+		var reduceErr error
+		for _, item := range update.updates {
+			current, hash, reduceErr = (Reducer{}).Reduce(ctx, current, item)
+			if reduceErr != nil {
+				return nil, [sha256.Size]byte{}, reduceErr
+			}
+		}
+		return current, hash, nil
 	default:
 		return nil, [sha256.Size]byte{}, fmt.Errorf("unsupported Uniswap V3 event payload %T", event)
 	}
@@ -60,6 +80,7 @@ func requireSnapshot(previous market.SnapshotData) (Snapshot, error) {
 		schemaVersion: state.schemaVersion, sqrtPriceX96: state.SqrtPriceX96(), tick: state.tick,
 		liquidity: state.Liquidity(), feePips: state.feePips,
 		tickSpacing: state.tickSpacing, ticks: state.Ticks(),
+		coverage: state.coverage,
 	}, nil
 }
 
@@ -125,7 +146,7 @@ func updateBoundary(ticks map[int32]Tick, index int32, grossDelta, netDelta *big
 
 func hashState(state Snapshot) [sha256.Size]byte {
 	var canonical strings.Builder
-	fmt.Fprintf(&canonical, "%d|%s|%d|%s|%d|%d", state.schemaVersion, state.sqrtPriceX96, state.tick, state.liquidity, state.feePips, state.tickSpacing)
+	fmt.Fprintf(&canonical, "%d|%s|%d|%s|%d|%d|%t|%d|%d", state.schemaVersion, state.sqrtPriceX96, state.tick, state.liquidity, state.feePips, state.tickSpacing, state.coverage.full, state.coverage.minWord, state.coverage.maxWord)
 	for _, initialized := range state.ticks {
 		fmt.Fprintf(&canonical, "|%d:%s:%s", initialized.index, initialized.liquidityGross, initialized.liquidityNet)
 	}

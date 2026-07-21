@@ -49,7 +49,7 @@ func TestMirrorOwnsLifecycleButNotProtocolState(t *testing.T) {
 	for index, value := range []int{2, 3} {
 		event, err := market.NewMarketEvent(market.MarketEvent{
 			Market: "market", Source: "source", ReceivedAt: now.Add(time.Duration(index) * time.Second),
-			Data: opaqueEvent{value: value},
+			Reference: market.SourceReference{Kind: "test", Value: fmt.Sprint(index)}, Data: opaqueEvent{value: value},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -60,6 +60,9 @@ func TestMirrorOwnsLifecycleButNotProtocolState(t *testing.T) {
 		}
 		if result.Snapshot.Metadata().Version != uint64(index+1) {
 			t.Fatalf("version = %d", result.Snapshot.Metadata().Version)
+		}
+		if result.Snapshot.Metadata().EventReference != event.Reference {
+			t.Fatal("snapshot did not preserve source reference")
 		}
 	}
 	current, _ := mirror.Current()
