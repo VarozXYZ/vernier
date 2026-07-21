@@ -13,9 +13,8 @@ explain every evaluated opportunity from immutable market snapshots.
 - Architecture baseline: complete.
 - Deterministic Research kernel: available with constant-product and
   concentrated-liquidity local market adapters.
-- Read-only market observation: experimental, with explicit Ethereum, Base,
-  and Robinhood Chain adapters, pool-filtered logs, and exact on-chain parity
-  checks.
+- Read-only market observation: experimental, with configured EVM profiles,
+  pool-filtered logs, and exact on-chain parity checks.
 - Point-in-time cross-chain comparison: experimental for canonical Uniswap V2
   and the Aerodrome Slipstream V3 variant.
 - Live execution: not implemented.
@@ -107,25 +106,32 @@ Canonical adapter reuse and network/fork boundaries are recorded in
 
 ## Experimental live cross-chain comparison
 
-The private `compare-live` composition reads one canonical Uniswap V2 market
-and one Aerodrome Slipstream market at explicit block hashes. It sizes in the
-base asset, models prepositioned inventory, converts a fixed USD cost through
-an on-chain Chainlink observation, evaluates both directions, and checks every
-local leg against the venue reference quoter. Provider request pacing belongs
-to the EVM network layer, not to either market adapter.
+The private `compare-live` composition reads two configured markets at explicit
+block hashes. It sizes in the base asset, models prepositioned inventory,
+converts a fixed external cost through CoinGecko with Chainlink fallback,
+evaluates both directions, and checks every local leg against the venue
+reference quoter. Provider request pacing belongs to the EVM network layer,
+not to either market adapter.
 
-Operational addresses and endpoint variable names belong in an ignored JSON
-file under `config/local/`; endpoint values may be loaded from an ignored
-`.env` file:
+Configuration is modular YAML: a manifest selects topology and policy files,
+while endpoint values and API keys remain in an ignored `.env` file. The
+synthetic schema example under [examples/configuration](examples/configuration/)
+contains no working networks or operational addresses. Private files belong
+under ignored `config/local/`:
 
 ~~~console
-go run ./cmd/research compare-live --config config/local/live-compare.local.json --env-file .env --format text
+go run ./cmd/research compare-live --config config/local/vernier.yaml --env-file .env --format text
 ~~~
 
 The report contains configuration and snapshot hashes, exact quantities, cost
 evidence, the complete sizing curve, and parity results. It never includes
 configured addresses or endpoint values. The command is read-only and has no
 signer or broadcast capability.
+
+Compatible EVM networks share one implementation and differ through configured
+identity, chain ID, and endpoint profiles. Protocol or network-specific code is
+added only when behavior actually diverges. See
+[ADR 0004](decisions/0004-modular-composition.md).
 
 ## Development
 

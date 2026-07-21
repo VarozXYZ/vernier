@@ -17,22 +17,24 @@ func WriteText(writer io.Writer, report Report) error {
 	}
 	if _, err := fmt.Fprintf(
 		writer,
-		"inventory: prepositioned\nfixed_cost_usd: %s\nweth_usd: %s\nfixed_cost_weth: %s\nprice_block: %d\nparity_checks: %d\n",
-		report.Cost.FixedUSD.FloatString(6), report.Cost.WETHUSD.FloatString(8),
-		report.Cost.WETHCost.Decimal(18), report.Cost.PriceBlock.Number, len(report.Parity),
+		"inventory: prepositioned\nfixed_cost: %s %s\nprice: %s %s/%s\nprice_source: %s\nmodeled_cost: %s %s\nparity_checks: %d\n",
+		report.Cost.FixedAmount.FloatString(6), report.Cost.FixedAsset,
+		report.Cost.Price.Value().FloatString(8), report.Cost.Price.Base(), report.Cost.Price.Quote(),
+		report.Cost.Price.Source(), report.Cost.Cost.Decimal(18), report.Cost.Cost.Asset(), len(report.Parity),
 	); err != nil {
 		return err
 	}
 	for _, opportunity := range report.Research.Opportunities {
 		for index, candidate := range opportunity.Candidates {
-			netUSD := candidate.NetPnL.Rat()
-			netUSD.Mul(netUSD, report.Cost.WETHUSD)
+			netQuote := candidate.NetPnL.Rat()
+			netQuote.Mul(netQuote, report.Cost.Price.Value())
 			if _, err := fmt.Fprintf(
-				writer, "curve %s->%s index=%d size=%s VIRTUAL input=%s WETH output=%s WETH gross=%s WETH net=%s WETH net_usd=%s\n",
+				writer, "curve %s->%s index=%d size=%s %s input=%s %s output=%s %s gross=%s %s net=%s %s net_%s=%s\n",
 				opportunity.Direction.BuyMarket, opportunity.Direction.SellMarket, index,
-				candidate.Size.Decimal(8), candidate.Input.Decimal(18), candidate.Output.Decimal(18),
-				candidate.GrossPnL.Decimal(18), candidate.NetPnL.Decimal(18),
-				strings.TrimRight(strings.TrimRight(netUSD.FloatString(8), "0"), "."),
+				candidate.Size.Decimal(8), candidate.Size.Asset(), candidate.Input.Decimal(18), candidate.Input.Asset(),
+				candidate.Output.Decimal(18), candidate.Output.Asset(), candidate.GrossPnL.Decimal(18), candidate.GrossPnL.Asset(),
+				candidate.NetPnL.Decimal(18), candidate.NetPnL.Asset(), report.Cost.Price.Quote(),
+				strings.TrimRight(strings.TrimRight(netQuote.FloatString(8), "0"), "."),
 			); err != nil {
 				return err
 			}
@@ -41,13 +43,14 @@ func WriteText(writer io.Writer, report Report) error {
 			continue
 		}
 		selected := opportunity.Candidates[opportunity.SelectedIndex]
-		netUSD := selected.NetPnL.Rat()
-		netUSD.Mul(netUSD, report.Cost.WETHUSD)
+		netQuote := selected.NetPnL.Rat()
+		netQuote.Mul(netQuote, report.Cost.Price.Value())
 		if _, err := fmt.Fprintf(
-			writer, "selected %s->%s size=%s VIRTUAL gross=%s WETH net=%s WETH net_usd=%s\n",
+			writer, "selected %s->%s size=%s %s gross=%s %s net=%s %s net_%s=%s\n",
 			opportunity.Direction.BuyMarket, opportunity.Direction.SellMarket,
-			selected.Size.Decimal(8), selected.GrossPnL.Decimal(18), selected.NetPnL.Decimal(18),
-			strings.TrimRight(strings.TrimRight(netUSD.FloatString(8), "0"), "."),
+			selected.Size.Decimal(8), selected.Size.Asset(), selected.GrossPnL.Decimal(18), selected.GrossPnL.Asset(),
+			selected.NetPnL.Decimal(18), selected.NetPnL.Asset(), report.Cost.Price.Quote(),
+			strings.TrimRight(strings.TrimRight(netQuote.FloatString(8), "0"), "."),
 		); err != nil {
 			return err
 		}
@@ -69,10 +72,12 @@ func WriteJSON(writer io.Writer, report Report) error {
 		SchemaVersion: 1,
 		Research:      json.RawMessage(bytes.TrimSpace(researchJSON.Bytes())),
 		Cost: costDTO{
-			FixedUSD: report.Cost.FixedUSD.RatString(), WETHCost: report.Cost.WETHCost.String(),
-			WETHUSD: report.Cost.WETHUSD.RatString(), PriceBlock: report.Cost.PriceBlock.Number,
-			PriceBlockHash: report.Cost.PriceBlock.Hash.Hex(), PriceRound: report.Cost.PriceRound.String(),
-			PriceUpdatedAt: report.Cost.PriceUpdatedAt,
+			FixedAmount: report.Cost.FixedAmount.RatString(), FixedAsset: string(report.Cost.FixedAsset),
+			CostAmount: report.Cost.Cost.String(), CostAsset: string(report.Cost.Cost.Asset()),
+			PriceSource: string(report.Cost.Price.Source()), PriceBase: string(report.Cost.Price.Base()),
+			PriceQuote: string(report.Cost.Price.Quote()), PriceValue: report.Cost.Price.Value().RatString(),
+			PriceReference: report.Cost.Price.Reference(), PriceUpdatedAt: report.Cost.Price.SourceUpdatedAt(),
+			PriceObservedAt: report.Cost.Price.ObservedAt(),
 		},
 		Parity: make([]parityDTO, 0, len(report.Parity)),
 	}
@@ -91,13 +96,17 @@ func WriteJSON(writer io.Writer, report Report) error {
 }
 
 type costDTO struct {
-	FixedUSD       string    `json:"fixed_usd"`
-	WETHCost       string    `json:"weth_cost"`
-	WETHUSD        string    `json:"weth_usd"`
-	PriceBlock     uint64    `json:"price_block"`
-	PriceBlockHash string    `json:"price_block_hash"`
-	PriceRound     string    `json:"price_round"`
-	PriceUpdatedAt time.Time `json:"price_updated_at"`
+	FixedAmount     string    `json:"fixed_amount"`
+	FixedAsset      string    `json:"fixed_asset"`
+	CostAmount      string    `json:"cost_amount"`
+	CostAsset       string    `json:"cost_asset"`
+	PriceSource     string    `json:"price_source"`
+	PriceBase       string    `json:"price_base"`
+	PriceQuote      string    `json:"price_quote"`
+	PriceValue      string    `json:"price_value"`
+	PriceReference  string    `json:"price_reference"`
+	PriceUpdatedAt  time.Time `json:"price_updated_at"`
+	PriceObservedAt time.Time `json:"price_observed_at"`
 }
 
 type parityDTO struct {

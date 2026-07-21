@@ -1,0 +1,4 @@
+schema_version: 1
+topology: topology.yaml
+policy: policy.yaml
+active_research: synthetic_cross_chain

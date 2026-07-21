@@ -12,9 +12,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/VarozXYZ/vernier/adapters/chain/base"
 	"github.com/VarozXYZ/vernier/adapters/chain/ethereum"
-	"github.com/VarozXYZ/vernier/adapters/chain/robinhood"
+	"github.com/VarozXYZ/vernier/adapters/chain/evm"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
 	"github.com/VarozXYZ/vernier/runtime/observev3"
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
@@ -37,7 +36,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("research compare-live", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "config/local/live-compare.local.json", "path to private live comparison configuration")
+	configPath := flags.String("config", "config/local/vernier.yaml", "path to private YAML configuration manifest")
 	envPath := flags.String("env-file", ".env", "path to private environment file")
 	format := flags.String("format", "text", "output format: text or json")
 	if err := flags.Parse(args); err != nil {
@@ -51,12 +50,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "research compare-live: cannot load private environment")
 		return 2
 	}
-	data, err := os.ReadFile(*configPath)
-	if err != nil {
-		fmt.Fprintln(stderr, "research compare-live: cannot read private configuration")
-		return 2
-	}
-	config, err := livecompare.ParseConfig(data)
+	config, err := livecompare.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
 		return 2
@@ -66,21 +60,28 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
 		return 2
 	}
-	robinhoodNetwork, err := robinhood.Dial(ctx, endpoints.Robinhood, endpoints.Robinhood)
-	if err != nil {
-		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
-		return 1
+	networks := make(livecompare.Networks, len(config.Chains))
+	for id, profile := range config.Chains {
+		network, dialErr := evm.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, profile.ChainID, endpoints[id], endpoints[id])
+		if dialErr != nil {
+			for _, opened := range networks {
+				if closer, ok := opened.(interface{ Close() }); ok {
+					closer.Close()
+				}
+			}
+			fmt.Fprintf(stderr, "research compare-live: %v\n", dialErr)
+			return 1
+		}
+		networks[id] = network
 	}
-	defer robinhoodNetwork.Close()
-	baseNetwork, err := base.Dial(ctx, endpoints.Base, endpoints.Base)
-	if err != nil {
-		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
-		return 1
-	}
-	defer baseNetwork.Close()
-	runner, err := livecompare.New(config, livecompare.Networks{
-		Robinhood: robinhoodNetwork, Base: baseNetwork,
-	}, livecompare.Options{})
+	defer func() {
+		for _, network := range networks {
+			if closer, ok := network.(interface{ Close() }); ok {
+				closer.Close()
+			}
+		}
+	}()
+	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv})
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: invalid composition: %v\n", err)
 		return 2

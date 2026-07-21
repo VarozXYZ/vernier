@@ -53,5 +53,6 @@ require (
 	golang.org/x/telemetry v0.0.0-20260708182218-49f421fb7959 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	golang.org/x/vuln v1.6.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1
 	honnef.co/go/tools v0.7.0 // indirect
 )

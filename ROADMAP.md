@@ -17,10 +17,9 @@ Observe canonical and compatible pools through pool-filtered WebSocket logs,
 maintain local state, and compare local quotes exactly with venue references at
 the same block hash.
 
-Status: implemented experimentally for canonical Uniswap V3 on Ethereum, a
-canonical Uniswap V2 pool on Robinhood Chain, and an Aerodrome Slipstream pool
-on Base. The two latter markets also have a read-only point-in-time
-cross-chain comparison.
+Status: implemented experimentally for canonical Uniswap V3, canonical
+Uniswap V2, and Aerodrome Slipstream on configured EVM profiles. Two configured
+markets can also be compared read-only at explicit point-in-time snapshots.
 
 ## 3. Durable Research
 
