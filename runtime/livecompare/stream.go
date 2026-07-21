@@ -45,10 +45,12 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 	if options.OnReport == nil {
 		options.OnReport = func(Report) error { return nil }
 	}
+	r.logger.Info("continuous research started", "run", r.config.RunID, "markets", len(r.config.Markets), "updates", options.Updates)
 	blocks, err := r.currentBlocks(ctx)
 	if err != nil {
 		return err
 	}
+	r.logger.Info("stream cost reference blocks read", "blocks", blockSummary(blocks))
 	registry, setup, err := r.registry()
 	if err != nil {
 		return err
@@ -72,7 +74,7 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 		}
 		feed, feedErr := evmlogs.New(evmlogs.Config{
 			Market: configured.ID, Source: source, Network: r.networks[configured.Venue.Chain], Venue: candidate.venue,
-			Clock: r.clock,
+			Clock: r.clock, Logger: r.logger,
 		})
 		if feedErr != nil {
 			return feedErr
@@ -80,14 +82,17 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 		markets[configured.ID] = &streamMarket{runtime: candidate, mirror: mirror, feed: feed}
 		sources[configured.ID] = candidate.source
 	}
+	r.logger.Info("stream markets composed", "markets", len(markets))
 	costEvidence, cost, err := r.cost(ctx, blocks, now)
 	if err != nil {
 		return err
 	}
+	r.logger.Info("stream cost snapshot ready", "source", costEvidence.Price.Source(), "asset", costEvidence.Cost.Asset())
 	strategy, err := r.newStrategy(registry, setup, sources)
 	if err != nil {
 		return err
 	}
+	r.logger.Info("stream strategy ready", "strategy", strategy.ID())
 
 	runCtx, cancel := context.WithCancel(ctx)
 	signals := make(chan streamSignal)
@@ -115,6 +120,7 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 		case <-ctx.Done():
 			return nil
 		case err := <-feedErrors:
+			r.logger.Error("stream feed failed", "error", err)
 			return err
 		case signal := <-signals:
 			snapshots := make([]market.MarketSnapshot, 0, len(markets))
@@ -130,6 +136,12 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 			if !ready {
 				continue
 			}
+			metadata := make(map[string]any, len(snapshots))
+			for _, snapshot := range snapshots {
+				value := snapshot.Metadata()
+				metadata[string(value.Market)] = map[string]any{"version": value.Version, "block": value.EventPosition.Value, "health": value.Health}
+			}
+			r.logger.Info("stream evaluation started", "triggered_at", signal.triggered, "snapshots", metadata)
 			research, evaluateErr := r.evaluate(
 				runCtx, strategy, snapshots, cost,
 				fmt.Sprintf("stream-evaluation/%s/%d", r.config.ResearchID, evaluations+1), signal.triggered,
@@ -137,10 +149,12 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 			if evaluateErr != nil {
 				return evaluateErr
 			}
+			research.Evaluations = evaluations + 1
 			report := Report{Research: research, Cost: costEvidence}
 			if callbackErr := options.OnReport(report); callbackErr != nil {
 				return callbackErr
 			}
+			r.logger.Info("stream evaluation emitted", "evaluation", evaluations+1, "opportunities", len(research.Opportunities), "status", research.Status)
 			evaluations++
 			if options.Updates > 0 && evaluations >= options.Updates {
 				return nil

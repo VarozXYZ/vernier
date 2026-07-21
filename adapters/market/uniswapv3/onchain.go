@@ -223,7 +223,7 @@ func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockR
 		}
 		update, err := decodeLog(event)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decode Uniswap V3 log %s at block %d index %d: %w", event.TxHash.Hex(), block.Number, event.Index, err)
 		}
 		updates = append(updates, update)
 	}
@@ -482,7 +482,11 @@ func liquidityLogUpdate(event types.Log, delta *big.Int) (LiquidityUpdate, error
 	if err != nil {
 		return LiquidityUpdate{}, fmt.Errorf("decode upper tick: %w", err)
 	}
-	return NewLiquidityUpdate(lower, upper, delta)
+	update, err := NewLiquidityUpdate(lower, upper, delta)
+	if err != nil {
+		return LiquidityUpdate{}, fmt.Errorf("liquidity range [%d,%d] delta %s: %w", lower, upper, delta.String(), err)
+	}
+	return update, nil
 }
 
 func signedTopicInt32(topic common.Hash) (int32, error) {

@@ -143,8 +143,11 @@ type LiquidityUpdate struct {
 	delta *big.Int
 }
 
+// NewLiquidityUpdate accepts zero deltas because pool contracts can emit a
+// zero-liquidity Burn when a position is poked or collected. It is a valid
+// protocol event and must not terminate a live feed.
 func NewLiquidityUpdate(lower, upper int32, delta *big.Int) (LiquidityUpdate, error) {
-	if lower >= upper || lower < MinTick || upper > MaxTick || delta == nil || delta.Sign() == 0 {
+	if lower >= upper || lower < MinTick || upper > MaxTick || delta == nil {
 		return LiquidityUpdate{}, fmt.Errorf("invalid Uniswap V3 liquidity update")
 	}
 	return LiquidityUpdate{lower: lower, upper: upper, delta: cloneInt(delta)}, nil

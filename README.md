@@ -114,6 +114,11 @@ or an explicit disconnect health change:
 go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --stream --updates 1 --format jsonl
 ~~~
 
+Diagnostics are written to stderr so they never alter the report on stdout.
+Use `--log-level debug` when investigating startup or feed behavior; the
+default `info` level reports configuration, network readiness, bootstrap
+duration, accepted blocks, evaluation triggers, reconnects, and failures.
+
 Stream mode caches the external cost evidence and never performs venue parity
 RPC calls on the event loop. A healthy WebSocket has no age expiry. Events
 proven older by block evidence are ignored; a confirmed disconnect degrades

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"strings"
 	"time"
@@ -29,6 +30,7 @@ import (
 	priceport "github.com/VarozXYZ/vernier/ports/price"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
+	"github.com/VarozXYZ/vernier/runtime/observability"
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
 
@@ -40,6 +42,7 @@ type Options struct {
 	Clock       func() time.Time
 	LookupEnv   configuration.LookupEnv
 	PriceClient coingecko.Client
+	Logger      *slog.Logger
 }
 
 type Runner struct {
@@ -48,6 +51,7 @@ type Runner struct {
 	clock    func() time.Time
 	lookup   configuration.LookupEnv
 	client   coingecko.Client
+	logger   *slog.Logger
 }
 
 type CostEvidence struct {
@@ -93,6 +97,9 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 	if options.LookupEnv == nil {
 		options.LookupEnv = func(string) (string, bool) { return "", false }
 	}
+	if options.Logger == nil {
+		options.Logger = observability.DiscardLogger()
+	}
 	limited := make(Networks, len(config.Chains))
 	for id, profile := range config.Chains {
 		network := networks[id]
@@ -105,15 +112,18 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		}
 		limited[id] = wrapped
 	}
-	return &Runner{config: config, networks: limited, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient}, nil
+	return &Runner{config: config, networks: limited, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
 	startedAt := r.clock().UTC()
+	r.logger.Info("point-in-time research started", "run", r.config.RunID, "markets", len(r.config.Markets))
 	blocks, err := r.currentBlocks(ctx)
 	if err != nil {
+		r.logger.Error("failed to read current blocks", "error", err)
 		return Report{}, err
 	}
+	r.logger.Info("current blocks read", "blocks", blockSummary(blocks))
 	registry, setup, err := r.registry()
 	if err != nil {
 		return Report{}, err
@@ -123,18 +133,26 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
 	for _, configured := range r.config.Markets {
+		r.logger.Info("bootstrapping market", "market", configured.ID, "chain", configured.Venue.Chain, "venue", configured.Venue.Kind, "block", blocks[configured.Venue.Chain].Number)
+		marketStarted := time.Now()
 		candidate, err := r.bootstrapMarket(ctx, configured, registry, blocks[configured.Venue.Chain], maximum, startedAt)
 		if err != nil {
+			r.logger.Error("market bootstrap failed", "market", configured.ID, "duration", time.Since(marketStarted), "error", err)
 			return Report{}, err
 		}
+		r.logger.Info("market bootstrap complete", "market", configured.ID, "version", candidate.snapshot.Metadata().Version, "duration", time.Since(marketStarted))
 		runtimes = append(runtimes, candidate)
 		sources[configured.ID] = candidate.source
 		snapshots = append(snapshots, candidate.snapshot)
 	}
+	r.logger.Info("market bootstraps complete", "snapshots", len(snapshots))
+	costStarted := time.Now()
 	costEvidence, cost, err := r.cost(ctx, blocks, startedAt)
 	if err != nil {
+		r.logger.Error("cost snapshot failed", "duration", time.Since(costStarted), "error", err)
 		return Report{}, err
 	}
+	r.logger.Info("cost snapshot ready", "source", costEvidence.Price.Source(), "asset", costEvidence.Cost.Asset(), "duration", time.Since(costStarted))
 	candidate, err := r.newStrategy(registry, setup, sources)
 	if err != nil {
 		return Report{}, err
@@ -143,11 +161,16 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
+	r.logger.Info("local research evaluation complete", "opportunities", len(researchReport.Opportunities))
 	report := Report{Research: researchReport, Cost: costEvidence}
+	r.logger.Info("parity validation started")
+	parityStarted := time.Now()
 	report.Parity, err = validateParity(ctx, researchReport.Opportunities, runtimes)
 	if err != nil {
+		r.logger.Error("parity validation failed", "duration", time.Since(parityStarted), "error", err)
 		return report, err
 	}
+	r.logger.Info("parity validation complete", "checks", len(report.Parity), "duration", time.Since(parityStarted))
 	return report, nil
 }
 
@@ -161,6 +184,14 @@ func (r *Runner) currentBlocks(ctx context.Context) (map[string]evm.BlockReferen
 		blocks[id] = block
 	}
 	return blocks, nil
+}
+
+func blockSummary(blocks map[string]evm.BlockReference) map[string]uint64 {
+	result := make(map[string]uint64, len(blocks))
+	for id, block := range blocks {
+		result[id] = block.Number
+	}
+	return result
 }
 
 func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.ArbitrageSetup, sources map[market.MarketID]quoteport.Source) (*strategy.TwoMarketCrossChainArbitrage, error) {

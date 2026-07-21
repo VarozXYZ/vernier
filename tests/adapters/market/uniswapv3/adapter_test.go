@@ -139,6 +139,19 @@ func TestReducerPublishesImmutableStateAndAppliesLiquidityEvents(t *testing.T) {
 	}
 }
 
+func TestReducerAcceptsZeroLiquidityProtocolEvent(t *testing.T) {
+	mirror := newV3Mirror(t)
+	initial := applyV3(t, mirror, v3Event(t, 10, stateUpdateForTest(t, big.NewInt(1_000_000_000_000), nil)))
+	update, err := uniswapv3.NewLiquidityUpdate(-60, 60, big.NewInt(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := applyV3(t, mirror, v3Event(t, 11, update))
+	if next.Data().(uniswapv3.Snapshot).Liquidity().Cmp(initial.Data().(uniswapv3.Snapshot).Liquidity()) != 0 {
+		t.Fatal("zero-liquidity event changed active liquidity")
+	}
+}
+
 func TestReducerAppliesSwapStateWithoutLosingInitializedTicks(t *testing.T) {
 	mirror := newV3Mirror(t)
 	outer := big.NewInt(1_000_000_000_000)
