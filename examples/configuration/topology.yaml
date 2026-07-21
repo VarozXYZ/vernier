@@ -1,0 +1,37 @@
+schema_version: 1
+chains:
+  chain_alpha: {kind: evm, label: Chain Alpha, chain_id: "1001", rpc_url_env: CHAIN_ALPHA_RPC}
+  chain_beta: {kind: evm, label: Chain Beta, chain_id: "1002", rpc_url_env: CHAIN_BETA_RPC}
+assets:
+  asset_x: {symbol: ASSET_X}
+  wrapped_native: {symbol: WNATIVE}
+  usd: {symbol: USD}
+tokens:
+  asset_x_alpha: {asset: asset_x, chain: chain_alpha, address: "0x0000000000000000000000000000000000000011", decimals: 18, symbol: ASSET_X}
+  wrapped_alpha: {asset: wrapped_native, chain: chain_alpha, address: "0x0000000000000000000000000000000000000012", decimals: 18, symbol: WNATIVE}
+  asset_x_beta: {asset: asset_x, chain: chain_beta, address: "0x0000000000000000000000000000000000000021", decimals: 18, symbol: ASSET_X}
+  wrapped_beta: {asset: wrapped_native, chain: chain_beta, address: "0x0000000000000000000000000000000000000022", decimals: 18, symbol: WNATIVE}
+venues:
+  venue_alpha:
+    kind: uniswap_v2
+    chain: chain_alpha
+    pool_address: "0x0000000000000000000000000000000000000013"
+    factory_address: "0x0000000000000000000000000000000000000014"
+    reference_address: "0x0000000000000000000000000000000000000015"
+    fee_bps: 30
+  venue_beta:
+    kind: aerodrome_slipstream
+    chain: chain_beta
+    pool_address: "0x0000000000000000000000000000000000000023"
+    factory_address: "0x0000000000000000000000000000000000000024"
+    reference_address: "0x0000000000000000000000000000000000000025"
+    max_tick_words: 64
+markets:
+  market_alpha: {venue: venue_alpha, base_token: asset_x_alpha, quote_token: wrapped_alpha}
+  market_beta: {venue: venue_beta, base_token: asset_x_beta, quote_token: wrapped_beta}
+price_sources:
+  wrapped_native_usd:
+    base_asset: wrapped_native
+    quote_asset: usd
+    primary: {kind: coingecko, coin_id: wrapped-native-example, currency: usd, api_key_env: COINGECKO_API_KEY, api_key_kind: demo}
+    fallback: {kind: chainlink, chain: chain_beta, feed_address: "0x0000000000000000000000000000000000000026"}
