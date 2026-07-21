@@ -118,6 +118,9 @@ go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml
 ~~~
 
 Diagnostics are written to stderr so they never alter the report on stdout.
+Their timestamp prefix is compact and local: `YYYY-MM-DD/HH:MM:SS/milliseconds`;
+the `time=` label, timezone suffix, and extra precision are intentionally
+omitted.
 Use `--log-level debug` when investigating startup or feed behavior; the
 default `info` level reports configuration, network readiness, bootstrap
 duration, accepted events, evaluation triggers, reconnects, and failures. To

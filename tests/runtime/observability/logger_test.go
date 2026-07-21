@@ -2,6 +2,7 @@ package observability_test
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -15,7 +16,11 @@ func TestNewLoggerWritesStructuredDiagnosticsAtConfiguredLevel(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger.Debug("phase", "market", "virtual_base", "block", uint64(42))
-	if !strings.Contains(output.String(), "level=DEBUG") || !strings.Contains(output.String(), "market=virtual_base") {
+	line := output.String()
+	if !regexp.MustCompile(`^\d{4}-\d{2}-\d{2}/\d{2}:\d{2}:\d{2}/\d{3} level=DEBUG`).MatchString(line) {
+		t.Fatalf("unexpected timestamp format: %s", line)
+	}
+	if strings.Contains(line, "time=") || strings.Contains(line, "+02:") || !strings.Contains(line, "market=virtual_base") {
 		t.Fatalf("unexpected diagnostic output: %s", output.String())
 	}
 }
