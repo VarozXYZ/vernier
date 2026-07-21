@@ -31,6 +31,14 @@ type Venue interface {
 	DecodeBlock(context.Context, evm.Network, evm.BlockReference, []types.Log) (market.EventData, error)
 }
 
+// LogDecoder is an optional venue capability for filtered subscriptions. It
+// lets a venue turn each WebSocket log into one normalized event without
+// querying the whole block again. The feed keeps DecodeBlock as a compatibility
+// fallback for venues that need block-level correlation.
+type LogDecoder interface {
+	DecodeLog(context.Context, evm.Network, evm.BlockReference, types.Log) (market.EventData, error)
+}
+
 type Clock func() time.Time
 
 type RetryPolicy struct {
@@ -166,7 +174,12 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 	established = true
 	f.logger.Info("feed bootstrap applied", "market", f.market, "block", block.Number)
 	highest := block.Number
-	processed := map[common.Hash]struct{}{block.Hash: {}}
+	var logDecoder LogDecoder
+	if decoder, ok := f.venue.(LogDecoder); ok {
+		logDecoder = decoder
+	}
+	processedLogs := make(map[logIdentity]struct{})
+	processedBlocks := map[common.Hash]struct{}{block.Hash: {}}
 
 	for {
 		select {
@@ -185,11 +198,37 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 				f.logger.Debug("feed log ignored", "market", f.market, "block", observed.BlockNumber, "reason", ignoredLogReason(observed, highest))
 				continue
 			}
-			if _, duplicate := processed[observed.BlockHash]; duplicate {
+			active := evm.BlockReference{Number: observed.BlockNumber, Hash: observed.BlockHash}
+			if logDecoder != nil {
+				key := identity(observed)
+				if _, duplicate := processedLogs[key]; duplicate {
+					f.logger.Debug("feed log ignored", "market", f.market, "block", active.Number, "tx_hash", observed.TxHash.Hex(), "log_index", observed.Index, "reason", "duplicate_log")
+					continue
+				}
+				f.logger.Debug("feed event received", "market", f.market, "block", active.Number, "tx_hash", observed.TxHash.Hex(), "log_index", observed.Index)
+				eventStarted := time.Now()
+				data, decodeErr := logDecoder.DecodeLog(ctx, f.network, active, observed)
+				if decodeErr != nil {
+					if errors.Is(decodeErr, context.Canceled) {
+						return true, false, decodeErr
+					}
+					f.logger.Error("feed event decode failed", "market", f.market, "block", active.Number, "tx_hash", observed.TxHash.Hex(), "log_index", observed.Index, "duration", time.Since(eventStarted), "error", decodeErr)
+					return true, false, fmt.Errorf("decode %s event at block %d index %d: %w", f.market, active.Number, observed.Index, decodeErr)
+				}
+				if err := sink.Publish(ctx, f.event(active, data)); err != nil {
+					return true, false, err
+				}
+				processedLogs[key] = struct{}{}
+				f.logger.Info("feed event applied", "market", f.market, "block", active.Number, "tx_hash", observed.TxHash.Hex(), "log_index", observed.Index, "duration", time.Since(eventStarted))
+				if active.Number > highest {
+					highest = active.Number
+				}
+				continue
+			}
+			if _, duplicate := processedBlocks[observed.BlockHash]; duplicate {
 				f.logger.Debug("feed block ignored", "market", f.market, "block", observed.BlockNumber, "reason", "duplicate_block")
 				continue
 			}
-			active := evm.BlockReference{Number: observed.BlockNumber, Hash: observed.BlockHash}
 			f.logger.Debug("feed block received", "market", f.market, "block", active.Number)
 			blockStarted := time.Now()
 			blockLogs, err := f.network.LogsAt(ctx, active, f.venue.Filter())
@@ -211,13 +250,23 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 			if err := sink.Publish(ctx, f.event(active, data)); err != nil {
 				return true, false, err
 			}
-			processed[active.Hash] = struct{}{}
+			processedBlocks[active.Hash] = struct{}{}
 			f.logger.Info("feed block applied", "market", f.market, "block", active.Number, "logs", len(blockLogs), "duration", time.Since(blockStarted))
 			if active.Number > highest {
 				highest = active.Number
 			}
 		}
 	}
+}
+
+type logIdentity struct {
+	blockHash common.Hash
+	txHash    common.Hash
+	index     uint
+}
+
+func identity(log types.Log) logIdentity {
+	return logIdentity{blockHash: log.BlockHash, txHash: log.TxHash, index: log.Index}
 }
 
 func ignoredLogReason(observed types.Log, highest uint64) string {

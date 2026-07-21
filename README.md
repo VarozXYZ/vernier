@@ -78,9 +78,12 @@ containing a matching pool event. The value updates=0 runs until canceled.
 Configuration, endpoints, and addresses are not included in output records.
 
 The observer loads complete state only at startup and after a confirmed
-WebSocket disconnection. Each active block is fetched once by exact block hash
-to order its pool logs. Tick coverage is explicit; the local quoter fails
-closed and loads additional bitmap words when a configured probe needs them.
+WebSocket disconnection. Venue adapters decode filtered logs individually in
+subscription arrival order; same-block events are therefore applied one by
+one, while provably older blocks are ignored. Venues that require block-level
+correlation may use the exact-block fallback. Tick coverage is explicit; the
+local quoter fails closed and loads additional bitmap words when a configured
+probe needs them.
 Every emitted quote is compared exactly with QuoterV2 at the same block hash.
 
 Canonical adapter reuse and network/fork boundaries are recorded in
@@ -117,7 +120,13 @@ go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml
 Diagnostics are written to stderr so they never alter the report on stdout.
 Use `--log-level debug` when investigating startup or feed behavior; the
 default `info` level reports configuration, network readiness, bootstrap
-duration, accepted blocks, evaluation triggers, reconnects, and failures.
+duration, accepted events, evaluation triggers, reconnects, and failures. To
+inspect a JSONL run without interleaving diagnostics in the terminal, redirect
+the two streams separately, for example:
+
+~~~console
+go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --stream --updates 1 --format jsonl > report.jsonl 2> stream.log
+~~~
 
 Stream mode caches the external cost evidence and never performs venue parity
 RPC calls on the event loop. A healthy WebSocket has no age expiry. Events

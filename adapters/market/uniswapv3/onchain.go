@@ -205,7 +205,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 	return update, nil
 }
 
-func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockReference, logs []types.Log) (market.EventData, error) {
+func (a *Adapter) DecodeBlock(ctx context.Context, _ evm.Network, block evm.BlockReference, logs []types.Log) (market.EventData, error) {
 	if len(logs) == 0 {
 		return nil, fmt.Errorf("uniswap V3 block %d contains no matching logs", block.Number)
 	}
@@ -218,16 +218,27 @@ func (a *Adapter) DecodeBlock(_ context.Context, _ evm.Network, block evm.BlockR
 	})
 	updates := make([]market.EventData, 0, len(ordered))
 	for _, event := range ordered {
-		if event.Address != a.pool || event.BlockHash != block.Hash || event.BlockNumber != block.Number || event.Removed {
-			return nil, fmt.Errorf("uniswap V3 log does not belong to pool and block")
-		}
-		update, err := decodeLog(event)
+		update, err := a.DecodeLog(ctx, nil, block, event)
 		if err != nil {
-			return nil, fmt.Errorf("decode Uniswap V3 log %s at block %d index %d: %w", event.TxHash.Hex(), block.Number, event.Index, err)
+			return nil, err
 		}
 		updates = append(updates, update)
 	}
 	return NewBlockUpdate(updates...)
+}
+
+// DecodeLog decodes one filtered pool log. It deliberately does not sort or
+// aggregate same-block logs; the feed supplies them in subscription arrival
+// order and the mirror applies each event independently.
+func (a *Adapter) DecodeLog(_ context.Context, _ evm.Network, block evm.BlockReference, event types.Log) (market.EventData, error) {
+	if event.Address != a.pool || event.BlockHash != block.Hash || event.BlockNumber != block.Number || event.Removed {
+		return nil, fmt.Errorf("uniswap V3 log does not belong to pool and block")
+	}
+	update, err := decodeLog(event)
+	if err != nil {
+		return nil, fmt.Errorf("decode Uniswap V3 log %s at block %d index %d: %w", event.TxHash.Hex(), block.Number, event.Index, err)
+	}
+	return update, nil
 }
 
 func (a *Adapter) loadCoveredState(ctx context.Context, network evm.Network, block evm.BlockReference, sqrtPrice *big.Int, tick int32, liquidity *big.Int, fee uint32, spacing int32) (StateUpdate, error) {

@@ -109,6 +109,29 @@ func (a *Adapter) DecodeBlock(
 	return uniswapv3.NewBlockUpdate(update, feeUpdate)
 }
 
+// DecodeLog preserves subscription arrival order while retaining the
+// variant's dynamic fee update for the exact event block.
+func (a *Adapter) DecodeLog(
+	ctx context.Context,
+	network evm.Network,
+	block evm.BlockReference,
+	event types.Log,
+) (market.EventData, error) {
+	update, err := a.inner.DecodeLog(ctx, network, block, event)
+	if err != nil {
+		return nil, err
+	}
+	fee, err := a.feeAt(ctx, network, block)
+	if err != nil {
+		return nil, err
+	}
+	feeUpdate, err := uniswapv3.NewFeeUpdate(fee)
+	if err != nil {
+		return nil, err
+	}
+	return uniswapv3.NewBlockUpdate(update, feeUpdate)
+}
+
 func (a *Adapter) ExpandCoverage(
 	ctx context.Context,
 	network evm.Network,
