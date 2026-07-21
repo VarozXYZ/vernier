@@ -76,6 +76,7 @@ func TestRunExitCodes(t *testing.T) {
 		"bad observe format":                {"observe-v3", "--format", "json"},
 		"stream requires jsonl":             {"compare-live", "--stream", "--format", "json"},
 		"stream updates cannot be negative": {"compare-live", "--stream", "--updates", "-1"},
+		"bad live log level":                {"compare-live", "--log-level", "trace"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code, _, _ := runCLI(t, args...)
