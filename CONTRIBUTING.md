@@ -15,6 +15,9 @@ Project-owned changes use short branches, English Conventional Commit titles,
 tests proportional to risk, and pull requests that explain problem, approach,
 scope, validation, risks, and documentation.
 
+Pull requests are integrated with rebase merge so their coherent commits remain
+visible in linear history. Squash and merge commits are not used.
+
 All Go tests and test-only data live under the root `tests/` tree, mirroring the
 production package layout. Production directories must not contain `_test.go`
 files or `testdata/`. Tests exercise public behavior; production internals are
