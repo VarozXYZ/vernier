@@ -35,9 +35,10 @@ leaking EVM types into the economic domain. Blocks without market events cost
 no subscription work. Future deviations remain visible and testable instead
 of becoming configuration flags inside canonical implementations.
 
-The first live slice supports only Ethereum mainnet and canonical Uniswap V3.
-A second real network or fork is required before extracting more shared
-behavior.
+The live slice now also demonstrates a real Aerodrome volatile pool. Its
+protocol adapter reuses the generic constant-product state while retaining
+Aerodrome-specific log and router semantics; stable Aerodrome pools remain a
+different invariant and are not silently treated as volatile.
 
 ## Alternatives
 

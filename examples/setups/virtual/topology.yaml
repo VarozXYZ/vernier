@@ -49,20 +49,21 @@ venues:
     factory_address: "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f"
     reference_address: "0x89e5db8b5aa49aa85ac63f691524311aeb649eba"
     fee_bps: 30
-  base_aerodrome_slipstream:
-    kind: aerodrome_slipstream
+  base_aerodrome_volatile:
+    kind: aerodrome_volatile
     chain: base
-    pool_address: "0x3f0296bf652e19bca772ec3df08b32732f93014a"
-    factory_address: "0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a"
-    reference_address: "0x254cf9e1e6e233aa1ac962cb9b05b2cfeaae15b0"
-    max_tick_words: 64
+    pool_address: "0x21594b992f68495dd28d605834b58889d0a727c7"
+    factory_address: "0x420dd381b31aef6683db6b902084cb0ffece40da"
+    reference_address: "0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43"
+    fee_bps: 100
+    stable: false
 markets:
   virtual_robinhood:
     venue: robinhood_uniswap_v2
     base_token: virtual_robinhood
     quote_token: weth_robinhood
   virtual_base:
-    venue: base_aerodrome_slipstream
+    venue: base_aerodrome_volatile
     base_token: virtual_base
     quote_token: weth_base
 price_sources:

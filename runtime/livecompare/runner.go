@@ -15,6 +15,7 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
 	"github.com/VarozXYZ/vernier/adapters/feed/evmlogs"
 	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
+	"github.com/VarozXYZ/vernier/adapters/market/aerodrome"
 	"github.com/VarozXYZ/vernier/adapters/market/aerodromeslipstream"
 	"github.com/VarozXYZ/vernier/adapters/market/constantproduct"
 	"github.com/VarozXYZ/vernier/adapters/market/uniswapv2"
@@ -303,6 +304,31 @@ func (r *Runner) composeMarket(configured configuration.ResolvedMarket, registry
 				return reference.QuoteExactOutput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
 			},
 		}, nil
+	case "aerodrome_volatile":
+		adapter, err := aerodrome.NewAdapter(aerodrome.Config{
+			Pool: configured.Venue.Pool, Factory: configured.Venue.Factory,
+			BaseToken: configured.Base.Address, QuoteToken: configured.Quote.Address, FeeBPS: configured.Venue.FeeBPS,
+		})
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		local, err := constantproduct.NewQuoter(market.SourceID(configured.Venue.ID+"/local"), domainMarket)
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		reference, err := aerodrome.NewReferenceQuoter(configured.Venue.Reference, configured.Venue.Factory, configured.Base.Address, configured.Quote.Address, configured.Venue.Stable)
+		if err != nil {
+			return marketRuntime{}, err
+		}
+		return marketRuntime{
+			config: configured, venue: adapter, reducer: constantproduct.Reducer{}, source: local,
+			exactIn: func(ctx context.Context, block evm.BlockReference, _ market.MarketSnapshot, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+				return reference.QuoteExactInput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
+			},
+			exactOut: func(ctx context.Context, block evm.BlockReference, _ market.MarketSnapshot, tokenIn, tokenOut market.TokenID, amount *big.Int) (*big.Int, error) {
+				return reference.QuoteExactOutput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
+			},
+		}, nil
 	case "uniswap_v3":
 		maxBase, initialQuote, baseToQuoteZero, err := v3Inputs(configured, maximum)
 		if err != nil {
@@ -435,6 +461,8 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 			adapterID = uniswapv3.ID
 		} else if configured.Venue.Kind == "aerodrome_slipstream" {
 			adapterID = aerodromeslipstream.ID
+		} else if configured.Venue.Kind == "aerodrome_volatile" {
+			adapterID = aerodrome.ID
 		}
 		venues = append(venues, market.Venue{ID: venueID})
 		pools = append(pools, market.Pool{ID: poolID, Venue: venueID, Chain: chainID, Tokens: []market.TokenID{configured.Base.Token.ID, configured.Quote.Token.ID}, Adapter: adapterID})
