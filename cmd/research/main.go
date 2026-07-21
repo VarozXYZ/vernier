@@ -2,13 +2,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 
+	"github.com/VarozXYZ/vernier/adapters/chain/base"
 	"github.com/VarozXYZ/vernier/adapters/chain/ethereum"
+	"github.com/VarozXYZ/vernier/adapters/chain/robinhood"
+	"github.com/VarozXYZ/vernier/runtime/livecompare"
 	"github.com/VarozXYZ/vernier/runtime/observev3"
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
@@ -21,7 +28,123 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "observe-v3" {
 		return runObserveV3(ctx, args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "compare-live" {
+		return runCompareLive(ctx, args[1:], stdout, stderr)
+	}
 	return runSynthetic(ctx, args, stdout, stderr)
+}
+
+func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("research compare-live", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "config/local/live-compare.local.json", "path to private live comparison configuration")
+	envPath := flags.String("env-file", ".env", "path to private environment file")
+	format := flags.String("format", "text", "output format: text or json")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 || (*format != "text" && *format != "json") {
+		fmt.Fprintln(stderr, "research compare-live: invalid arguments")
+		return 2
+	}
+	if err := loadEnvFile(*envPath, os.LookupEnv, os.Setenv); err != nil {
+		fmt.Fprintln(stderr, "research compare-live: cannot load private environment")
+		return 2
+	}
+	data, err := os.ReadFile(*configPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "research compare-live: cannot read private configuration")
+		return 2
+	}
+	config, err := livecompare.ParseConfig(data)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
+		return 2
+	}
+	endpoints, err := config.ResolveEndpoints(os.LookupEnv)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
+		return 2
+	}
+	robinhoodNetwork, err := robinhood.Dial(ctx, endpoints.Robinhood, endpoints.Robinhood)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
+		return 1
+	}
+	defer robinhoodNetwork.Close()
+	baseNetwork, err := base.Dial(ctx, endpoints.Base, endpoints.Base)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
+		return 1
+	}
+	defer baseNetwork.Close()
+	runner, err := livecompare.New(config, livecompare.Networks{
+		Robinhood: robinhoodNetwork, Base: baseNetwork,
+	}, livecompare.Options{})
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: invalid composition: %v\n", err)
+		return 2
+	}
+	report, err := runner.Run(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: run failed: %v\n", err)
+		return 1
+	}
+	if *format == "json" {
+		err = livecompare.WriteJSON(stdout, report)
+	} else {
+		err = livecompare.WriteText(stdout, report)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: write report: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+var envKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func loadEnvFile(path string, lookup func(string) (string, bool), set func(string, string) error) error {
+	if strings.TrimSpace(path) == "" || lookup == nil || set == nil {
+		return fmt.Errorf("environment file path, lookup, and setter are required")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		key, value, found := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if !found || !envKey.MatchString(key) {
+			return fmt.Errorf("invalid environment entry")
+		}
+		if _, exists := lookup(key); exists {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && (value[0] == '\'' && value[len(value)-1] == '\'' ||
+			value[0] == '"' && value[len(value)-1] == '"') {
+			if value[0] == '\'' {
+				value = value[1 : len(value)-1]
+			} else {
+				value, err = strconv.Unquote(value)
+				if err != nil {
+					return fmt.Errorf("invalid quoted environment value")
+				}
+			}
+		}
+		if err := set(key, value); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
 }
 
 func runSynthetic(ctx context.Context, args []string, stdout, stderr io.Writer) int {

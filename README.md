@@ -11,10 +11,13 @@ explain every evaluated opportunity from immutable market snapshots.
 ## Status
 
 - Architecture baseline: complete.
-- Deterministic Research kernel: available with constant-product and Uniswap
-  V3 local market adapters.
-- Read-only Ethereum observation: experimental, with filtered Uniswap V3 logs
-  and exact local/QuoterV2 parity checks.
+- Deterministic Research kernel: available with constant-product and
+  concentrated-liquidity local market adapters.
+- Read-only market observation: experimental, with explicit Ethereum, Base,
+  and Robinhood Chain adapters, pool-filtered logs, and exact on-chain parity
+  checks.
+- Point-in-time cross-chain comparison: experimental for canonical Uniswap V2
+  and the Aerodrome Slipstream V3 variant.
 - Live execution: not implemented.
 
 See [ROADMAP.md](ROADMAP.md) for the public delivery sequence.
@@ -41,13 +44,15 @@ initialized ticks; it does not use a spot-price approximation.
 Arrival order updates a mirror unless a feed-selected policy has comparable
 source evidence (the fixture uses block number and known timestamp) proving an
 event is older. Older events are ignored and audited without degrading the
-mirror. Explicit feed-liveness failures, such as a WebSocket disconnect, degrade
-the mirror and produce `unclassifiable` results until fresh data arrives.
+mirror. Explicit feed-liveness failures, such as a WebSocket disconnect,
+degrade the mirror and produce `unclassifiable` results until reconnection
+performs a full current-state bootstrap. A healthy WebSocket keeps the mirror
+valid indefinitely: snapshots have no age expiry or finality gate.
 
-The current V3 slice is deliberately local: it reduces normalized full-state,
-swap, and liquidity events and quotes from immutable snapshots. ABI decoding,
-RPC state loading, reorg handling, and transaction construction are future
-adapter capabilities, not hidden dependencies of the quote path.
+The canonical V3 slice reduces normalized full-state, swap, liquidity, and
+dynamic-fee events and quotes from immutable snapshots. On-chain ABI decoding
+and bounded tick loading live in adapters; transaction construction is not
+part of Research.
 
 The adapter boundary is recorded in
 [ADR 0001](decisions/0001-market-adapter-boundaries.md).
@@ -99,6 +104,28 @@ Every emitted quote is compared exactly with QuoterV2 at the same block hash.
 
 Canonical adapter reuse and network/fork boundaries are recorded in
 [ADR 0003](decisions/0003-canonical-chain-and-market-adapters.md).
+
+## Experimental live cross-chain comparison
+
+The private `compare-live` composition reads one canonical Uniswap V2 market
+and one Aerodrome Slipstream market at explicit block hashes. It sizes in the
+base asset, models prepositioned inventory, converts a fixed USD cost through
+an on-chain Chainlink observation, evaluates both directions, and checks every
+local leg against the venue reference quoter. Provider request pacing belongs
+to the EVM network layer, not to either market adapter.
+
+Operational addresses and endpoint variable names belong in an ignored JSON
+file under `config/local/`; endpoint values may be loaded from an ignored
+`.env` file:
+
+~~~console
+go run ./cmd/research compare-live --config config/local/live-compare.local.json --env-file .env --format text
+~~~
+
+The report contains configuration and snapshot hashes, exact quantities, cost
+evidence, the complete sizing curve, and parity results. It never includes
+configured addresses or endpoint values. The command is read-only and has no
+signer or broadcast capability.
 
 ## Development
 

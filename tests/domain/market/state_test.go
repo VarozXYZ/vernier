@@ -32,7 +32,7 @@ func TestMarketEventNormalizesTimestamps(t *testing.T) {
 	}
 }
 
-func TestSnapshotCopiesMetadataAndReportsAge(t *testing.T) {
+func TestSnapshotCopiesMetadata(t *testing.T) {
 	received := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	metadata := market.SnapshotMetadata{
 		Market: "market", Source: "source", Version: 1,
@@ -47,9 +47,6 @@ func TestSnapshotCopiesMetadataAndReportsAge(t *testing.T) {
 	metadata.Version = 99
 	if snapshot.Metadata().Version != 1 {
 		t.Fatal("snapshot metadata changed through caller mutation")
-	}
-	if got := snapshot.Age(received.Add(3 * time.Second)); got != 3*time.Second {
-		t.Fatalf("unexpected snapshot age: %s", got)
 	}
 }
 

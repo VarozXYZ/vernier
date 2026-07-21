@@ -35,7 +35,7 @@ func TestUnmodeledQuoteFeeClosesClassification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "10")})
+	grid, err := sizing.NewGrid([]market.AssetQuantity{baseQuantity(t, "10")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestUnmodeledQuoteFeeClosesClassification(t *testing.T) {
 	}
 	evaluation, err := arbitrage.NewEvaluation(
 		"evaluation-fees", "run", "strategy-fees", "config-hash", fixture.snapshots, fixture.cost,
-		fixture.now, fixture.now, time.Second,
+		fixture.now, fixture.now,
 	)
 	if err != nil {
 		t.Fatal(err)

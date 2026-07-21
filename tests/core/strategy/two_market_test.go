@@ -18,7 +18,7 @@ import (
 
 func TestTwoMarketEvaluatesBothDirectionsWithExactDecimals(t *testing.T) {
 	fixture := newStrategyFixture(t, "1", "0.5")
-	opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now, time.Second))
+	opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,9 +32,16 @@ func TestTwoMarketEvaluatesBothDirectionsWithExactDecimals(t *testing.T) {
 		t.Fatalf("expected no-spread B->A opportunity, got %s", opportunities[1].Classification)
 	}
 	selected := opportunities[0].Candidates[opportunities[0].SelectedIndex]
-	converted := new(big.Int).Mul(selected.BuyQuote.AmountOut.Units(), big.NewInt(100))
+	buySize, err := selected.Size.ToTokenAmount(market.Token{ID: "base-a", Asset: "base", Decimals: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	converted := new(big.Int).Mul(buySize.Units(), big.NewInt(100))
 	if selected.SellQuote.AmountIn.Units().Cmp(converted) != 0 {
-		t.Fatalf("cross-decimal conversion lost value: buy=%s sell=%s", selected.BuyQuote.AmountOut, selected.SellQuote.AmountIn)
+		t.Fatalf("cross-decimal size conversion lost value: size=%s sell=%s", selected.Size, selected.SellQuote.AmountIn)
+	}
+	if selected.BuyQuote.AmountOut.Units().Cmp(buySize.Units()) < 0 {
+		t.Fatalf("buy quote does not cover requested size: size=%s output=%s", buySize, selected.BuyQuote.AmountOut)
 	}
 	if selected.BuyQuote.SnapshotVersion != 1 || selected.SellQuote.SnapshotVersion != 1 {
 		t.Fatal("candidate did not preserve fixed snapshot versions")
@@ -53,13 +60,13 @@ func TestTwoMarketSeparatesEconomicClassifications(t *testing.T) {
 		cost      string
 		want      arbitrage.Classification
 	}{
-		{name: "cost consumes profit", threshold: "1", cost: "5", want: arbitrage.ClassificationObservedSpread},
-		{name: "below threshold", threshold: "4", cost: "0.5", want: arbitrage.ClassificationEconomic},
+		{name: "cost consumes profit", threshold: "1", cost: "10", want: arbitrage.ClassificationObservedSpread},
+		{name: "below threshold", threshold: "7", cost: "0.5", want: arbitrage.ClassificationEconomic},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newStrategyFixture(t, test.threshold, test.cost)
-			opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now, time.Second))
+			opportunities, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -70,15 +77,14 @@ func TestTwoMarketSeparatesEconomicClassifications(t *testing.T) {
 	}
 }
 
-func TestTwoMarketMarksStaleAndDegradedSnapshotsUnclassifiable(t *testing.T) {
+func TestTwoMarketUsesHealthySnapshotsWithoutAgeExpiry(t *testing.T) {
 	fixture := newStrategyFixture(t, "1", "0.5")
-	staleEvaluation := fixture.evaluation(t, fixture.snapshots, fixture.now.Add(10*time.Second), time.Second)
-	stale, err := fixture.strategy.Evaluate(context.Background(), staleEvaluation)
+	oldButHealthy, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now.Add(24*time.Hour)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stale[0].Classification != arbitrage.ClassificationUnclassifiable || stale[0].Reasons[0] != "stale_market_snapshot" {
-		t.Fatalf("unexpected stale result: %+v", stale[0])
+	if oldButHealthy[0].Classification == arbitrage.ClassificationUnclassifiable {
+		t.Fatalf("healthy snapshot expired by age: %+v", oldButHealthy[0])
 	}
 
 	degraded := fixture.snapshots[0].Metadata()
@@ -90,7 +96,7 @@ func TestTwoMarketMarksStaleAndDegradedSnapshotsUnclassifiable(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshots := []market.MarketSnapshot{degradedSnapshot, fixture.snapshots[1]}
-	results, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, snapshots, fixture.now, time.Second))
+	results, err := fixture.strategy.Evaluate(context.Background(), fixture.evaluation(t, snapshots, fixture.now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +121,7 @@ func newStrategyFixture(t *testing.T, thresholdText, costText string) strategyFi
 	if err != nil {
 		t.Fatal(err)
 	}
-	gridValues := []market.AssetQuantity{quantity(t, "10"), quantity(t, "20")}
+	gridValues := []market.AssetQuantity{baseQuantity(t, "10"), baseQuantity(t, "20")}
 	grid, err := sizing.NewGrid(gridValues)
 	if err != nil {
 		t.Fatal(err)
@@ -142,11 +148,11 @@ func newStrategyFixture(t *testing.T, thresholdText, costText string) strategyFi
 	}
 }
 
-func (f strategyFixture) evaluation(t *testing.T, snapshots []market.MarketSnapshot, started time.Time, maxAge time.Duration) arbitrage.Evaluation {
+func (f strategyFixture) evaluation(t *testing.T, snapshots []market.MarketSnapshot, started time.Time) arbitrage.Evaluation {
 	t.Helper()
 	evaluation, err := arbitrage.NewEvaluation(
 		"evaluation", "run", "strategy", "config-hash", snapshots, f.cost,
-		f.now, started, maxAge,
+		f.now, started,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +163,15 @@ func (f strategyFixture) evaluation(t *testing.T, snapshots []market.MarketSnaps
 func quantity(t *testing.T, text string) market.AssetQuantity {
 	t.Helper()
 	value, err := market.ParseAssetQuantity("quote", text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func baseQuantity(t *testing.T, text string) market.AssetQuantity {
+	t.Helper()
+	value, err := market.ParseAssetQuantity("base", text)
 	if err != nil {
 		t.Fatal(err)
 	}
