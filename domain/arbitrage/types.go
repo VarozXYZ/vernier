@@ -80,6 +80,8 @@ type Evaluation struct {
 	configHash  string
 	snapshots   []market.MarketSnapshot
 	cost        CostSnapshot
+	trigger     TriggerMetadata
+	hasTrigger  bool
 	triggeredAt time.Time
 	startedAt   time.Time
 }
@@ -119,6 +121,19 @@ func (e Evaluation) ConfigHash() string     { return e.configHash }
 func (e Evaluation) Cost() CostSnapshot     { return e.cost }
 func (e Evaluation) TriggeredAt() time.Time { return e.triggeredAt }
 func (e Evaluation) StartedAt() time.Time   { return e.startedAt }
+func (e Evaluation) Trigger() (TriggerMetadata, bool) {
+	return e.trigger, e.hasTrigger
+}
+
+// WithTrigger returns an evaluation carrying the feed event that caused it.
+// Point-in-time evaluations intentionally have no trigger. The copy keeps the
+// evaluation immutable to strategies and persistence consumers.
+func (e Evaluation) WithTrigger(trigger TriggerMetadata) Evaluation {
+	trigger.At = trigger.At.UTC()
+	return Evaluation{id: e.id, run: e.run, strategy: e.strategy, configHash: e.configHash,
+		snapshots: append([]market.MarketSnapshot(nil), e.snapshots...), cost: e.cost,
+		trigger: trigger, hasTrigger: true, triggeredAt: e.triggeredAt, startedAt: e.startedAt}
+}
 func (e Evaluation) Snapshots() []market.MarketSnapshot {
 	return append([]market.MarketSnapshot(nil), e.snapshots...)
 }
@@ -167,6 +182,8 @@ type Opportunity struct {
 	SelectedIndex  int
 	Threshold      market.AssetQuantity
 	Reasons        []string
+	Trigger        TriggerMetadata
+	HasTrigger     bool
 	TriggeredAt    time.Time
 	StartedAt      time.Time
 	FinishedAt     time.Time

@@ -115,6 +115,7 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 		Classification: arbitrage.ClassificationUnclassifiable, SelectedIndex: -1,
 		Threshold: s.threshold, TriggeredAt: evaluation.TriggeredAt(), StartedAt: evaluation.StartedAt(),
 	}
+	opportunity.Trigger, opportunity.HasTrigger = evaluation.Trigger()
 	buySnapshot, buyOK := evaluation.Snapshot(direction.BuyMarket)
 	sellSnapshot, sellOK := evaluation.Snapshot(direction.SellMarket)
 	if !buyOK || !sellOK {
