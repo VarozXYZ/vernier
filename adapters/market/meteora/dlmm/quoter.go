@@ -73,7 +73,7 @@ func (q *Quoter) state(snapshot market.MarketSnapshot) (Snapshot, error) {
 	}
 	state, ok := snapshot.Data().(Snapshot)
 	if !ok || state.schemaVersion != snapshotSchemaVersion {
-		return Snapshot{}, fmt.Errorf("incompatible Meteora DLMM snapshot %T", snapshot.Data())
+		return Snapshot{}, fmt.Errorf("incompatible meteora DLMM snapshot %T", snapshot.Data())
 	}
 	return state, nil
 }
@@ -98,7 +98,7 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 		}
 	}
 	if len(result) == 0 {
-		return nil, fmt.Errorf("Meteora DLMM has no active liquidity")
+		return nil, fmt.Errorf("meteora DLMM has no active liquidity")
 	}
 	return result, nil
 }

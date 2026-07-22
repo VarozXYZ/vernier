@@ -88,7 +88,7 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 		return nil, fmt.Errorf("unsupported Whirlpool token direction")
 	}
 	if state.liquidity.Sign() <= 0 {
-		return nil, fmt.Errorf("Whirlpool has no active liquidity")
+		return nil, fmt.Errorf("whirlpool has no active liquidity")
 	}
 	q64Value := new(big.Int).Lsh(big.NewInt(1), uint(q64))
 	reserveA := new(big.Int).Mul(state.liquidity, q64Value)
@@ -96,7 +96,7 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 	reserveB := new(big.Int).Mul(state.liquidity, state.sqrtPriceX64)
 	reserveB.Quo(reserveB, q64Value)
 	if reserveA.Sign() <= 0 || reserveB.Sign() <= 0 {
-		return nil, fmt.Errorf("Whirlpool virtual reserves round to zero")
+		return nil, fmt.Errorf("whirlpool virtual reserves round to zero")
 	}
 	if tokenIn == q.tokenA {
 		return []liquiditycurve.Segment{{In: reserveA, Out: reserveB}}, nil

@@ -66,7 +66,7 @@ type referenceKey struct {
 
 func New(config Config) (*Source, error) {
 	if config.ID == "" || config.Taker == "" || config.Local == nil || len(config.TokenMints) == 0 {
-		return nil, fmt.Errorf("Jupiter source requires id, public taker, token mints, and local source")
+		return nil, fmt.Errorf("jupiter source requires id, public taker, token mints, and local source")
 	}
 	if config.BaseURL == "" {
 		config.BaseURL = DefaultBaseURL
@@ -86,7 +86,7 @@ func New(config Config) (*Source, error) {
 	mints := make(map[market.TokenID]string, len(config.TokenMints))
 	for token, mint := range config.TokenMints {
 		if token == "" || strings.TrimSpace(mint) == "" {
-			return nil, fmt.Errorf("Jupiter token mint mapping is incomplete")
+			return nil, fmt.Errorf("jupiter token mint mapping is incomplete")
 		}
 		mints[token] = mint
 	}
