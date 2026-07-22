@@ -24,7 +24,16 @@ import (
 type StreamOptions struct {
 	Updates          int
 	OnReport         func(Report) error
+	OnReference      func(ReferenceReport) error
 	OpportunityStore persistence.OpportunityStore
+}
+
+// ReferenceReport is emitted independently from the local report. This keeps
+// the external HTTP call off the event loop while preserving a clear causal
+// link to the evaluation that selected the size.
+type ReferenceReport struct {
+	Evaluation  int
+	Comparisons []ReferenceComparison
 }
 
 type streamMarket struct {
@@ -51,6 +60,9 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 	if options.OnReport == nil {
 		options.OnReport = func(Report) error { return nil }
 	}
+	if options.OnReference == nil {
+		options.OnReference = func(ReferenceReport) error { return nil }
+	}
 	r.logger.Info("continuous research started", "run", r.config.RunID, "markets", len(r.config.Markets), "updates", options.Updates)
 	blocks, err := r.currentBlocks(ctx)
 	if err != nil {
@@ -67,9 +79,14 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 	}
 	markets := make(map[market.MarketID]*streamMarket, len(r.config.Markets))
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
+	referenceSources := make(map[market.MarketID]quoteport.ExternalReferenceSource, len(r.config.Markets))
 	now := r.clock().UTC()
 	for _, configured := range r.config.Markets {
 		candidate, composeErr := r.composeMarket(configured, registry, maximum)
+		if composeErr != nil {
+			return composeErr
+		}
+		candidate.reference, composeErr = r.externalSource(configured, candidate.source)
 		if composeErr != nil {
 			return composeErr
 		}
@@ -90,6 +107,9 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 		}
 		markets[configured.ID] = &streamMarket{runtime: candidate, mirror: mirror, feed: feed}
 		sources[configured.ID] = candidate.source
+		if candidate.reference != nil {
+			referenceSources[configured.ID] = candidate.reference
+		}
 	}
 	r.logger.Info("stream markets composed", "markets", len(markets))
 	costEvidence, cost, err := r.cost(ctx, blocks, now)
@@ -137,6 +157,8 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 		cancel()
 		feedWG.Wait()
 	}()
+	var referenceWG sync.WaitGroup
+	defer referenceWG.Wait()
 
 	evaluations := 0
 	for {
@@ -191,7 +213,26 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 			if callbackErr := options.OnReport(report); callbackErr != nil {
 				return callbackErr
 			}
-			r.logger.Info("stream evaluation emitted", "evaluation", evaluations+1, "opportunities", len(research.Opportunities), "status", research.Status)
+			referenceEvaluation := evaluations + 1
+			referenceSnapshots := append([]market.MarketSnapshot(nil), snapshots...)
+			referenceOpportunities := append([]arbitrage.Opportunity(nil), research.Opportunities...)
+			availableReferences := r.referenceSourcesFor(sources)
+			for id, source := range referenceSources {
+				availableReferences[id] = source
+			}
+			if len(referenceSources) > 0 || len(r.referenceSources) > 0 {
+				r.logger.Debug("stream external reference validation started", "evaluation", referenceEvaluation)
+				referenceWG.Add(1)
+				go func() {
+					defer referenceWG.Done()
+					comparisons := validateReferences(ctx, referenceOpportunities, referenceSnapshots, availableReferences, research, r.clock)
+					r.logger.Info("stream external reference validation complete", "evaluation", referenceEvaluation, "checks", len(comparisons))
+					if callbackErr := options.OnReference(ReferenceReport{Evaluation: referenceEvaluation, Comparisons: comparisons}); callbackErr != nil {
+						r.logger.Error("stream external reference output failed", "evaluation", referenceEvaluation, "error", callbackErr)
+					}
+				}()
+			}
+			r.logger.Info("stream evaluation emitted", "evaluation", evaluations+1, "opportunities", len(research.Opportunities), "status", research.Status, "local_duration", research.LocalTiming.Duration)
 			evaluations++
 			if options.Updates > 0 && evaluations >= options.Updates {
 				return nil

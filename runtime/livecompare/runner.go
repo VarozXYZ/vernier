@@ -23,6 +23,7 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
 	"github.com/VarozXYZ/vernier/adapters/price/chainlink"
 	"github.com/VarozXYZ/vernier/adapters/price/coingecko"
+	"github.com/VarozXYZ/vernier/adapters/quote/jupiter"
 	"github.com/VarozXYZ/vernier/core/costing"
 	"github.com/VarozXYZ/vernier/core/marketstate"
 	"github.com/VarozXYZ/vernier/core/sizing"
@@ -46,17 +47,21 @@ type Options struct {
 	LookupEnv      configuration.LookupEnv
 	PriceClient    coingecko.Client
 	SolanaNetworks SolanaNetworks
-	Logger         *slog.Logger
+	// ReferenceSources are optional providers used only after local sizing has
+	// selected one candidate. They never participate in local evaluation.
+	ReferenceSources map[market.MarketID]quoteport.ExternalReferenceSource
+	Logger           *slog.Logger
 }
 
 type Runner struct {
-	config         configuration.ParsedConfig
-	networks       Networks
-	clock          func() time.Time
-	lookup         configuration.LookupEnv
-	client         coingecko.Client
-	solanaNetworks SolanaNetworks
-	logger         *slog.Logger
+	config           configuration.ParsedConfig
+	networks         Networks
+	clock            func() time.Time
+	lookup           configuration.LookupEnv
+	client           coingecko.Client
+	solanaNetworks   SolanaNetworks
+	referenceSources map[market.MarketID]quoteport.ExternalReferenceSource
+	logger           *slog.Logger
 }
 
 type CostEvidence struct {
@@ -78,19 +83,21 @@ type ParityEvidence struct {
 }
 
 type Report struct {
-	Research runtimeresearch.Report
-	Cost     CostEvidence
-	Parity   []ParityEvidence
+	Research  runtimeresearch.Report
+	Cost      CostEvidence
+	Parity    []ParityEvidence
+	Reference []ReferenceComparison
 }
 
 type marketRuntime struct {
-	config   configuration.ResolvedMarket
-	snapshot market.MarketSnapshot
-	venue    evmlogs.Venue
-	reducer  marketstate.Reducer
-	source   quoteport.Source
-	exactIn  referenceQuote
-	exactOut referenceQuote
+	config    configuration.ResolvedMarket
+	snapshot  market.MarketSnapshot
+	venue     evmlogs.Venue
+	reducer   marketstate.Reducer
+	source    quoteport.Source
+	reference quoteport.ExternalReferenceSource
+	exactIn   referenceQuote
+	exactOut  referenceQuote
 }
 
 type referenceQuote func(context.Context, evm.BlockReference, market.MarketSnapshot, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
@@ -123,7 +130,7 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		}
 		limited[id] = wrapped
 	}
-	return &Runner{config: config, networks: limited, solanaNetworks: options.SolanaNetworks, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
+	return &Runner{config: config, networks: limited, solanaNetworks: options.SolanaNetworks, referenceSources: options.ReferenceSources, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
@@ -145,6 +152,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	}
 	runtimes := make([]marketRuntime, 0, len(r.config.Markets))
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
+	referenceSources := make(map[market.MarketID]quoteport.ExternalReferenceSource, len(r.config.Markets))
 	snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
 	for _, configured := range r.config.Markets {
 		r.logger.Info("bootstrapping market", "market", configured.ID, "chain", configured.Venue.Chain, "venue", configured.Venue.Kind, "block", blocks[configured.Venue.Chain].Number)
@@ -157,6 +165,9 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		r.logger.Info("market bootstrap complete", "market", configured.ID, "version", candidate.snapshot.Metadata().Version, "duration", time.Since(marketStarted))
 		runtimes = append(runtimes, candidate)
 		sources[configured.ID] = candidate.source
+		if candidate.reference != nil {
+			referenceSources[configured.ID] = candidate.reference
+		}
 		snapshots = append(snapshots, candidate.snapshot)
 	}
 	r.logger.Info("market bootstraps complete", "snapshots", len(snapshots))
@@ -175,8 +186,15 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	r.logger.Info("local research evaluation complete", "opportunities", len(researchReport.Opportunities))
+	r.logger.Info("local research evaluation complete", "opportunities", len(researchReport.Opportunities), "duration", researchReport.LocalTiming.Duration)
 	report := Report{Research: researchReport, Cost: costEvidence}
+	availableReferences := r.referenceSourcesFor(sources)
+	for id, source := range referenceSources {
+		availableReferences[id] = source
+	}
+	r.logger.Info("external reference validation started", "checks", len(researchReport.Opportunities))
+	report.Reference = validateReferences(ctx, researchReport.Opportunities, snapshots, availableReferences, researchReport, r.clock)
+	r.logger.Info("external reference validation complete", "checks", len(report.Reference))
 	r.logger.Info("parity validation started")
 	parityStarted := time.Now()
 	report.Parity, err = validateParity(ctx, researchReport.Opportunities, runtimes)
@@ -186,6 +204,19 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 	}
 	r.logger.Info("parity validation complete", "checks", len(report.Parity), "duration", time.Since(parityStarted))
 	return report, nil
+}
+
+func (r *Runner) referenceSourcesFor(local map[market.MarketID]quoteport.Source) map[market.MarketID]quoteport.Source {
+	result := make(map[market.MarketID]quoteport.Source, len(local)+len(r.referenceSources))
+	for id, source := range local {
+		result[id] = source
+	}
+	for id, source := range r.referenceSources {
+		if source != nil {
+			result[id] = source
+		}
+	}
+	return result
 }
 
 func (r *Runner) currentBlocks(ctx context.Context) (map[string]evm.BlockReference, error) {
@@ -244,7 +275,7 @@ func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCros
 	if trigger != nil {
 		evaluation = evaluation.WithTrigger(*trigger)
 	}
-	opportunities, err := candidate.Evaluate(ctx, evaluation)
+	opportunities, localTiming, err := candidate.EvaluateWithTiming(ctx, evaluation)
 	if err != nil {
 		return runtimeresearch.Report{}, err
 	}
@@ -257,12 +288,16 @@ func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCros
 	}
 	return runtimeresearch.Report{
 		RunID: arbitrage.ResearchRunID(r.config.RunID), ConfigHash: r.config.Hash,
-		Status: status, Evaluations: 1, Opportunities: opportunities,
+		Status: status, Evaluations: 1, Opportunities: opportunities, LocalTiming: localTiming,
 	}, nil
 }
 
 func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.ResolvedMarket, registry *market.Registry, block evm.BlockReference, maximum market.AssetQuantity, now time.Time) (marketRuntime, error) {
 	candidate, err := r.composeMarket(configured, registry, maximum)
+	if err != nil {
+		return marketRuntime{}, err
+	}
+	candidate.reference, err = r.externalSource(configured, candidate.source)
 	if err != nil {
 		return marketRuntime{}, err
 	}
@@ -279,6 +314,32 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 	}
 	candidate.snapshot = snapshot
 	return candidate, nil
+}
+
+func (r *Runner) externalSource(configured configuration.ResolvedMarket, local quoteport.Source) (quoteport.ExternalReferenceSource, error) {
+	if configured.ReferenceQuote == "" {
+		return nil, nil
+	}
+	profile, ok := r.config.QuoteSources[configured.ReferenceQuote]
+	if !ok {
+		return nil, fmt.Errorf("market %q references unknown quote source %q", configured.ID, configured.ReferenceQuote)
+	}
+	taker, ok := r.lookup(profile.TakerEnv)
+	if !ok || strings.TrimSpace(taker) == "" {
+		return nil, fmt.Errorf("quote source %q taker environment %q is unset", profile.ID, profile.TakerEnv)
+	}
+	apiKey := ""
+	if profile.APIKeyEnv != "" {
+		apiKey, _ = r.lookup(profile.APIKeyEnv)
+	}
+	mints := make(map[market.TokenID]string)
+	for _, hop := range configured.Path {
+		mints[hop.In.Token.ID] = hop.In.AddressText
+		mints[hop.Out.Token.ID] = hop.Out.AddressText
+	}
+	mints[configured.Base.Token.ID] = configured.Base.AddressText
+	mints[configured.Quote.Token.ID] = configured.Quote.AddressText
+	return jupiter.New(jupiter.Config{ID: market.SourceID(profile.ID), BaseURL: profile.BaseURL, Taker: taker, SlippageBPS: profile.SlippageBPS, MaxAccounts: profile.MaxAccounts, APIKey: apiKey, TokenMints: mints, Local: local, Clock: r.clock})
 }
 
 func (r *Runner) composeMarket(configured configuration.ResolvedMarket, registry *market.Registry, maximum market.AssetQuantity) (marketRuntime, error) {
