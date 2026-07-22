@@ -37,7 +37,7 @@ func (q *Quoter) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	if err != nil {
 		return market.Quote{}, err
 	}
-	amountOut, fee, err := liquiditycurve.ExactInput(segments, input.AmountIn.Units(), state.feeBPS)
+	amountOut, fee, err := liquiditycurve.ExactInputRate(segments, input.AmountIn.Units(), state.feeRate)
 	if err != nil {
 		return market.Quote{}, err
 	}
@@ -56,7 +56,7 @@ func (q *Quoter) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 	if err != nil {
 		return market.Quote{}, err
 	}
-	amountIn, fee, err := liquiditycurve.ExactOutput(segments, input.AmountOut.Units(), state.feeBPS)
+	amountIn, fee, err := liquiditycurve.ExactOutputRate(segments, input.AmountOut.Units(), state.feeRate)
 	if err != nil {
 		return market.Quote{}, err
 	}
@@ -85,8 +85,12 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 	result := make([]liquiditycurve.Segment, 0, len(state.bins))
 	scale := new(big.Int).Lsh(big.NewInt(1), priceScaleBits)
 	if tokenIn == q.tokenX {
-		for _, bin := range state.bins {
-			if bin.id < state.activeID {
+		// Meteora's swap_for_y direction consumes the active bin and then
+		// decrements active_id. The official SDK therefore walks toward lower
+		// bin IDs when X is sold for Y.
+		for i := len(state.bins) - 1; i >= 0; i-- {
+			bin := state.bins[i]
+			if bin.id > state.activeID {
 				continue
 			}
 			if bin.reserveY.Sign() > 0 {
@@ -97,9 +101,10 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 			}
 		}
 	} else {
-		for i := len(state.bins) - 1; i >= 0; i-- {
-			bin := state.bins[i]
-			if bin.id > state.activeID {
+		// The opposite direction increments active_id and consumes higher
+		// bins after the active bin.
+		for _, bin := range state.bins {
+			if bin.id < state.activeID {
 				continue
 			}
 			if bin.reserveX.Sign() > 0 {
