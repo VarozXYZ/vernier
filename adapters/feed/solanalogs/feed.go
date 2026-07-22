@@ -269,6 +269,7 @@ func (f *Feed) runAccountSession(ctx context.Context, sink feedport.Sink, decode
 	if err := sink.SetHealth(ctx, feedport.HealthUpdate{Health: market.HealthHealthy, ObservedAt: f.clock().UTC()}); err != nil {
 		return false, false, err
 	}
+	f.logger.Info("feed bootstrap applied", "market", f.market, "slot", slot)
 	addresses := decoder.AccountSubscriptions()
 	programDecoder, programNetwork := f.programMode()
 	programRequests := []solana.ProgramSubscriptionRequest(nil)
@@ -330,6 +331,7 @@ func (f *Feed) runAccountSession(ctx context.Context, sink feedport.Sink, decode
 			if update.slot < highest {
 				continue
 			}
+			f.logger.Debug("feed account event received", "market", f.market, "account", update.account, "slot", update.slot)
 			started := time.Now()
 			var data []market.EventData
 			var decodeErr error

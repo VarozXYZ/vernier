@@ -130,6 +130,7 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 			if !ready {
 				continue
 			}
+			r.logger.Info("route evaluation started", "triggered_at", signal.triggered, "snapshots", routeSnapshotSummary(snapshots))
 			research, err := r.evaluate(runCtx, strategy, snapshots, cost, fmt.Sprintf("route-stream/%s/%d", r.config.ResearchID, evaluations+1), signal.triggered, triggerPointer(signal))
 			if err != nil {
 				return err
@@ -146,15 +147,18 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 			if err := options.OnReport(report); err != nil {
 				return err
 			}
+			r.logger.Info("route evaluation emitted", "evaluation", evaluations+1, "opportunities", len(research.Opportunities), "status", research.Status, "local_duration", research.LocalTiming.Duration)
 			if r.referencesEnabled() && (len(r.config.QuoteSources) > 0 || len(r.referenceSources) > 0) {
 				referenceEvaluation := evaluations + 1
 				referenceSnapshots := append([]market.MarketSnapshot(nil), snapshots...)
 				referenceOpportunities := append([]arbitrage.Opportunity(nil), research.Opportunities...)
 				available := r.referenceSourcesFor(sources)
 				references.Add(1)
+				r.logger.Debug("route external reference validation started", "evaluation", referenceEvaluation)
 				go func() {
 					defer references.Done()
 					comparisons := validateReferences(ctx, referenceOpportunities, referenceSnapshots, available, research, r.clock)
+					r.logger.Info("route external reference validation complete", "evaluation", referenceEvaluation, "checks", len(comparisons))
 					if options.OnReference != nil {
 						_ = options.OnReference(ReferenceReport{Evaluation: referenceEvaluation, Comparisons: comparisons})
 					}
@@ -174,6 +178,15 @@ func routeHopCount(routes map[market.MarketID]routeRuntime) int {
 		count += len(route.children)
 	}
 	return count
+}
+
+func routeSnapshotSummary(snapshots []market.MarketSnapshot) map[string]any {
+	result := make(map[string]any, len(snapshots))
+	for _, snapshot := range snapshots {
+		metadata := snapshot.Metadata()
+		result[string(metadata.Market)] = map[string]any{"version": metadata.Version, "slot": metadata.EventPosition.Value, "health": metadata.Health}
+	}
+	return result
 }
 
 type routeStreamSink struct {
