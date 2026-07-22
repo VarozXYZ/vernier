@@ -101,7 +101,7 @@ func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions
 				return err
 			}
 			for _, hop := range quote.Hops {
-				if _, err := fmt.Fprintf(writer, "local_hop %s duration=%s cached=%t\n", hop.Market, hop.Duration, hop.Cached); err != nil {
+				if _, err := fmt.Fprintf(writer, "local_hop %s input_raw=%s output_raw=%s duration=%s cached=%t\n", hop.Market, hop.AmountIn, hop.AmountOut, hop.Duration, hop.Cached); err != nil {
 					return err
 				}
 			}

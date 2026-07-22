@@ -55,6 +55,10 @@ func TestRouteCacheReusesUnchangedHop(t *testing.T) {
 	if first.calls.Load() != 1 || second.calls.Load() != 1 {
 		t.Fatalf("cache calls first=%d second=%d", first.calls.Load(), second.calls.Load())
 	}
+	trace := source.LastTiming()
+	if !trace.Cached || len(trace.Hops) != 2 || !trace.Hops[0].Cached || !trace.Hops[1].Cached {
+		t.Fatalf("cached route did not preserve hop trace: %+v", trace)
+	}
 	changedSecond := snapshot(t, "hop2", 2, 3)
 	input.Snapshot = routeSnapshot(t, firstSnapshot, changedSecond)
 	if _, err := source.Quote(context.Background(), input); err != nil {
@@ -63,7 +67,7 @@ func TestRouteCacheReusesUnchangedHop(t *testing.T) {
 	if first.calls.Load() != 1 || second.calls.Load() != 2 {
 		t.Fatalf("per-hop invalidation calls first=%d second=%d", first.calls.Load(), second.calls.Load())
 	}
-	trace := source.LastTiming()
+	trace = source.LastTiming()
 	if len(trace.Hops) != 2 || !trace.Hops[0].Cached || trace.Hops[1].Cached || trace.Duration < 0 {
 		t.Fatalf("unexpected per-hop timing after invalidation: %+v", trace)
 	}

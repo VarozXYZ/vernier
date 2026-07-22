@@ -98,6 +98,16 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	return s.local.Quote(ctx, input)
 }
 
+// LastTiming preserves the local route trace when Jupiter is composed as an
+// external validation wrapper. The wrapper must not hide per-hop diagnostics
+// from the research report.
+func (s *Source) LastTiming() quoteport.Timing {
+	if traced, ok := s.local.(quoteport.TimingSource); ok {
+		return traced.LastTiming()
+	}
+	return quoteport.Timing{}
+}
+
 func (s *Source) QuoteWithReference(ctx context.Context, input quoteport.Input) (quoteport.ReferenceResult, error) {
 	local, err := s.local.Quote(ctx, input)
 	if err != nil {

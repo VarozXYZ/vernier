@@ -212,9 +212,11 @@ type quoteTiming struct {
 }
 
 type hopTiming struct {
-	Market   string `json:"market"`
-	Duration string `json:"duration"`
-	Cached   bool   `json:"cached"`
+	Market    string `json:"market"`
+	Duration  string `json:"duration"`
+	Cached    bool   `json:"cached"`
+	AmountIn  string `json:"amount_in,omitempty"`
+	AmountOut string `json:"amount_out,omitempty"`
 }
 
 func newReportDTO(report Report) reportDTO {
@@ -274,7 +276,7 @@ func hopTimings(values []quoteport.HopTiming) []hopTiming {
 	}
 	result := make([]hopTiming, 0, len(values))
 	for _, value := range values {
-		result = append(result, hopTiming{Market: string(value.Market), Duration: value.Duration.String(), Cached: value.Cached})
+		result = append(result, hopTiming{Market: string(value.Market), Duration: value.Duration.String(), Cached: value.Cached, AmountIn: value.AmountIn, AmountOut: value.AmountOut})
 	}
 	return result
 }
