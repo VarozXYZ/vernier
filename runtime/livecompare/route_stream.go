@@ -29,10 +29,9 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 	if err != nil {
 		return err
 	}
-	slots, err := r.currentSlots(ctx)
-	if err != nil {
-		return err
-	}
+	// Route-stream feeds own the current-state bootstrap. Building a route must
+	// not perform a second synchronous bootstrap before those feeds start.
+	slots := map[string]uint64{}
 	registry, setup, err := r.registry()
 	if err != nil {
 		return err
@@ -45,7 +44,7 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	now := r.clock().UTC()
 	for _, configured := range r.config.Markets {
-		route, err := r.buildRoute(ctx, configured, registry, maximum, blocks, slots, now)
+		route, err := r.buildRoute(ctx, configured, registry, maximum, blocks, slots, now, false)
 		if err != nil {
 			return err
 		}

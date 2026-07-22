@@ -72,7 +72,7 @@ func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
 	referenceSources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
 	for _, configured := range r.config.Markets {
-		route, err := r.buildRoute(ctx, configured, registry, maximum, blocks, slots, startedAt)
+		route, err := r.buildRoute(ctx, configured, registry, maximum, blocks, slots, startedAt, true)
 		if err != nil {
 			return Report{}, fmt.Errorf("bootstrap route %s: %w", configured.ID, err)
 		}
@@ -127,7 +127,7 @@ func (r *Runner) currentSlots(ctx context.Context) (map[string]uint64, error) {
 	return slots, nil
 }
 
-func (r *Runner) buildRoute(ctx context.Context, configured configuration.ResolvedMarket, registry *market.Registry, maximum market.AssetQuantity, blocks map[string]evm.BlockReference, slots map[string]uint64, now time.Time) (routeRuntime, error) {
+func (r *Runner) buildRoute(ctx context.Context, configured configuration.ResolvedMarket, registry *market.Registry, maximum market.AssetQuantity, blocks map[string]evm.BlockReference, slots map[string]uint64, now time.Time, bootstrap bool) (routeRuntime, error) {
 	candidate, ok := registry.Market(configured.ID)
 	if !ok {
 		return routeRuntime{}, fmt.Errorf("registry is missing route market")
@@ -148,6 +148,9 @@ func (r *Runner) buildRoute(ctx context.Context, configured configuration.Resolv
 	route, err := crosschain.NewRoute(candidate, market.SourceID(string(configured.Venue.Chain)+"/route"), routeChildren, func() time.Time { return r.clock().UTC() })
 	if err != nil {
 		return routeRuntime{}, err
+	}
+	if !bootstrap {
+		return routeRuntime{config: configured, route: route, children: children}, nil
 	}
 	for index := range children {
 		data, position, reference, err := children[index].bootstrap(ctx)
