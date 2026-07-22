@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
@@ -131,6 +132,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		return 2
 	}
 	if *stream {
+		var outputMu sync.Mutex
 		var opportunityStore persistence.OpportunityStore
 		if strings.TrimSpace(*opportunityStorePath) != "" {
 			opportunityStore, err = sqlitepersistence.Open(*opportunityStorePath)
@@ -144,11 +146,21 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		err = runner.RunStream(ctx, livecompare.StreamOptions{
 			Updates: *updates, OpportunityStore: opportunityStore,
 			OnReport: func(report livecompare.Report) error {
+				outputMu.Lock()
+				defer outputMu.Unlock()
 				options := livecompare.OutputOptions{Calculations: livecompare.CalculationDetail(*calculations)}
 				if *format == "jsonl" {
 					return livecompare.WriteJSONLineWithOptions(stdout, report, options)
 				}
 				return livecompare.WriteTextWithOptions(stdout, report, options)
+			},
+			OnReference: func(report livecompare.ReferenceReport) error {
+				outputMu.Lock()
+				defer outputMu.Unlock()
+				if *format == "jsonl" {
+					return livecompare.WriteReferenceJSONLine(stdout, report)
+				}
+				return livecompare.WriteReferenceText(stdout, report)
 			},
 		})
 	} else {

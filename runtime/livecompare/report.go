@@ -54,12 +54,27 @@ func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions
 	}
 	if _, err := fmt.Fprintf(
 		writer,
-		"inventory: prepositioned\nfixed_cost: %s %s\nprice: %s %s/%s\nprice_source: %s\nmodeled_cost: %s %s\nparity_checks: %d\n",
+		"inventory: prepositioned\nfixed_cost: %s %s\nprice: %s %s/%s\nprice_source: %s\nmodeled_cost: %s %s\nlocal_evaluation_duration: %s\nexternal_reference_checks: %d\nparity_checks: %d\n",
 		report.Cost.FixedAmount.FloatString(6), report.Cost.FixedAsset,
 		report.Cost.Price.Value().FloatString(8), report.Cost.Price.Base(), report.Cost.Price.Quote(),
-		report.Cost.Price.Source(), report.Cost.Cost.Decimal(18), report.Cost.Cost.Asset(), len(report.Parity),
+		report.Cost.Price.Source(), report.Cost.Cost.Decimal(18), report.Cost.Cost.Asset(), report.Research.LocalTiming.Duration, len(report.Reference), len(report.Parity),
 	); err != nil {
 		return err
+	}
+	for _, direction := range report.Research.LocalTiming.Directions {
+		if _, err := fmt.Fprintf(writer, "local_direction %s->%s duration=%s\n", direction.Direction.BuyMarket, direction.Direction.SellMarket, direction.Duration); err != nil {
+			return err
+		}
+		for _, quote := range direction.Quotes {
+			if _, err := fmt.Fprintf(writer, "local_quote %s leg=%s mode=%s duration=%s cached=%t\n", quote.Market, quote.Leg, quote.Mode, quote.Duration, quote.Cached); err != nil {
+				return err
+			}
+			for _, hop := range quote.Hops {
+				if _, err := fmt.Fprintf(writer, "local_hop %s duration=%s cached=%t\n", hop.Market, hop.Duration, hop.Cached); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	for _, opportunity := range report.Research.Opportunities {
 		for index, candidate := range opportunity.Candidates {
@@ -92,13 +107,21 @@ func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions
 			return err
 		}
 	}
+	for _, value := range report.Reference {
+		if _, err := fmt.Fprintf(writer, "reference %s->%s leg=%s provider=%s status=%s local_out=%s reference_out=%s delta_raw=%s local_quote=%s reference_latency=%s total=%s\n",
+			value.Direction.BuyMarket, value.Direction.SellMarket, value.Leg, value.Provider, value.Status,
+			value.LocalOutput.String(), value.ReferenceOutput.String(), value.OutputDeltaRaw,
+			value.LocalQuoteDuration, value.ReferenceLatency, value.TotalDuration); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func writeTextSummary(writer io.Writer, report Report) error {
-	if _, err := fmt.Fprintf(writer, "evaluation: %d\nstatus: %s\nopportunities: %d\ncost: %s %s via %s\nparity_checks: %d\n",
+	if _, err := fmt.Fprintf(writer, "evaluation: %d\nstatus: %s\nopportunities: %d\ncost: %s %s via %s\nlocal_evaluation_duration: %s\nexternal_reference_checks: %d\nparity_checks: %d\n",
 		report.Research.Evaluations, report.Research.Status, len(report.Research.Opportunities),
-		report.Cost.Cost.Decimal(6), report.Cost.Cost.Asset(), report.Cost.Price.Source(), len(report.Parity)); err != nil {
+		report.Cost.Cost.Decimal(6), report.Cost.Cost.Asset(), report.Cost.Price.Source(), report.Research.LocalTiming.Duration, len(report.Reference), len(report.Parity)); err != nil {
 		return err
 	}
 	for _, opportunity := range report.Research.Opportunities {
@@ -146,6 +169,40 @@ func WriteJSONLineWithOptions(writer io.Writer, report Report, options OutputOpt
 	return writeJSON(writer, report, false, options.Calculations)
 }
 
+// WriteReferenceJSONLine writes the asynchronous external-validation record
+// emitted after a stream's local report.
+func WriteReferenceJSONLine(writer io.Writer, report ReferenceReport) error {
+	payload := struct {
+		SchemaVersion int            `json:"schema_version"`
+		Kind          string         `json:"kind"`
+		Evaluation    int            `json:"evaluation"`
+		Comparisons   []referenceDTO `json:"comparisons"`
+	}{SchemaVersion: 1, Kind: "external_reference", Evaluation: report.Evaluation, Comparisons: make([]referenceDTO, 0, len(report.Comparisons))}
+	for _, value := range report.Comparisons {
+		payload.Comparisons = append(payload.Comparisons, referenceDTOFrom(value))
+	}
+	encoder := json.NewEncoder(writer)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(payload)
+}
+
+// WriteReferenceText is the human-readable counterpart of
+// WriteReferenceJSONLine.
+func WriteReferenceText(writer io.Writer, report ReferenceReport) error {
+	if _, err := fmt.Fprintf(writer, "external_reference evaluation=%d checks=%d\n", report.Evaluation, len(report.Comparisons)); err != nil {
+		return err
+	}
+	for _, value := range report.Comparisons {
+		if _, err := fmt.Fprintf(writer, "reference %s->%s leg=%s provider=%s status=%s local_out=%s reference_out=%s delta_raw=%s local_quote=%s reference_latency=%s total=%s\n",
+			value.Direction.BuyMarket, value.Direction.SellMarket, value.Leg, value.Provider, value.Status,
+			value.LocalOutput.String(), value.ReferenceOutput.String(), value.OutputDeltaRaw,
+			value.LocalQuoteDuration, value.ReferenceLatency, value.TotalDuration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func writeJSON(writer io.Writer, report Report, indent bool, detail CalculationDetail) error {
 	if detail == CalculationSummary {
 		return writeJSONSummary(writer, report)
@@ -159,6 +216,7 @@ func writeJSON(writer io.Writer, report Report, indent bool, detail CalculationD
 		Research      json.RawMessage `json:"research"`
 		Cost          costDTO         `json:"cost_evidence"`
 		Parity        []parityDTO     `json:"parity"`
+		Reference     []referenceDTO  `json:"external_reference"`
 	}{
 		SchemaVersion: 1,
 		Research:      json.RawMessage(bytes.TrimSpace(researchJSON.Bytes())),
@@ -170,7 +228,8 @@ func writeJSON(writer io.Writer, report Report, indent bool, detail CalculationD
 			PriceReference: report.Cost.Price.Reference(), PriceUpdatedAt: report.Cost.Price.SourceUpdatedAt(),
 			PriceObservedAt: report.Cost.Price.ObservedAt(),
 		},
-		Parity: make([]parityDTO, 0, len(report.Parity)),
+		Parity:    make([]parityDTO, 0, len(report.Parity)),
+		Reference: make([]referenceDTO, 0, len(report.Reference)),
 	}
 	for _, value := range report.Parity {
 		payload.Parity = append(payload.Parity, parityDTO{
@@ -180,6 +239,9 @@ func writeJSON(writer io.Writer, report Report, indent bool, detail CalculationD
 			ReferenceOut: value.ReferenceOut.String(), Matches: value.Matches,
 		})
 	}
+	for _, value := range report.Reference {
+		payload.Reference = append(payload.Reference, referenceDTOFrom(value))
+	}
 	encoder := json.NewEncoder(writer)
 	if indent {
 		encoder.SetIndent("", "  ")
@@ -188,14 +250,28 @@ func writeJSON(writer io.Writer, report Report, indent bool, detail CalculationD
 	return encoder.Encode(payload)
 }
 
+func referenceDTOFrom(value ReferenceComparison) referenceDTO {
+	return referenceDTO{
+		BuyMarket: string(value.Direction.BuyMarket), SellMarket: string(value.Direction.SellMarket),
+		Market: string(value.Market), Leg: value.Leg, Provider: string(value.Provider),
+		SnapshotVersion: value.SnapshotVersion, InputToken: string(value.Input.Token()), Input: value.Input.String(),
+		LocalOutput: value.LocalOutput.String(), ReferenceOutput: value.ReferenceOutput.String(),
+		OutputDeltaRaw: value.OutputDeltaRaw, Status: string(value.Status), ContextSlot: value.ContextSlot,
+		LocalQuoteDuration: value.LocalQuoteDuration.String(), ReferenceLatency: value.ReferenceLatency.String(),
+		TotalDuration: value.TotalDuration.String(), Error: value.Error,
+	}
+}
+
 type summaryPayload struct {
-	SchemaVersion int                     `json:"schema_version"`
-	Kind          string                  `json:"kind"`
-	Evaluation    int                     `json:"evaluation"`
-	Status        runtimeresearch.Status  `json:"status"`
-	Opportunities []summaryOpportunityDTO `json:"opportunities"`
-	Cost          summaryCostDTO          `json:"cost"`
-	ParityChecks  int                     `json:"parity_checks"`
+	SchemaVersion   int                     `json:"schema_version"`
+	Kind            string                  `json:"kind"`
+	Evaluation      int                     `json:"evaluation"`
+	Status          runtimeresearch.Status  `json:"status"`
+	LocalDuration   string                  `json:"local_evaluation_duration"`
+	Opportunities   []summaryOpportunityDTO `json:"opportunities"`
+	Cost            summaryCostDTO          `json:"cost"`
+	ParityChecks    int                     `json:"parity_checks"`
+	ReferenceChecks int                     `json:"external_reference_checks"`
 }
 
 type summaryOpportunityDTO struct {
@@ -223,9 +299,9 @@ type summaryCostDTO struct {
 func writeJSONSummary(writer io.Writer, report Report) error {
 	payload := summaryPayload{
 		SchemaVersion: 1, Kind: "evaluation", Evaluation: report.Research.Evaluations,
-		Status: report.Research.Status, Opportunities: make([]summaryOpportunityDTO, 0, len(report.Research.Opportunities)),
-		Cost:         summaryCostDTO{Amount: report.Cost.Cost.Decimal(8), Asset: string(report.Cost.Cost.Asset()), Source: string(report.Cost.Price.Source())},
-		ParityChecks: len(report.Parity),
+		Status: report.Research.Status, LocalDuration: report.Research.LocalTiming.Duration.String(), Opportunities: make([]summaryOpportunityDTO, 0, len(report.Research.Opportunities)),
+		Cost:            summaryCostDTO{Amount: report.Cost.Cost.Decimal(8), Asset: string(report.Cost.Cost.Asset()), Source: string(report.Cost.Price.Source())},
+		ReferenceChecks: len(report.Reference), ParityChecks: len(report.Parity),
 	}
 	for _, opportunity := range report.Research.Opportunities {
 		item := summaryOpportunityDTO{
@@ -272,4 +348,24 @@ type parityDTO struct {
 	LocalOut     string `json:"local_out"`
 	ReferenceOut string `json:"reference_out"`
 	Matches      bool   `json:"matches"`
+}
+
+type referenceDTO struct {
+	BuyMarket          string `json:"buy_market"`
+	SellMarket         string `json:"sell_market"`
+	Market             string `json:"market"`
+	Leg                string `json:"leg"`
+	Provider           string `json:"provider"`
+	SnapshotVersion    uint64 `json:"snapshot_version"`
+	InputToken         string `json:"input_token"`
+	Input              string `json:"input"`
+	LocalOutput        string `json:"local_output"`
+	ReferenceOutput    string `json:"reference_output"`
+	OutputDeltaRaw     string `json:"output_delta_raw"`
+	Status             string `json:"status"`
+	ContextSlot        uint64 `json:"context_slot,omitempty"`
+	LocalQuoteDuration string `json:"local_quote_duration"`
+	ReferenceLatency   string `json:"reference_latency"`
+	TotalDuration      string `json:"total_duration"`
+	Error              string `json:"error,omitempty"`
 }

@@ -45,7 +45,9 @@ venues:
     max_tick_words: 16
 markets:
   market_a: {venue: venue_a, base_token: virtual_a, quote_token: weth_a}
-  market_b: {venue: venue_b, base_token: virtual_b, quote_token: weth_b}
+  market_b: {venue: venue_b, base_token: virtual_b, quote_token: weth_b, reference_quote: external}
+quote_sources:
+  external: {kind: jupiter, taker_env: PUBLIC_TAKER, slippage_bps: 50, max_accounts: 32}
 price_sources:
   weth_usd:
     base_asset: weth
@@ -76,7 +78,7 @@ func TestLoadConfigResolvesModularYAMLExactly(t *testing.T) {
 	}
 	if config.FixedCost.RatString() != "1/2" || config.SizingAsset != "quote" || config.MinimumSize.RatString() != "100" ||
 		config.MaximumSize.RatString() != "5000" || config.SizeSamples != 10 || len(config.Hash) != 64 ||
-		len(config.Chains) != 2 || config.Markets[0].Venue.Kind != "uniswap_v2" {
+		len(config.Chains) != 2 || config.Markets[0].Venue.Kind != "uniswap_v2" || config.Markets[1].ReferenceQuote != "external" || config.QuoteSources["external"].TakerEnv != "PUBLIC_TAKER" {
 		t.Fatalf("unexpected parsed configuration: %+v", config)
 	}
 	endpoints, err := config.ResolveEndpoints(func(name string) (string, bool) { return "wss://" + strings.ToLower(name), true })
