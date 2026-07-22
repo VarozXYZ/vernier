@@ -224,6 +224,24 @@ func (s *streamSink) Publish(ctx context.Context, event market.MarketEvent) erro
 	}
 }
 
+func (s *streamSink) Reset(ctx context.Context, event market.MarketEvent) error {
+	result, err := s.mirror.Reset(ctx, event)
+	if err != nil {
+		return err
+	}
+	if result.Disposition == feedport.ApplyDispositionIgnoredStale {
+		return nil
+	}
+	select {
+	case s.signals <- streamSignal{market: s.market, triggered: event.ReceivedAt.UTC(), trigger: arbitrage.TriggerMetadata{
+		Market: event.Market, Source: event.Source, Position: event.Position, Reference: event.Reference, At: event.ReceivedAt.UTC(),
+	}, hasTrigger: true}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func triggerPointer(signal streamSignal) *arbitrage.TriggerMetadata {
 	if !signal.hasTrigger {
 		return nil

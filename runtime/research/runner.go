@@ -286,6 +286,11 @@ func (s *runtimeSink) Publish(ctx context.Context, event market.MarketEvent) err
 	}
 }
 
+func (s *runtimeSink) Reset(ctx context.Context, event market.MarketEvent) error {
+	_, err := s.mirror.Reset(ctx, event)
+	return err
+}
+
 func (s *runtimeSink) SetHealth(ctx context.Context, update feedport.HealthUpdate) error {
 	return s.mirror.SetHealth(ctx, update)
 }

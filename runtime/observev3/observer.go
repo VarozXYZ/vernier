@@ -188,6 +188,25 @@ func (s *observerSink) Publish(ctx context.Context, event market.MarketEvent) er
 	return nil
 }
 
+func (s *observerSink) Reset(ctx context.Context, event market.MarketEvent) error {
+	result, err := s.observer.mirror.Reset(ctx, event)
+	if err != nil {
+		return err
+	}
+	if result.Disposition == feedport.ApplyDispositionIgnoredStale {
+		return nil
+	}
+	snapshot := result.Snapshot
+	evidence, err := s.observer.quote(ctx, event, &snapshot)
+	if err != nil && !errors.Is(err, ErrParityMismatch) {
+		return err
+	}
+	if writeErr := s.observer.writeSnapshot(makeSnapshotRecord(s.observer.config, snapshot, evidence)); writeErr != nil {
+		return writeErr
+	}
+	return err
+}
+
 func (s *observerSink) SetHealth(ctx context.Context, update feedport.HealthUpdate) error {
 	if err := s.observer.mirror.SetHealth(ctx, update); err != nil {
 		return err
