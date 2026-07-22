@@ -71,13 +71,14 @@ func TestRunTextMatchesGolden(t *testing.T) {
 func TestRunExitCodes(t *testing.T) {
 	fixture := filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.yaml")
 	for name, args := range map[string][]string{
-		"missing fixture":                   {"--fixture", filepath.Join(t.TempDir(), "missing.yaml")},
-		"bad format":                        {"--fixture", fixture, "--format", "yaml"},
-		"bad observe format":                {"observe-v3", "--format", "json"},
-		"stream requires jsonl":             {"compare-live", "--stream", "--format", "json"},
-		"stream updates cannot be negative": {"compare-live", "--stream", "--updates", "-1"},
-		"bad live log level":                {"compare-live", "--log-level", "trace"},
-		"bad calculation detail":            {"compare-live", "--calculations", "everything"},
+		"missing fixture":                     {"--fixture", filepath.Join(t.TempDir(), "missing.yaml")},
+		"bad format":                          {"--fixture", fixture, "--format", "yaml"},
+		"bad observe format":                  {"observe-v3", "--format", "json"},
+		"stream requires jsonl":               {"compare-live", "--stream", "--format", "json"},
+		"continuous live mode is the default": {"compare-live", "--format", "json"},
+		"stream updates cannot be negative":   {"compare-live", "--stream", "--updates", "-1"},
+		"bad live log level":                  {"compare-live", "--log-level", "trace"},
+		"bad calculation detail":              {"compare-live", "--calculations", "everything"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code, _, _ := runCLI(t, args...)
@@ -85,6 +86,16 @@ func TestRunExitCodes(t *testing.T) {
 				t.Fatalf("got exit %d, want 2", code)
 			}
 		})
+	}
+}
+
+func TestCompareLiveDefaultsToContinuousMode(t *testing.T) {
+	code, _, stderr := runCLI(t, "compare-live", "--help")
+	if code != 2 {
+		t.Fatalf("got exit %d, want help exit 2", code)
+	}
+	if !strings.Contains(stderr, "(default true)") || !strings.Contains(stderr, "use --stream=false") {
+		t.Fatalf("help does not document the continuous default: %s", stderr)
 	}
 }
 

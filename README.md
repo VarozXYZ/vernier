@@ -94,8 +94,9 @@ Canonical adapter reuse and network/fork boundaries are recorded in
 
 ## Experimental live cross-chain comparison
 
-The `compare-live` composition reads two configured markets at explicit
-block hashes. It sizes in the quote asset by default, models prepositioned inventory,
+The `compare-live` composition continuously reads two configured markets from
+pool-filtered WebSocket logs by default. It sizes in the quote asset, models
+prepositioned inventory,
 converts a fixed external cost through CoinGecko with Chainlink fallback,
 probes both markets locally before sizing, and checks selected local legs
 against the venue reference quoter. Provider request pacing belongs to the EVM
@@ -128,13 +129,13 @@ WETH budgets for this VIRTUAL/WETH setup rather than VIRTUAL or ETH quantities.
 go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --format text
 ~~~
 
-For continuous read-only observation, use the same setup with pool-filtered
-WebSocket logs. The first report is emitted after both pools complete their
-current-state bootstrap; subsequent reports are triggered by accepted events
-or an explicit disconnect health change:
+The first report is emitted after both pools complete their current-state
+bootstrap; subsequent reports are triggered by accepted events or an explicit
+disconnect health change. Use `--updates 1` for a single report, or
+`--stream=false --format json` for an explicit point-in-time snapshot:
 
 ~~~console
-go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --stream --updates 1 --format jsonl
+go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --updates 1 --format jsonl
 ~~~
 
 Stream mode persists only economically meaningful opportunity windows. The
@@ -183,17 +184,17 @@ profile such as `.env.private`:
 go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env.private --format text
 ~~~
 
-For a live, read-only run use the pool-filtered subscriptions and emit one
-report per accepted route update:
+The command is already a live, read-only run. To emit one report per accepted
+route update in JSONL:
 
 ~~~console
-go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env.private --stream --updates 1 --format jsonl --log-level info
+go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env.private --updates 1 --format jsonl --log-level info
 ~~~
 
 Startup validates every configured endpoint, bootstraps every hop in both
 markets, and waits for complete route snapshots before the first local
-evaluation. The point-in-time command exits after that evaluation. Stream mode
-then starts one feed per hop; an accepted event identifies its triggering hop,
+evaluation. By default the process then starts one feed per hop; an accepted
+event identifies its triggering hop,
 updates only that mirror, and reevaluates the composed route. A configured
 external quote source is called only after local sizing has selected the best
 candidate, on a background path, so its latency cannot delay or change the

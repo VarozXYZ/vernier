@@ -19,7 +19,8 @@ the same block hash.
 
 Status: implemented experimentally for canonical Uniswap V3, canonical
 Uniswap V2, and Aerodrome Slipstream on configured EVM profiles. Two configured
-markets can also be compared read-only at explicit point-in-time snapshots.
+markets are compared continuously by default; explicit point-in-time snapshots
+remain available with `--stream=false`.
 VIRTUAL across Robinhood Chain and Base is the public reference setup, with
 local quotes checked exactly against both venue contracts. An experimental
 continuous mode now shares the same mirrors and strategy, evaluates after
