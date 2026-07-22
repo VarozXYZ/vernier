@@ -115,6 +115,35 @@ type AccountNotification struct {
 	Value   Account
 }
 
+// ProgramFilter is the small subset of Solana program filters needed by
+// protocol adapters. A filter is either a data-size constraint or a byte
+// comparison at an account-data offset.
+type ProgramFilter struct {
+	DataSize *uint64
+	Memcmp   *ProgramMemcmp
+}
+
+type ProgramMemcmp struct {
+	Offset uint64
+	Bytes  string
+}
+
+type ProgramAccount struct {
+	Account string
+	Value   Account
+}
+
+type ProgramSubscriptionRequest struct {
+	Program string
+	Filters []ProgramFilter
+}
+
+type ProgramNotification struct {
+	Slot    uint64
+	Account string
+	Value   Account
+}
+
 func (n *ReadOnlyNetwork) ReadAccount(ctx context.Context, address string) (Account, error) {
 	accounts, err := n.ReadMultipleAccounts(ctx, []string{address})
 	if err != nil {
@@ -147,6 +176,46 @@ func (n *ReadOnlyNetwork) ReadMultipleAccounts(ctx context.Context, addresses []
 			return nil, fmt.Errorf("decode account %d: %w", i, err)
 		}
 		accounts[i] = account
+	}
+	return accounts, nil
+}
+
+func (n *ReadOnlyNetwork) ReadProgramAccounts(ctx context.Context, program string, filters []ProgramFilter) ([]ProgramAccount, error) {
+	if strings.TrimSpace(program) == "" {
+		return nil, fmt.Errorf("program is required")
+	}
+	config := map[string]any{"encoding": "base64", "commitment": "processed"}
+	if len(filters) > 0 {
+		encoded := make([]map[string]any, 0, len(filters))
+		for _, filter := range filters {
+			switch {
+			case filter.DataSize != nil && filter.Memcmp == nil:
+				encoded = append(encoded, map[string]any{"dataSize": *filter.DataSize})
+			case filter.DataSize == nil && filter.Memcmp != nil && filter.Memcmp.Bytes != "":
+				encoded = append(encoded, map[string]any{"memcmp": map[string]any{"offset": filter.Memcmp.Offset, "bytes": filter.Memcmp.Bytes}})
+			default:
+				return nil, fmt.Errorf("invalid program filter")
+			}
+		}
+		config["filters"] = encoded
+	}
+	var result []struct {
+		Pubkey  string            `json:"pubkey"`
+		Account *jsonAccountValue `json:"account"`
+	}
+	if err := n.callHTTP(ctx, "getProgramAccounts", []any{program, config}, &result); err != nil {
+		return nil, fmt.Errorf("read %s program accounts: %w", n.label, err)
+	}
+	accounts := make([]ProgramAccount, 0, len(result))
+	for _, item := range result {
+		if item.Account == nil {
+			continue
+		}
+		account, err := item.Account.account()
+		if err != nil {
+			return nil, fmt.Errorf("decode program account %s: %w", item.Pubkey, err)
+		}
+		accounts = append(accounts, ProgramAccount{Account: item.Pubkey, Value: account})
 	}
 	return accounts, nil
 }
@@ -279,6 +348,12 @@ type AccountSubscription interface {
 	Unsubscribe()
 }
 
+type ProgramSubscription interface {
+	Err() <-chan error
+	Notifications() <-chan ProgramNotification
+	Unsubscribe()
+}
+
 func (n *ReadOnlyNetwork) SubscribeLogs(ctx context.Context, pool string) (LogsSubscription, error) {
 	if strings.TrimSpace(pool) == "" {
 		return nil, fmt.Errorf("pool account is required")
@@ -347,6 +422,57 @@ func (n *ReadOnlyNetwork) SubscribeAccount(ctx context.Context, account string) 
 		return nil, fmt.Errorf("invalid accountSubscribe response")
 	}
 	subscription := &accountSubscription{conn: conn, account: account, id: response.Result, errors: make(chan error, 1), notifications: make(chan AccountNotification, 128), done: make(chan struct{})}
+	go subscription.readLoop()
+	return subscription, nil
+}
+
+func (n *ReadOnlyNetwork) SubscribeProgram(ctx context.Context, request ProgramSubscriptionRequest) (ProgramSubscription, error) {
+	if strings.TrimSpace(request.Program) == "" {
+		return nil, fmt.Errorf("program is required")
+	}
+	filters := make([]map[string]any, 0, len(request.Filters))
+	for _, filter := range request.Filters {
+		switch {
+		case filter.DataSize != nil && filter.Memcmp == nil:
+			filters = append(filters, map[string]any{"dataSize": *filter.DataSize})
+		case filter.DataSize == nil && filter.Memcmp != nil && filter.Memcmp.Bytes != "":
+			filters = append(filters, map[string]any{"memcmp": map[string]any{"offset": filter.Memcmp.Offset, "bytes": filter.Memcmp.Bytes}})
+		default:
+			return nil, fmt.Errorf("invalid program filter")
+		}
+	}
+	config := map[string]any{"commitment": "processed", "encoding": "base64", "withContext": true}
+	if len(filters) > 0 {
+		config["filters"] = filters
+	}
+	conn, _, err := n.dialer.DialContext(ctx, n.websocketURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s WebSocket endpoint: %w", n.label, err)
+	}
+	id := n.requestID.Add(1)
+	rpc := rpcRequest{JSONRPC: "2.0", ID: id, Method: "programSubscribe", Params: []any{request.Program, config}}
+	if err := conn.WriteJSON(rpc); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	var response struct {
+		ID     uint64    `json:"id"`
+		Result uint64    `json:"result"`
+		Error  *RPCError `json:"error"`
+	}
+	if err := conn.ReadJSON(&response); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if response.Error != nil {
+		conn.Close()
+		return nil, response.Error
+	}
+	if response.ID != id || response.Result == 0 {
+		conn.Close()
+		return nil, fmt.Errorf("invalid programSubscribe response")
+	}
+	subscription := &programSubscription{conn: conn, id: response.Result, errors: make(chan error, 1), notifications: make(chan ProgramNotification, 128), done: make(chan struct{})}
 	go subscription.readLoop()
 	return subscription, nil
 }
@@ -483,3 +609,74 @@ func (s *accountSubscription) readLoop() {
 }
 
 var _ AccountSubscription = (*accountSubscription)(nil)
+
+type programSubscription struct {
+	mu            sync.Mutex
+	conn          *websocket.Conn
+	id            uint64
+	errors        chan error
+	notifications chan ProgramNotification
+	done          chan struct{}
+	once          sync.Once
+}
+
+func (s *programSubscription) Err() <-chan error                         { return s.errors }
+func (s *programSubscription) Notifications() <-chan ProgramNotification { return s.notifications }
+func (s *programSubscription) Unsubscribe() {
+	s.once.Do(func() {
+		close(s.done)
+		s.mu.Lock()
+		_ = s.conn.WriteJSON(rpcRequest{JSONRPC: "2.0", ID: s.id + 1, Method: "programUnsubscribe", Params: []any{s.id}})
+		_ = s.conn.Close()
+		s.mu.Unlock()
+	})
+}
+
+func (s *programSubscription) readLoop() {
+	defer close(s.notifications)
+	defer close(s.errors)
+	for {
+		var message struct {
+			Method string `json:"method"`
+			Params struct {
+				Result struct {
+					Context struct {
+						Slot uint64 `json:"slot"`
+					} `json:"context"`
+					Value struct {
+						Pubkey  string            `json:"pubkey"`
+						Account *jsonAccountValue `json:"account"`
+					} `json:"value"`
+				} `json:"result"`
+			} `json:"params"`
+		}
+		if err := s.conn.ReadJSON(&message); err != nil {
+			select {
+			case <-s.done:
+				return
+			case s.errors <- err:
+			}
+			return
+		}
+		if message.Method != "programNotification" || message.Params.Result.Value.Account == nil {
+			continue
+		}
+		value, err := message.Params.Result.Value.Account.account()
+		if err != nil {
+			select {
+			case <-s.done:
+				return
+			case s.errors <- err:
+			}
+			return
+		}
+		notification := ProgramNotification{Slot: message.Params.Result.Context.Slot, Account: message.Params.Result.Value.Pubkey, Value: value}
+		select {
+		case <-s.done:
+			return
+		case s.notifications <- notification:
+		}
+	}
+}
+
+var _ ProgramSubscription = (*programSubscription)(nil)

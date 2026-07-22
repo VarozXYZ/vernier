@@ -71,6 +71,53 @@ func (s *accountSubscription) Notifications() <-chan solana.AccountNotification 
 }
 func (*accountSubscription) Unsubscribe() {}
 
+type programDecoder struct{ decoded int }
+
+func (d *programDecoder) Bootstrap(context.Context, solanalogs.Network, uint64) (market.EventData, error) {
+	return eventData{value: 0}, nil
+}
+func (*programDecoder) Decode(context.Context, solanalogs.Network, solana.LogNotification) ([]market.EventData, error) {
+	return nil, errors.New("log decoder must not be called")
+}
+func (*programDecoder) AccountSubscriptions() []string { return nil }
+func (*programDecoder) ProgramSubscriptions() []solana.ProgramSubscriptionRequest {
+	return []solana.ProgramSubscriptionRequest{{Program: "program"}}
+}
+func (d *programDecoder) DecodeAccount(context.Context, solana.AccountNotification) ([]market.EventData, error) {
+	return nil, errors.New("account decoder must not be called")
+}
+func (d *programDecoder) DecodeProgram(context.Context, solana.ProgramNotification) ([]market.EventData, error) {
+	d.decoded++
+	return []market.EventData{eventData{value: 4}}, nil
+}
+
+type programNetwork struct{}
+
+func (programNetwork) CurrentSlot(context.Context) (uint64, error) { return 10, nil }
+func (programNetwork) SubscribeLogs(context.Context, string) (solana.LogsSubscription, error) {
+	return nil, errors.New("logs must not be subscribed")
+}
+func (programNetwork) SubscribeAccount(context.Context, string) (solana.AccountSubscription, error) {
+	return nil, errors.New("accounts must not be subscribed")
+}
+func (programNetwork) SubscribeProgram(context.Context, solana.ProgramSubscriptionRequest) (solana.ProgramSubscription, error) {
+	subscription := &programSubscription{notifications: make(chan solana.ProgramNotification, 1), errors: make(chan error, 1)}
+	subscription.notifications <- solana.ProgramNotification{Slot: 10, Account: "tick-account", Value: solana.Account{Data: []byte{1}}}
+	close(subscription.notifications)
+	return subscription, nil
+}
+
+type programSubscription struct {
+	notifications chan solana.ProgramNotification
+	errors        chan error
+}
+
+func (s *programSubscription) Err() <-chan error { return s.errors }
+func (s *programSubscription) Notifications() <-chan solana.ProgramNotification {
+	return s.notifications
+}
+func (*programSubscription) Unsubscribe() {}
+
 func (*fakeNetwork) CurrentSlot(context.Context) (uint64, error) { return 10, nil }
 
 func (n *fakeNetwork) SubscribeLogs(context.Context, string) (solana.LogsSubscription, error) {
@@ -174,6 +221,22 @@ func TestFeedUsesAccountWebSocketWithoutLogOrRPCDecode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &sink{cancel: cancel, cancelDegraded: true}
 	feed, err := solanalogs.New(solanalogs.Config{Market: "pool", Source: "solana", Pool: "pool-account", Network: accountNetwork{}, Decoder: decoder, Retry: solanalogs.RetryPolicy{Initial: time.Millisecond, Maximum: time.Millisecond}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := feed.Run(ctx, s); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v", err)
+	}
+	if decoder.decoded != 1 || len(s.resets) != 1 || len(s.events) != 1 {
+		t.Fatalf("decoded=%d resets=%d events=%d", decoder.decoded, len(s.resets), len(s.events))
+	}
+}
+
+func TestFeedUsesProgramWebSocketForDiscoveredAccounts(t *testing.T) {
+	decoder := &programDecoder{}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &sink{cancel: cancel, cancelDegraded: true}
+	feed, err := solanalogs.New(solanalogs.Config{Market: "pool", Source: "solana", Pool: "pool-account", Network: programNetwork{}, Decoder: decoder, Retry: solanalogs.RetryPolicy{Initial: time.Millisecond, Maximum: time.Millisecond}})
 	if err != nil {
 		t.Fatal(err)
 	}

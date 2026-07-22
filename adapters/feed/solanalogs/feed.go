@@ -28,6 +28,10 @@ type AccountNetwork interface {
 	SubscribeAccount(context.Context, string) (solana.AccountSubscription, error)
 }
 
+type ProgramNetwork interface {
+	SubscribeProgram(context.Context, solana.ProgramSubscriptionRequest) (solana.ProgramSubscription, error)
+}
+
 // Decoder owns protocol-specific account bootstrap and log interpretation. A
 // single notification may contain multiple instructions; returned data must
 // retain that instruction order.
@@ -42,6 +46,11 @@ type Decoder interface {
 type AccountDecoder interface {
 	AccountSubscriptions() []string
 	DecodeAccount(context.Context, solana.AccountNotification) ([]market.EventData, error)
+}
+
+type ProgramDecoder interface {
+	ProgramSubscriptions() []solana.ProgramSubscriptionRequest
+	DecodeProgram(context.Context, solana.ProgramNotification) ([]market.EventData, error)
 }
 
 type Clock func() time.Time
@@ -230,7 +239,11 @@ func (f *Feed) accountMode() (AccountDecoder, AccountNetwork) {
 }
 
 type accountUpdate struct {
-	notification solana.AccountNotification
+	slot           uint64
+	account        string
+	value          solana.Account
+	accountDecoder AccountDecoder
+	programDecoder ProgramDecoder
 }
 
 func (f *Feed) runAccountSession(ctx context.Context, sink feedport.Sink, decoder AccountDecoder, network AccountNetwork) (bool, bool, error) {
@@ -257,29 +270,52 @@ func (f *Feed) runAccountSession(ctx context.Context, sink feedport.Sink, decode
 		return false, false, err
 	}
 	addresses := decoder.AccountSubscriptions()
-	if len(addresses) == 0 {
+	programDecoder, programNetwork := f.programMode()
+	programRequests := []solana.ProgramSubscriptionRequest(nil)
+	if programDecoder != nil && programNetwork != nil {
+		programRequests = programDecoder.ProgramSubscriptions()
+	}
+	if len(addresses) == 0 && len(programRequests) == 0 {
 		return false, false, fmt.Errorf("account feed %s has no subscriptions", f.market)
 	}
 	updates := make(chan accountUpdate, 128)
-	errorsCh := make(chan error, len(addresses))
-	subscriptions := make([]solana.AccountSubscription, 0, len(addresses))
+	errorsCh := make(chan error, len(addresses)+len(programRequests))
+	accountSubscriptions := make([]solana.AccountSubscription, 0, len(addresses))
+	programSubscriptions := make([]solana.ProgramSubscription, 0, len(programRequests))
 	for _, address := range addresses {
 		subscription, subscribeErr := network.SubscribeAccount(ctx, address)
 		if subscribeErr != nil {
-			for _, active := range subscriptions {
+			for _, active := range accountSubscriptions {
 				active.Unsubscribe()
 			}
 			return true, true, subscribeErr
 		}
-		subscriptions = append(subscriptions, subscription)
-		go forwardAccounts(ctx, subscription, updates, errorsCh)
+		accountSubscriptions = append(accountSubscriptions, subscription)
+		go forwardAccounts(ctx, subscription, updates, errorsCh, decoder)
+	}
+	for _, request := range programRequests {
+		subscription, subscribeErr := programNetwork.SubscribeProgram(ctx, request)
+		if subscribeErr != nil {
+			for _, active := range accountSubscriptions {
+				active.Unsubscribe()
+			}
+			for _, active := range programSubscriptions {
+				active.Unsubscribe()
+			}
+			return true, true, subscribeErr
+		}
+		programSubscriptions = append(programSubscriptions, subscription)
+		go forwardPrograms(ctx, subscription, updates, errorsCh, programDecoder)
 	}
 	defer func() {
-		for _, subscription := range subscriptions {
+		for _, subscription := range accountSubscriptions {
+			subscription.Unsubscribe()
+		}
+		for _, subscription := range programSubscriptions {
 			subscription.Unsubscribe()
 		}
 	}()
-	f.logger.Info("feed account subscriptions active", "market", f.market, "accounts", len(addresses))
+	f.logger.Info("feed account subscriptions active", "market", f.market, "accounts", len(addresses), "programs", len(programRequests))
 	highest := slot
 	for {
 		select {
@@ -291,31 +327,46 @@ func (f *Feed) runAccountSession(ctx context.Context, sink feedport.Sink, decode
 			}
 			return true, true, err
 		case update := <-updates:
-			if update.notification.Slot < highest {
+			if update.slot < highest {
 				continue
 			}
 			started := time.Now()
-			data, decodeErr := decoder.DecodeAccount(ctx, update.notification)
+			var data []market.EventData
+			var decodeErr error
+			if update.accountDecoder != nil {
+				data, decodeErr = update.accountDecoder.DecodeAccount(ctx, solana.AccountNotification{Slot: update.slot, Account: update.account, Value: update.value})
+			} else {
+				data, decodeErr = update.programDecoder.DecodeProgram(ctx, solana.ProgramNotification{Slot: update.slot, Account: update.account, Value: update.value})
+			}
 			if decodeErr != nil {
-				return true, false, fmt.Errorf("decode %s account %s: %w", f.market, update.notification.Account, decodeErr)
+				return true, false, fmt.Errorf("decode %s account %s: %w", f.market, update.account, decodeErr)
 			}
 			for index, item := range data {
 				if item == nil {
-					return true, false, fmt.Errorf("decode %s account %s returned nil event at index %d", f.market, update.notification.Account, index)
+					return true, false, fmt.Errorf("decode %s account %s returned nil event at index %d", f.market, update.account, index)
 				}
-				if err := sink.Publish(ctx, f.event(update.notification.Slot, "account:"+update.notification.Account, item)); err != nil {
+				if err := sink.Publish(ctx, f.event(update.slot, "account:"+update.account, item)); err != nil {
 					return true, false, err
 				}
-				f.logger.Debug("feed account event applied", "market", f.market, "account", update.notification.Account, "slot", update.notification.Slot, "duration", time.Since(started))
+				f.logger.Debug("feed account event applied", "market", f.market, "account", update.account, "slot", update.slot, "duration", time.Since(started))
 			}
-			if update.notification.Slot > highest {
-				highest = update.notification.Slot
+			if update.slot > highest {
+				highest = update.slot
 			}
 		}
 	}
 }
 
-func forwardAccounts(ctx context.Context, subscription solana.AccountSubscription, updates chan<- accountUpdate, errorsCh chan<- error) {
+func (f *Feed) programMode() (ProgramDecoder, ProgramNetwork) {
+	decoder, decoderOK := f.decoder.(ProgramDecoder)
+	network, networkOK := f.network.(ProgramNetwork)
+	if !decoderOK || !networkOK {
+		return nil, nil
+	}
+	return decoder, network
+}
+
+func forwardAccounts(ctx context.Context, subscription solana.AccountSubscription, updates chan<- accountUpdate, errorsCh chan<- error, decoder AccountDecoder) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -338,7 +389,38 @@ func forwardAccounts(ctx context.Context, subscription solana.AccountSubscriptio
 				return
 			}
 			select {
-			case updates <- accountUpdate{notification: notification}:
+			case updates <- accountUpdate{slot: notification.Slot, account: notification.Account, value: notification.Value, accountDecoder: decoder}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func forwardPrograms(ctx context.Context, subscription solana.ProgramSubscription, updates chan<- accountUpdate, errorsCh chan<- error, decoder ProgramDecoder) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err, open := <-subscription.Err():
+			if !open || err == nil {
+				err = fmt.Errorf("solana program subscription closed")
+			}
+			select {
+			case errorsCh <- err:
+			case <-ctx.Done():
+			}
+			return
+		case notification, open := <-subscription.Notifications():
+			if !open {
+				select {
+				case errorsCh <- fmt.Errorf("solana program notification stream closed"):
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case updates <- accountUpdate{slot: notification.Slot, account: notification.Account, value: notification.Value, programDecoder: decoder}:
 			case <-ctx.Done():
 				return
 			}

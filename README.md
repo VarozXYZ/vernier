@@ -236,14 +236,16 @@ added only when behavior actually diverges. See
 
 Solana topology uses separate `http_url_env` and `websocket_url_env` values.
 Pools are independent from venues, and a `path` lists ordered hops. Solana
-pool adapters may use filtered `logsSubscribe` or account-level
-`accountSubscribe` streams; the local decoder must be pure for every
-notification, so the decision hot path never falls back to RPC. A healthy
-subscription has no TTL or slot-gap rule; only a confirmed WebSocket
-disconnect degrades it, and reconnect bootstraps current state without
-backfill. If a required account is not subscribed or its state is outside the
-declared local coverage, the quoter fails closed as `unclassifiable` rather
-than issuing an RPC read. A market may optionally set `reference_quote` to a modular
+pool adapters may use filtered `logsSubscribe`, account-level
+`accountSubscribe`, or program-level `programSubscribe` streams; the local
+decoder must be pure for every notification, so the decision hot path never
+falls back to RPC. Whirlpool bootstraps all fixed and dynamic tick arrays
+associated with the pool and then discovers new arrays through filtered
+program notifications. A healthy subscription has no TTL or slot-gap rule;
+only a confirmed WebSocket disconnect degrades it, and reconnect bootstraps
+current state without backfill. If a required account is not subscribed or its
+state is outside the declared local coverage, the quoter fails closed as
+`unclassifiable` rather than issuing an RPC read. A market may optionally set `reference_quote` to a modular
 `quote_sources` entry of kind `jupiter`. For each accepted event, Research
 first emits the complete local curve and selected size; only then does a
 background validation request the selected leg. The follow-up record contains
