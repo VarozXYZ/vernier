@@ -111,7 +111,10 @@ failed/incomplete probe safely falls back to evaluating both directions.
 The policy is recorded in [ADR 0007](decisions/0007-early-direction-discovery.md).
 
 Configuration is modular YAML: a manifest selects topology and policy files,
-while endpoint values and API keys remain in an ignored `.env` file. VIRTUAL
+while endpoint values and API keys remain in an ignored setup profile such as
+`.env.virtual` or `.env.private`. Environment keys are deliberately short and
+describe the provider directly (`ROBINHOOD_WS_URL`, `SOLANA_HTTP_URL`,
+`JUPITER_TAKER`); the selected filename provides setup isolation. VIRTUAL
 across Robinhood Chain and Base is the deliberately public reference setup in
 [examples/setups/virtual](examples/setups/virtual/). Its Base market uses the
 canonical Aerodrome volatile pool adapter; changing the pool, factory, router,
@@ -122,7 +125,7 @@ The sizing policy uses `asset: quote` by default, so the configured bounds are
 WETH budgets for this VIRTUAL/WETH setup rather than VIRTUAL or ETH quantities.
 
 ~~~console
-go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --format text
+go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --format text
 ~~~
 
 For continuous read-only observation, use the same setup with pool-filtered
@@ -131,7 +134,7 @@ current-state bootstrap; subsequent reports are triggered by accepted events
 or an explicit disconnect health change:
 
 ~~~console
-go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --stream --updates 1 --format jsonl
+go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --stream --updates 1 --format jsonl
 ~~~
 
 Stream mode persists only economically meaningful opportunity windows. The
@@ -160,7 +163,7 @@ inspect a JSONL run without interleaving diagnostics in the terminal, redirect
 the two streams separately, for example:
 
 ~~~console
-go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env --stream --updates 1 --format jsonl > report.jsonl 2> stream.log
+go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --stream --updates 1 --format jsonl > report.jsonl 2> stream.log
 ~~~
 
 The default report is an evaluation summary: it shows the selected size and
@@ -173,17 +176,18 @@ from `--log-level debug`, which is reserved for runtime diagnostics.
 
 The same command starts Research for any private modular manifest. Keep that
 manifest and its topology/policy files outside the public tree, and provide
-only endpoint, taker, and optional provider-key values through `.env`:
+only endpoint, taker, and optional provider-key values through a setup-specific
+profile such as `.env.private`:
 
 ~~~console
-go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env --format text
+go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env.private --format text
 ~~~
 
 For a live, read-only run use the pool-filtered subscriptions and emit one
 report per accepted route update:
 
 ~~~console
-go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env --stream --updates 1 --format jsonl --log-level info
+go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env.private --stream --updates 1 --format jsonl --log-level info
 ~~~
 
 Startup validates every configured endpoint, bootstraps every hop in both

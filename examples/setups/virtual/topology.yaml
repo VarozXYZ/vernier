@@ -4,13 +4,13 @@ chains:
     kind: evm
     label: Robinhood Chain
     chain_id: "4663"
-    rpc_url_env: VERNIER_ROBINHOOD_WS_URL
+    rpc_url_env: ROBINHOOD_WS_URL
     rpc_min_interval_ms: 100
   base:
     kind: evm
     label: Base
     chain_id: "8453"
-    rpc_url_env: VERNIER_BASE_WS_URL
+    rpc_url_env: BASE_WS_URL
     rpc_min_interval_ms: 350
 assets:
   virtual: {symbol: VIRTUAL}
