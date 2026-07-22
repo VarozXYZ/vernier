@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
+	"github.com/VarozXYZ/vernier/adapters/chain/solana"
 	sqlitepersistence "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	persistence "github.com/VarozXYZ/vernier/ports/persistence"
@@ -84,8 +85,19 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		return 2
 	}
 	networks := make(livecompare.Networks, len(config.Chains))
+	solanaNetworks := make(livecompare.SolanaNetworks)
 	for id, profile := range config.Chains {
 		logger.Info("dialing network", "chain", id, "label", profile.Label)
+		if profile.Kind == "solana" {
+			network, dialErr := solana.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, endpoints[id+".http"], endpoints[id+".websocket"])
+			if dialErr != nil {
+				fmt.Fprintf(stderr, "research compare-live: %v\n", dialErr)
+				return 1
+			}
+			solanaNetworks[id] = network
+			logger.Info("network ready", "chain", id)
+			continue
+		}
 		network, dialErr := evm.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, profile.ChainID, endpoints[id], endpoints[id])
 		if dialErr != nil {
 			for _, opened := range networks {
@@ -105,8 +117,11 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 				closer.Close()
 			}
 		}
+		for _, network := range solanaNetworks {
+			network.Close()
+		}
 	}()
-	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger})
+	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks})
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: invalid composition: %v\n", err)
 		return 2
