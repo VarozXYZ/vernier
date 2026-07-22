@@ -97,7 +97,7 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 				// The protocol consumes Y liquidity at the bin price. The
 				// corresponding X input capacity is rounded up.
 				input := ceilMulDiv(bin.reserveY, scale, bin.priceX64)
-				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveY})
+				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveY, FeeRate: state.FeeRateForBin(bin.id)})
 			}
 		}
 	} else {
@@ -109,7 +109,7 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 			}
 			if bin.reserveX.Sign() > 0 {
 				input := ceilMulDiv(bin.reserveX, bin.priceX64, scale)
-				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveX})
+				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveX, FeeRate: state.FeeRateForBin(bin.id)})
 			}
 		}
 	}

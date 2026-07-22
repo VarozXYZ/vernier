@@ -68,25 +68,10 @@ func (d *Decoder) decode(ctx context.Context, reader AccountReader, data []byte)
 	binStep := binary.LittleEndian.Uint16(data[80:82])
 	baseFactor := binary.LittleEndian.Uint16(data[8:10])
 	variableControl := binary.LittleEndian.Uint32(data[16:20])
-	volatility := binary.LittleEndian.Uint32(data[40:44])
+	maxVolatility := binary.LittleEndian.Uint32(data[20:24])
 	basePower := data[34]
-	feeRate := uint64(baseFactor) * uint64(binStep) * 10
-	for i := byte(0); i < basePower; i++ {
-		feeRate *= 10
-	}
-	volatilityBin := uint64(volatility) * uint64(binStep)
-	variable := uint64(0)
-	if variableControl > 0 {
-		variable = (uint64(variableControl)*volatilityBin*volatilityBin + 99_999_999_999) / 100_000_000_000
-	}
-	totalRate := feeRate + variable
-	if totalRate > 100_000_000 {
-		totalRate = 100_000_000
-	}
-	feeBPS := uint16((totalRate*10_000 + 999_999_999) / 1_000_000_000)
-	if feeBPS >= 10_000 {
-		return StateUpdate{}, fmt.Errorf("DLMM fee is outside quote model")
-	}
+	volatilityReference := binary.LittleEndian.Uint32(data[40:44])
+	indexReference := int32(binary.LittleEndian.Uint32(data[44:48]))
 
 	programID, err := solana.DecodePublicKey(meteoraProgram)
 	if err != nil {
@@ -133,7 +118,7 @@ func (d *Decoder) decode(ctx context.Context, reader AccountReader, data []byte)
 		}
 		bins = append(bins, parsed...)
 	}
-	return NewStateUpdateWithFeeRate(activeID, binStep, totalRate, bins)
+	return NewDynamicStateUpdate(activeID, binStep, baseFactor, basePower, variableControl, maxVolatility, volatilityReference, indexReference, bins)
 }
 
 func parseBinArray(data []byte, expectedIndex int64, pool [32]byte) ([]Bin, error) {

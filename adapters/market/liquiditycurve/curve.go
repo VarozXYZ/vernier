@@ -16,8 +16,9 @@ const BasisPoints uint64 = 10_000
 const FeeRatePrecision uint64 = 1_000_000_000
 
 type Segment struct {
-	In  *big.Int
-	Out *big.Int
+	In      *big.Int
+	Out     *big.Int
+	FeeRate uint64 // zero uses the quote-wide fallback rate
 }
 
 func ExactInput(segments []Segment, amount *big.Int, feeBPS uint16) (output, fee *big.Int, err error) {
@@ -32,7 +33,6 @@ func ExactInputRate(segments []Segment, amount *big.Int, feeRate uint64) (output
 		return nil, nil, fmt.Errorf("amount must be positive and fee valid")
 	}
 	denominator := new(big.Int).SetUint64(FeeRatePrecision)
-	netFactor := new(big.Int).SetUint64(FeeRatePrecision - feeRate)
 	remaining := new(big.Int).Set(amount)
 	output, fee = new(big.Int), new(big.Int)
 	for _, segment := range segments {
@@ -43,6 +43,14 @@ func ExactInputRate(segments []Segment, amount *big.Int, feeRate uint64) (output
 			return nil, nil, fmt.Errorf("segment reserves must be positive")
 		}
 		gross := new(big.Int).Set(remaining)
+		rate := feeRate
+		if segment.FeeRate != 0 {
+			rate = segment.FeeRate
+		}
+		if rate >= FeeRatePrecision {
+			return nil, nil, fmt.Errorf("segment fee is invalid")
+		}
+		netFactor := new(big.Int).SetUint64(FeeRatePrecision - rate)
 		afterFee := new(big.Int).Mul(gross, netFactor)
 		afterFee.Quo(afterFee, denominator)
 		if afterFee.Sign() == 0 {
@@ -84,7 +92,6 @@ func ExactOutputRate(segments []Segment, amountOut *big.Int, feeRate uint64) (in
 		return nil, nil, fmt.Errorf("amount must be positive and fee valid")
 	}
 	denominator := new(big.Int).SetUint64(FeeRatePrecision)
-	netFactor := new(big.Int).SetUint64(FeeRatePrecision - feeRate)
 	remaining := new(big.Int).Set(amountOut)
 	input, fee = new(big.Int), new(big.Int)
 	for _, segment := range segments {
@@ -103,6 +110,14 @@ func ExactOutputRate(segments []Segment, amountOut *big.Int, feeRate uint64) (in
 		afterFee := new(big.Int).Mul(available, segment.In)
 		afterFee.Add(afterFee, new(big.Int).Sub(segment.Out, big.NewInt(1)))
 		afterFee.Quo(afterFee, segment.Out)
+		rate := feeRate
+		if segment.FeeRate != 0 {
+			rate = segment.FeeRate
+		}
+		if rate >= FeeRatePrecision {
+			return nil, nil, fmt.Errorf("segment fee is invalid")
+		}
+		netFactor := new(big.Int).SetUint64(FeeRatePrecision - rate)
 		gross := new(big.Int).Mul(afterFee, denominator)
 		gross.Add(gross, new(big.Int).Sub(new(big.Int).Set(netFactor), big.NewInt(1)))
 		gross.Quo(gross, netFactor)
