@@ -100,6 +100,9 @@ func TestCompareLiveDefaultsToContinuousMode(t *testing.T) {
 	if !strings.Contains(stderr, "(default true)") || !strings.Contains(stderr, "use --stream=false") {
 		t.Fatalf("help does not document the continuous default: %s", stderr)
 	}
+	if !strings.Contains(stderr, "-reference-quote") {
+		t.Fatalf("help does not document external quote selection: %s", stderr)
+	}
 }
 
 func TestRunReturnsSuccessForExplicitDegradation(t *testing.T) {

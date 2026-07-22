@@ -57,11 +57,15 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 	updates := flags.Int("updates", 0, "reports to emit; zero runs until canceled")
 	logLevel := flags.String("log-level", "info", "diagnostic log level: debug, info, warn, or error")
 	calculations := flags.String("calculations", "summary", "calculation output: summary or full")
+	referenceQuote := flags.String("reference-quote", "", "external quote validation: config, off, or a configured source ID for Solana markets")
 	opportunityStorePath := flags.String("opportunity-store", ".vernier/opportunities.sqlite", "SQLite opportunity-window store; empty disables persistence")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	validFormat := *format == "text" || (!*stream && *format == "json") || (*stream && *format == "jsonl")
+	if *referenceQuote == "config" {
+		*referenceQuote = ""
+	}
 	if flags.NArg() != 0 || !validFormat || *updates < 0 || (*calculations != string(livecompare.CalculationSummary) && *calculations != string(livecompare.CalculationFull)) {
 		fmt.Fprintln(stderr, "research compare-live: invalid arguments")
 		return 2
@@ -87,6 +91,11 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		return 2
 	}
 	logger.Info("configuration loaded", "chains", len(config.Chains), "markets", len(config.Markets), "config_hash", config.Hash)
+	referenceMode := *referenceQuote
+	if referenceMode == "" {
+		referenceMode = "config"
+	}
+	logger.Info("external quote validation mode", "mode", referenceMode)
 	endpoints, err := config.ResolveEndpoints(os.LookupEnv)
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
@@ -133,7 +142,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 			network.Close()
 		}
 	}()
-	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks})
+	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks, ReferenceQuoteOverride: *referenceQuote})
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: invalid composition: %v\n", err)
 		return 2

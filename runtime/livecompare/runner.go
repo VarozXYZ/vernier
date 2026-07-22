@@ -47,6 +47,10 @@ type Options struct {
 	LookupEnv      configuration.LookupEnv
 	PriceClient    coingecko.Client
 	SolanaNetworks SolanaNetworks
+	// ReferenceQuoteOverride selects a configured external quote source for
+	// Solana markets. Empty preserves each market's YAML setting; "off"
+	// disables external validation for the run.
+	ReferenceQuoteOverride string
 	// ReferenceSources are optional providers used only after local sizing has
 	// selected one candidate. They never participate in local evaluation.
 	ReferenceSources map[market.MarketID]quoteport.ExternalReferenceSource
@@ -54,14 +58,15 @@ type Options struct {
 }
 
 type Runner struct {
-	config           configuration.ParsedConfig
-	networks         Networks
-	clock            func() time.Time
-	lookup           configuration.LookupEnv
-	client           coingecko.Client
-	solanaNetworks   SolanaNetworks
-	referenceSources map[market.MarketID]quoteport.ExternalReferenceSource
-	logger           *slog.Logger
+	config                 configuration.ParsedConfig
+	networks               Networks
+	clock                  func() time.Time
+	lookup                 configuration.LookupEnv
+	client                 coingecko.Client
+	solanaNetworks         SolanaNetworks
+	referenceQuoteOverride string
+	referenceSources       map[market.MarketID]quoteport.ExternalReferenceSource
+	logger                 *slog.Logger
 }
 
 type CostEvidence struct {
@@ -112,6 +117,11 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 	if options.Logger == nil {
 		options.Logger = observability.DiscardLogger()
 	}
+	if options.ReferenceQuoteOverride != "" && options.ReferenceQuoteOverride != "off" {
+		if _, ok := config.QuoteSources[options.ReferenceQuoteOverride]; !ok {
+			return nil, fmt.Errorf("reference quote source %q is not configured", options.ReferenceQuoteOverride)
+		}
+	}
 	limited := make(Networks, len(config.Chains))
 	for id, profile := range config.Chains {
 		if profile.Kind == "solana" {
@@ -130,7 +140,7 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		}
 		limited[id] = wrapped
 	}
-	return &Runner{config: config, networks: limited, solanaNetworks: options.SolanaNetworks, referenceSources: options.ReferenceSources, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
+	return &Runner{config: config, networks: limited, solanaNetworks: options.SolanaNetworks, referenceSources: options.ReferenceSources, referenceQuoteOverride: options.ReferenceQuoteOverride, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
@@ -214,12 +224,19 @@ func (r *Runner) referenceSourcesFor(local map[market.MarketID]quoteport.Source)
 	for id, source := range local {
 		result[id] = source
 	}
+	if !r.referencesEnabled() {
+		return result
+	}
 	for id, source := range r.referenceSources {
 		if source != nil {
 			result[id] = source
 		}
 	}
 	return result
+}
+
+func (r *Runner) referencesEnabled() bool {
+	return r.referenceQuoteOverride != "off"
 }
 
 func (r *Runner) currentBlocks(ctx context.Context) (map[string]evm.BlockReference, error) {
@@ -325,12 +342,19 @@ func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.R
 }
 
 func (r *Runner) externalSource(configured configuration.ResolvedMarket, local quoteport.Source) (quoteport.ExternalReferenceSource, error) {
-	if configured.ReferenceQuote == "" {
+	if !r.referencesEnabled() {
 		return nil, nil
 	}
-	profile, ok := r.config.QuoteSources[configured.ReferenceQuote]
+	referenceID := configured.ReferenceQuote
+	if r.referenceQuoteOverride != "" && marketUsesSolana(r.config, configured) {
+		referenceID = r.referenceQuoteOverride
+	}
+	if referenceID == "" {
+		return nil, nil
+	}
+	profile, ok := r.config.QuoteSources[referenceID]
 	if !ok {
-		return nil, fmt.Errorf("market %q references unknown quote source %q", configured.ID, configured.ReferenceQuote)
+		return nil, fmt.Errorf("market %q references unknown quote source %q", configured.ID, referenceID)
 	}
 	taker, ok := r.lookup(profile.TakerEnv)
 	if !ok || strings.TrimSpace(taker) == "" {
@@ -348,6 +372,18 @@ func (r *Runner) externalSource(configured configuration.ResolvedMarket, local q
 	mints[configured.Base.Token.ID] = configured.Base.AddressText
 	mints[configured.Quote.Token.ID] = configured.Quote.AddressText
 	return jupiter.New(jupiter.Config{ID: market.SourceID(profile.ID), BaseURL: profile.BaseURL, Taker: taker, SlippageBPS: profile.SlippageBPS, MaxAccounts: profile.MaxAccounts, APIKey: apiKey, TokenMints: mints, Local: local, Clock: r.clock})
+}
+
+func marketUsesSolana(config configuration.ParsedConfig, candidate configuration.ResolvedMarket) bool {
+	for _, hop := range candidate.Path {
+		if chain, ok := config.Chains[hop.Venue.Chain]; ok && chain.Kind == "solana" {
+			return true
+		}
+	}
+	if chain, ok := config.Chains[candidate.Venue.Chain]; ok {
+		return chain.Kind == "solana"
+	}
+	return false
 }
 
 func (r *Runner) composeMarket(configured configuration.ResolvedMarket, registry *market.Registry, maximum market.AssetQuantity) (marketRuntime, error) {

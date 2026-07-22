@@ -223,7 +223,7 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 			for id, source := range referenceSources {
 				availableReferences[id] = source
 			}
-			if len(referenceSources) > 0 || len(r.referenceSources) > 0 {
+			if r.referencesEnabled() && (len(referenceSources) > 0 || len(r.referenceSources) > 0) {
 				r.logger.Debug("stream external reference validation started", "evaluation", referenceEvaluation)
 				referenceWG.Add(1)
 				go func() {

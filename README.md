@@ -254,6 +254,12 @@ HTTP latency, total validation time, context slot, and any unavailability
 reason. The external result never changes the local
 classification and never signs or broadcasts a transaction.
 
+The YAML setting can be overridden for a live run without editing the setup:
+`--reference-quote config` preserves the manifest, `--reference-quote off`
+disables external validation, and `--reference-quote <source_id>` selects a
+configured source for Solana markets. The override remains asynchronous and
+never enters local sizing or quote calculation.
+
 The topology wiring is intentionally small and reusable:
 
 ```yaml
