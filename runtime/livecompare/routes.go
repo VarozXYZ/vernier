@@ -68,7 +68,6 @@ func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	routes := make([]routeRuntime, 0, len(r.config.Markets))
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	referenceSources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
@@ -82,7 +81,6 @@ func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
 			return Report{}, fmt.Errorf("route %s did not publish a snapshot", configured.ID)
 		}
 		r.logger.Info("route bootstrap complete", "market", configured.ID, "hops", len(route.children), "version", snapshot.Metadata().Version)
-		routes = append(routes, route)
 		source := quoteport.Source(route.route.Source)
 		if configured.ReferenceQuote != "" {
 			reference, err := r.externalSource(configured, source)
