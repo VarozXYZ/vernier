@@ -77,6 +77,51 @@ func TestMeteoraDLMMUsesBinPriceAndOneSidedLiquidity(t *testing.T) {
 	}
 }
 
+func TestMeteoraDLMMStartsAtActiveBinInBothDirections(t *testing.T) {
+	scale := new(big.Int).Lsh(big.NewInt(1), 64)
+	binBelow, err := dlmm.NewBinWithPrice(0, big.NewInt(1_000), big.NewInt(1_000), scale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binActive, err := dlmm.NewBinWithPrice(1, big.NewInt(500), big.NewInt(1_000), new(big.Int).Lsh(big.NewInt(1), 65))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binAbove, err := dlmm.NewBinWithPrice(2, big.NewInt(1_000), big.NewInt(1_000), new(big.Int).Lsh(big.NewInt(2), 65))
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := dlmm.NewStateUpdate(1, 10, 0, []dlmm.Bin{binBelow, binActive, binAbove})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, hash, err := (dlmm.Reducer{}).Reduce(context.Background(), nil, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testSnapshot(t, "pool", data, hash)
+	quoter, err := dlmm.NewQuoter("meteora", market.Market{ID: "pool", BaseToken: "x", QuoteToken: "y"}, "x", "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	xIn, _ := market.NewTokenAmount("x", big.NewInt(100))
+	forward, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: snapshot, TokenIn: "x", TokenOut: "y", AmountIn: xIn, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.AmountOut.Units().Cmp(big.NewInt(200)) != 0 {
+		t.Fatalf("forward quote = %s, want active-bin output 200", forward.AmountOut.Units())
+	}
+	yIn, _ := market.NewTokenAmount("y", big.NewInt(100))
+	reverse, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: snapshot, TokenIn: "y", TokenOut: "x", AmountIn: yIn, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reverse.AmountOut.Units().Cmp(big.NewInt(50)) != 0 {
+		t.Fatalf("reverse quote = %s, want active-bin output 50", reverse.AmountOut.Units())
+	}
+}
+
 func testSnapshot(t *testing.T, id market.MarketID, data market.SnapshotData, hash [32]byte) market.MarketSnapshot {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	snapshot, err := market.NewMarketSnapshot(market.SnapshotMetadata{Market: id, Source: "feed", Version: 1, ReceivedAt: now, AppliedAt: now, Health: market.HealthHealthy, HealthChangedAt: now, StateHash: hash}, data)
