@@ -48,6 +48,35 @@ func TestMeteoraDLMMGoldenSegmentQuoteAndExactOutput(t *testing.T) {
 	}
 }
 
+func TestMeteoraDLMMUsesBinPriceAndOneSidedLiquidity(t *testing.T) {
+	price := new(big.Int).Lsh(big.NewInt(2), 64)
+	bin, err := dlmm.NewBinWithPrice(0, big.NewInt(0), big.NewInt(2_000), price)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := dlmm.NewStateUpdate(0, 10, 0, []dlmm.Bin{bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, hash, err := (dlmm.Reducer{}).Reduce(context.Background(), nil, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testSnapshot(t, "pool", data, hash)
+	quoter, err := dlmm.NewQuoter("meteora", market.Market{ID: "pool", BaseToken: "x", QuoteToken: "y"}, "x", "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	amount, _ := market.NewTokenAmount("x", big.NewInt(100))
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: snapshot, TokenIn: "x", TokenOut: "y", AmountIn: amount, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.AmountOut.Units().Cmp(big.NewInt(200)) != 0 {
+		t.Fatalf("amount out = %s, want 200", quote.AmountOut.Units())
+	}
+}
+
 func testSnapshot(t *testing.T, id market.MarketID, data market.SnapshotData, hash [32]byte) market.MarketSnapshot {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	snapshot, err := market.NewMarketSnapshot(market.SnapshotMetadata{Market: id, Source: "feed", Version: 1, ReceivedAt: now, AppliedAt: now, Health: market.HealthHealthy, HealthChangedAt: now, StateHash: hash}, data)

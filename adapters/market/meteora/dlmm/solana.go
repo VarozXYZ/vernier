@@ -148,17 +148,26 @@ func parseBinArray(data []byte, expectedIndex int64, pool [32]byte) ([]Bin, erro
 	for offset := 56; offset+binSize <= len(data) && len(result) < binArrayCount; offset += binSize {
 		x := new(big.Int).SetUint64(binary.LittleEndian.Uint64(data[offset : offset+8]))
 		y := new(big.Int).SetUint64(binary.LittleEndian.Uint64(data[offset+8 : offset+16]))
+		price := littleEndianInt(data[offset+16 : offset+32])
 		if x.Sign() == 0 && y.Sign() == 0 {
 			continue
 		}
 		binID := int32(index*binArrayCount + int64((offset-56)/binSize))
-		bin, err := NewBin(binID, x, y)
+		bin, err := NewBinWithPrice(binID, x, y, price)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, bin)
 	}
 	return result, nil
+}
+
+func littleEndianInt(value []byte) *big.Int {
+	copyValue := append([]byte(nil), value...)
+	for left, right := 0, len(copyValue)-1; left < right; left, right = left+1, right-1 {
+		copyValue[left], copyValue[right] = copyValue[right], copyValue[left]
+	}
+	return new(big.Int).SetBytes(copyValue)
 }
 
 func floorDiv(value int64, divisor int64) int64 {
