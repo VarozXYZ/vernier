@@ -61,3 +61,47 @@ func TestJupiterFailureDoesNotHideLocalQuote(t *testing.T) {
 		t.Fatalf("unexpected failure result %+v err=%v", result, err)
 	}
 }
+
+func TestJupiterReferenceUsesProvidedLocalQuote(t *testing.T) {
+	localCalls := 0
+	local := localSourceFunc(func(_ context.Context, input quoteport.Input) (market.Quote, error) {
+		localCalls++
+		out, _ := market.NewTokenAmount(input.TokenOut, big.NewInt(90))
+		return market.NewQuote(market.Quote{Source: "local", Market: "pool", SnapshotVersion: 1, Purpose: input.Purpose, Mode: market.QuoteModeExactInput, AmountIn: input.AmountIn, AmountOut: out, QuotedAt: input.QuotedAt})
+	})
+	source, err := jupiter.New(jupiter.Config{ID: "jupiter", BaseURL: "https://jupiter.test", Taker: "public-taker", TokenMints: map[market.TokenID]string{"in": "mint-in", "out": "mint-out"}, Local: local, Client: clientFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"outAmount":"95"}`))}, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	amount, _ := market.NewTokenAmount("in", big.NewInt(100))
+	localQuote, _ := market.NewQuote(market.Quote{Source: "local", Market: "pool", SnapshotVersion: 1, Purpose: market.QuotePurposeResearchDiscovery, Mode: market.QuoteModeExactInput, AmountIn: amount, AmountOut: mustAmount(t, "out", "90"), QuotedAt: time.Now()})
+	evidence, err := source.Reference(context.Background(), quoteport.Input{TokenIn: "in", TokenOut: "out", AmountIn: amount, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()}, localQuote)
+	if err != nil || evidence.Status != quoteport.ReferenceAvailable || evidence.AmountOut.Units().Cmp(big.NewInt(95)) != 0 {
+		t.Fatalf("unexpected reference: %+v err=%v", evidence, err)
+	}
+	if localCalls != 0 {
+		t.Fatalf("external validation recalculated local quote %d times", localCalls)
+	}
+}
+
+type localSourceFunc func(context.Context, quoteport.Input) (market.Quote, error)
+
+func (f localSourceFunc) ID() market.SourceID { return "local" }
+func (f localSourceFunc) Quote(ctx context.Context, input quoteport.Input) (market.Quote, error) {
+	return f(ctx, input)
+}
+
+func mustAmount(t *testing.T, token market.TokenID, value string) market.TokenAmount {
+	t.Helper()
+	units, ok := new(big.Int).SetString(value, 10)
+	if !ok {
+		t.Fatal("invalid test amount")
+	}
+	amount, err := market.NewTokenAmount(token, units)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return amount
+}

@@ -192,8 +192,32 @@ Solana topology uses separate `http_url_env` and `websocket_url_env` values.
 Pools are independent from venues, and a `path` lists ordered hops. A healthy
 pool-log subscription has no TTL or slot-gap rule; only a confirmed WebSocket
 disconnect degrades it, and reconnect bootstraps current state without
-backfill. Jupiter validation is asynchronous evidence for the locally selected
-size and never signs or broadcasts a transaction.
+backfill. A market may optionally set `reference_quote` to a modular
+`quote_sources` entry of kind `jupiter`. For each accepted event, Research
+first emits the complete local curve and selected size; only then does a
+background validation request the selected leg. The follow-up record contains
+the local output, external output, signed raw delta, local quote duration,
+HTTP latency, total validation time, context slot, and any unavailability
+reason. The external result never changes the local
+classification and never signs or broadcasts a transaction.
+
+The topology wiring is intentionally small and reusable:
+
+```yaml
+markets:
+  market_external:
+    path: configured_path
+    reference_quote: external_quote
+quote_sources:
+  external_quote:
+    kind: jupiter
+    taker_env: PUBLIC_TAKER
+    slippage_bps: 50
+    max_accounts: 64
+```
+
+The taker and optional API key are environment values; no credentials belong
+in YAML, fixtures, reports, or commits.
 
 ## Development
 
