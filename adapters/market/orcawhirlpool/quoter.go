@@ -1,10 +1,12 @@
 package orcawhirlpool
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/big"
 
+	"github.com/VarozXYZ/vernier/adapters/chain/solana"
 	"github.com/VarozXYZ/vernier/domain/market"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 )
@@ -23,6 +25,28 @@ func NewQuoter(id market.SourceID, candidate market.Market, tokenA, tokenB marke
 		return nil, fmt.Errorf("source, market, and Whirlpool token endpoints are required")
 	}
 	return &Quoter{id: id, market: candidate, tokenA: tokenA, tokenB: tokenB}, nil
+}
+
+// NewQuoterWithAddresses normalizes the configured token IDs to Whirlpool's
+// canonical A/B order. The path order describes the requested trade route,
+// while Whirlpool's swap direction is defined by the pool's mint ordering.
+// Orca creates pools with token_mint_a < token_mint_b by public-key bytes.
+func NewQuoterWithAddresses(id market.SourceID, candidate market.Market, first market.TokenID, firstAddress string, second market.TokenID, secondAddress string) (*Quoter, error) {
+	if firstAddress == "" || secondAddress == "" {
+		return nil, fmt.Errorf("whirlpool token addresses are required")
+	}
+	firstKey, err := solana.DecodePublicKey(firstAddress)
+	if err != nil {
+		return nil, fmt.Errorf("decode first Whirlpool token address: %w", err)
+	}
+	secondKey, err := solana.DecodePublicKey(secondAddress)
+	if err != nil {
+		return nil, fmt.Errorf("decode second Whirlpool token address: %w", err)
+	}
+	if bytes.Compare(firstKey[:], secondKey[:]) < 0 {
+		return NewQuoter(id, candidate, first, second)
+	}
+	return NewQuoter(id, candidate, second, first)
 }
 func (q *Quoter) ID() market.SourceID { return q.id }
 
