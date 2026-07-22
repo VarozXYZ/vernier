@@ -31,7 +31,7 @@ type Decoder struct{ Pool string }
 
 func NewDecoder(pool string) (*Decoder, error) {
 	if pool == "" {
-		return nil, fmt.Errorf("DLMM pool account is required")
+		return nil, fmt.Errorf("dlmm pool account is required")
 	}
 	return &Decoder{Pool: pool}, nil
 }
@@ -39,7 +39,7 @@ func NewDecoder(pool string) (*Decoder, error) {
 func (d *Decoder) Bootstrap(ctx context.Context, network solanalogs.Network, _ uint64) (market.EventData, error) {
 	reader, ok := network.(AccountReader)
 	if !ok {
-		return nil, fmt.Errorf("Solana network does not expose account reads")
+		return nil, fmt.Errorf("solana network does not expose account reads")
 	}
 	account, err := reader.ReadAccount(ctx, d.Pool)
 	if err != nil {

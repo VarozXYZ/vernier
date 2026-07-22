@@ -23,7 +23,7 @@ type Decoder struct{ Pool string }
 
 func NewDecoder(pool string) (*Decoder, error) {
 	if pool == "" {
-		return nil, fmt.Errorf("Whirlpool pool account is required")
+		return nil, fmt.Errorf("whirlpool pool account is required")
 	}
 	return &Decoder{Pool: pool}, nil
 }
@@ -31,7 +31,7 @@ func NewDecoder(pool string) (*Decoder, error) {
 func (d *Decoder) Bootstrap(ctx context.Context, network solanalogs.Network, _ uint64) (market.EventData, error) {
 	reader, ok := network.(AccountReader)
 	if !ok {
-		return nil, fmt.Errorf("Solana network does not expose account reads")
+		return nil, fmt.Errorf("solana network does not expose account reads")
 	}
 	account, err := reader.ReadAccount(ctx, d.Pool)
 	if err != nil {
@@ -50,7 +50,7 @@ func (d *Decoder) Decode(ctx context.Context, network solanalogs.Network, _ sola
 
 func (d *Decoder) decode(data []byte) (StateUpdate, error) {
 	if len(data) < 653 || string(data[:8]) != whirlpoolDiscriminator {
-		return StateUpdate{}, fmt.Errorf("invalid Whirlpool account data")
+		return StateUpdate{}, fmt.Errorf("invalid whirlpool account data")
 	}
 	readU16 := func(offset int) uint16 { return binary.LittleEndian.Uint16(data[offset : offset+2]) }
 	readI32 := func(offset int) int32 { return int32(binary.LittleEndian.Uint32(data[offset : offset+4])) }

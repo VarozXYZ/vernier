@@ -17,11 +17,11 @@ func TestPublicKeyAndPDAEncoding(t *testing.T) {
 		t.Fatalf("public key round trip changed bytes")
 	}
 	program := [32]byte{9}
-	address, bump, err := solana.FindProgramAddress([][]byte{[]byte("state"), key[:]}, program)
+	address, _, err := solana.FindProgramAddress([][]byte{[]byte("state"), key[:]}, program)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bump > 255 || address == [32]byte{} {
+	if address == [32]byte{} {
 		t.Fatalf("invalid PDA result")
 	}
 }
