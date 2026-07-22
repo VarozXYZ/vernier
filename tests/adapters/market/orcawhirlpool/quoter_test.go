@@ -34,6 +34,14 @@ func TestWhirlpoolVirtualReserveQuoteIsIntegerAndImmutable(t *testing.T) {
 	if quote.AmountOut.Units().Cmp(big.NewInt(90)) != 0 {
 		t.Fatalf("amount out = %s, want constant-product output 90", quote.AmountOut.Units())
 	}
+	target, _ := market.NewTokenAmount("b", big.NewInt(90))
+	exact, err := quoter.QuoteExactOutput(context.Background(), quoteport.ExactOutputInput{Snapshot: snapshot, TokenIn: "a", TokenOut: "b", AmountOut: target, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exact.AmountIn.Units().Cmp(big.NewInt(100)) != 0 {
+		t.Fatalf("exact-output input = %s, want 100", exact.AmountIn.Units())
+	}
 	state := snapshot.Data().(orcawhirlpool.Snapshot)
 	price.SetInt64(1)
 	if state.SqrtPriceX64().Cmp(new(big.Int).Lsh(big.NewInt(1), 64)) != 0 {
@@ -65,6 +73,35 @@ func TestWhirlpoolVirtualReserveUsesQ64Scale(t *testing.T) {
 	}
 	if quote.AmountOut.Units().Cmp(big.NewInt(333)) != 0 {
 		t.Fatalf("amount out = %s, want 333", quote.AmountOut.Units())
+	}
+}
+
+func TestWhirlpoolQuoteUsesCoveredInitializedTicks(t *testing.T) {
+	price := new(big.Int).Lsh(big.NewInt(1), 64)
+	tick, err := orcawhirlpool.NewTick(-1, big.NewInt(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := orcawhirlpool.NewCoveredStateUpdate(price, 0, big.NewInt(1_000_000_000_000_000_000), 0, 1, []orcawhirlpool.Tick{tick}, false, -1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, hash, err := (orcawhirlpool.Reducer{}).Reduce(context.Background(), nil, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testSnapshot(t, "pool", data, hash)
+	quoter, err := orcawhirlpool.NewQuoter("orca", market.Market{ID: "pool", BaseToken: "a", QuoteToken: "b"}, "a", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	amount, _ := market.NewTokenAmount("a", big.NewInt(1_000_000_000_000))
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: snapshot, TokenIn: "a", TokenOut: "b", AmountIn: amount, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.AmountOut.Units().Sign() <= 0 {
+		t.Fatal("covered tick quote produced no output")
 	}
 }
 

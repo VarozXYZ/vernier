@@ -15,6 +15,7 @@ import (
 )
 
 const snapshotSchemaVersion uint16 = 1
+const feeRatePrecision uint32 = 1_000_000
 
 type Tick struct {
 	index        int32
@@ -34,7 +35,7 @@ type StateUpdate struct {
 	sqrtPriceX64 *big.Int
 	tick         int32
 	liquidity    *big.Int
-	feeBPS       uint16
+	feeRate      uint32
 	tickSpacing  int32
 	ticks        []Tick
 	fullCoverage bool
@@ -43,14 +44,17 @@ type StateUpdate struct {
 }
 
 func NewStateUpdate(sqrtPriceX64 *big.Int, tick int32, liquidity *big.Int, feeBPS uint16, tickSpacing int32, ticks []Tick) (StateUpdate, error) {
-	return NewCoveredStateUpdate(sqrtPriceX64, tick, liquidity, feeBPS, tickSpacing, ticks, true, 0, 0)
+	return NewCoveredStateUpdateWithFeeRate(sqrtPriceX64, tick, liquidity, uint32(feeBPS)*100, tickSpacing, ticks, true, 0, 0)
 }
 func NewCoveredStateUpdate(sqrtPriceX64 *big.Int, tick int32, liquidity *big.Int, feeBPS uint16, tickSpacing int32, ticks []Tick, full bool, minTick, maxTick int32) (StateUpdate, error) {
-	state := Snapshot{schemaVersion: snapshotSchemaVersion, sqrtPriceX64: clone(sqrtPriceX64), tick: tick, liquidity: clone(liquidity), feeBPS: feeBPS, tickSpacing: tickSpacing, ticks: cloneTicks(ticks), fullCoverage: full, minTick: minTick, maxTick: maxTick}
+	return NewCoveredStateUpdateWithFeeRate(sqrtPriceX64, tick, liquidity, uint32(feeBPS)*100, tickSpacing, ticks, full, minTick, maxTick)
+}
+func NewCoveredStateUpdateWithFeeRate(sqrtPriceX64 *big.Int, tick int32, liquidity *big.Int, feeRate uint32, tickSpacing int32, ticks []Tick, full bool, minTick, maxTick int32) (StateUpdate, error) {
+	state := Snapshot{schemaVersion: snapshotSchemaVersion, sqrtPriceX64: clone(sqrtPriceX64), tick: tick, liquidity: clone(liquidity), feeRate: feeRate, tickSpacing: tickSpacing, ticks: cloneTicks(ticks), fullCoverage: full, minTick: minTick, maxTick: maxTick}
 	if err := state.validate(); err != nil {
 		return StateUpdate{}, err
 	}
-	return StateUpdate{sqrtPriceX64: state.SqrtPriceX64(), tick: tick, liquidity: state.Liquidity(), feeBPS: feeBPS, tickSpacing: tickSpacing, ticks: state.Ticks(), fullCoverage: full, minTick: minTick, maxTick: maxTick}, nil
+	return StateUpdate{sqrtPriceX64: state.SqrtPriceX64(), tick: tick, liquidity: state.Liquidity(), feeRate: feeRate, tickSpacing: tickSpacing, ticks: state.Ticks(), fullCoverage: full, minTick: minTick, maxTick: maxTick}, nil
 }
 func (StateUpdate) EventKind() string { return "orca_whirlpool/state/v1" }
 
@@ -88,7 +92,7 @@ type Snapshot struct {
 	sqrtPriceX64  *big.Int
 	tick          int32
 	liquidity     *big.Int
-	feeBPS        uint16
+	feeRate       uint32
 	tickSpacing   int32
 	ticks         []Tick
 	fullCoverage  bool
@@ -100,19 +104,25 @@ func (Snapshot) SnapshotKind() string     { return "orca_whirlpool/v1" }
 func (s Snapshot) SqrtPriceX64() *big.Int { return clone(s.sqrtPriceX64) }
 func (s Snapshot) Tick() int32            { return s.tick }
 func (s Snapshot) Liquidity() *big.Int    { return clone(s.liquidity) }
-func (s Snapshot) FeeBPS() uint16         { return s.feeBPS }
-func (s Snapshot) TickSpacing() int32     { return s.tickSpacing }
-func (s Snapshot) Ticks() []Tick          { return cloneTicks(s.ticks) }
-func (s Snapshot) FullCoverage() bool     { return s.fullCoverage }
-func (s Snapshot) MinTick() int32         { return s.minTick }
-func (s Snapshot) MaxTick() int32         { return s.maxTick }
+func (s Snapshot) FeeRate() uint32        { return s.feeRate }
+func (s Snapshot) FeeBPS() uint16 {
+	return uint16((uint64(s.feeRate)*10_000 + uint64(feeRatePrecision) - 1) / uint64(feeRatePrecision))
+}
+func (s Snapshot) TickSpacing() int32 { return s.tickSpacing }
+func (s Snapshot) Ticks() []Tick      { return cloneTicks(s.ticks) }
+func (s Snapshot) FullCoverage() bool { return s.fullCoverage }
+func (s Snapshot) MinTick() int32     { return s.minTick }
+func (s Snapshot) MaxTick() int32     { return s.maxTick }
 
 func (s Snapshot) validate() error {
-	if s.schemaVersion != snapshotSchemaVersion || s.sqrtPriceX64 == nil || s.sqrtPriceX64.Sign() <= 0 || s.liquidity == nil || s.liquidity.Sign() < 0 || s.feeBPS >= 10_000 || s.tickSpacing <= 0 {
+	if s.schemaVersion != snapshotSchemaVersion || s.sqrtPriceX64 == nil || s.sqrtPriceX64.Sign() <= 0 || s.liquidity == nil || s.liquidity.Sign() < 0 || s.feeRate >= feeRatePrecision || s.tickSpacing <= 0 {
 		return fmt.Errorf("invalid Orca Whirlpool state")
 	}
 	if !s.fullCoverage && s.minTick > s.maxTick {
 		return fmt.Errorf("invalid Whirlpool tick coverage")
+	}
+	if !s.fullCoverage && (s.tick < s.minTick || s.tick > s.maxTick) {
+		return fmt.Errorf("current Whirlpool tick is outside declared coverage")
 	}
 	previous := int32(-1 << 31)
 	for _, tick := range s.ticks {
@@ -133,7 +143,7 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 	var next Snapshot
 	switch update := event.(type) {
 	case StateUpdate:
-		next = Snapshot{schemaVersion: snapshotSchemaVersion, sqrtPriceX64: clone(update.sqrtPriceX64), tick: update.tick, liquidity: clone(update.liquidity), feeBPS: update.feeBPS, tickSpacing: update.tickSpacing, ticks: cloneTicks(update.ticks), fullCoverage: update.fullCoverage, minTick: update.minTick, maxTick: update.maxTick}
+		next = Snapshot{schemaVersion: snapshotSchemaVersion, sqrtPriceX64: clone(update.sqrtPriceX64), tick: update.tick, liquidity: clone(update.liquidity), feeRate: update.feeRate, tickSpacing: update.tickSpacing, ticks: cloneTicks(update.ticks), fullCoverage: update.fullCoverage, minTick: update.minTick, maxTick: update.maxTick}
 	case SwapUpdate:
 		current, err := require(previous)
 		if err != nil {
@@ -200,7 +210,7 @@ func clone(value *big.Int) *big.Int {
 }
 func hashState(state Snapshot) [sha256.Size]byte {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d|%s|%d|%s|%d|%d|%t|%d|%d", state.schemaVersion, state.sqrtPriceX64, state.tick, state.liquidity, state.feeBPS, state.tickSpacing, state.fullCoverage, state.minTick, state.maxTick)
+	fmt.Fprintf(&b, "%d|%s|%d|%s|%d|%d|%t|%d|%d", state.schemaVersion, state.sqrtPriceX64, state.tick, state.liquidity, state.feeRate, state.tickSpacing, state.fullCoverage, state.minTick, state.maxTick)
 	for _, tick := range state.ticks {
 		fmt.Fprintf(&b, "|%d:%s", tick.index, tick.liquidityNet)
 	}
