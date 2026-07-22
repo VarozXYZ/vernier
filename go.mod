@@ -9,6 +9,7 @@ tool (
 )
 
 require (
+	filippo.io/edwards25519 v1.1.0
 	github.com/ethereum/go-ethereum v1.17.4
 	modernc.org/sqlite v1.54.0
 )
@@ -42,7 +43,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
-	github.com/gorilla/websocket v1.4.2 // indirect
+	github.com/gorilla/websocket v1.4.2
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

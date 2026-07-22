@@ -127,6 +127,9 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 }
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
+	if r.requiresRouteRuntime() {
+		return r.runRoutes(ctx)
+	}
 	startedAt := r.clock().UTC()
 	r.logger.Info("point-in-time research started", "run", r.config.RunID, "markets", len(r.config.Markets))
 	blocks, err := r.currentBlocks(ctx)

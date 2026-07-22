@@ -106,10 +106,11 @@ type PathHopConfig struct {
 }
 
 type MarketConfig struct {
-	Venue      string `yaml:"venue"`
-	Path       string `yaml:"path"`
-	BaseToken  string `yaml:"base_token"`
-	QuoteToken string `yaml:"quote_token"`
+	Venue          string `yaml:"venue"`
+	Path           string `yaml:"path"`
+	BaseToken      string `yaml:"base_token"`
+	QuoteToken     string `yaml:"quote_token"`
+	ReferenceQuote string `yaml:"reference_quote"`
 }
 
 type QuoteSourceConfig struct {
@@ -197,11 +198,12 @@ type ResolvedVenue struct {
 }
 
 type ResolvedMarket struct {
-	ID    market.MarketID
-	Venue ResolvedVenue
-	Base  ResolvedToken
-	Quote ResolvedToken
-	Path  []ResolvedHop
+	ID             market.MarketID
+	Venue          ResolvedVenue
+	Base           ResolvedToken
+	Quote          ResolvedToken
+	Path           []ResolvedHop
+	ReferenceQuote string
 }
 
 type ResolvedHop struct {
@@ -219,6 +221,16 @@ type ResolvedPriceSource struct {
 	Fallback ProviderConfig
 }
 
+type ResolvedQuoteSource struct {
+	ID          string
+	Kind        string
+	BaseURL     string
+	TakerEnv    string
+	APIKeyEnv   string
+	SlippageBPS uint16
+	MaxAccounts uint16
+}
+
 type ParsedConfig struct {
 	Hash          string
 	ResearchID    string
@@ -229,6 +241,7 @@ type ParsedConfig struct {
 	Chains        map[string]ResolvedChain
 	Markets       [2]ResolvedMarket
 	PriceSource   ResolvedPriceSource
+	QuoteSources  map[string]ResolvedQuoteSource
 	FixedCost     *big.Rat
 	MinimumSize   *big.Rat
 	MaximumSize   *big.Rat
@@ -324,6 +337,14 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 		}
 		assets[market.AssetID(id)] = market.Asset{ID: market.AssetID(id), Symbol: config.Symbol}
 	}
+	quoteSources := make(map[string]ResolvedQuoteSource, len(topology.QuoteSources))
+	for id, config := range topology.QuoteSources {
+		resolved, err := resolveQuoteSource(id, config)
+		if err != nil {
+			return ParsedConfig{}, err
+		}
+		quoteSources[id] = resolved
+	}
 	chains := make(map[string]ResolvedChain)
 	markets := [2]ResolvedMarket{}
 	for index, id := range setup.Markets {
@@ -333,6 +354,13 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 		}
 		markets[index] = resolved
 		chains[chain.ID] = chain
+	}
+	for _, resolved := range markets {
+		if resolved.ReferenceQuote != "" {
+			if _, ok := quoteSources[resolved.ReferenceQuote]; !ok {
+				return ParsedConfig{}, fmt.Errorf("market %q references unknown quote source %q", resolved.ID, resolved.ReferenceQuote)
+			}
+		}
 	}
 	if markets[0].Base.Token.Asset != markets[1].Base.Token.Asset || markets[0].Quote.Token.Asset != markets[1].Quote.Token.Asset {
 		return ParsedConfig{}, fmt.Errorf("setup markets must share base and quote assets")
@@ -395,7 +423,7 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 	sum := sha256.Sum256(canonical)
 	return ParsedConfig{
 		Hash: hex.EncodeToString(sum[:]), ResearchID: manifest.ActiveResearch, RunID: research.RunID,
-		SetupID: research.Setup, InventoryMode: research.InventoryMode, Assets: assets, Chains: chains, Markets: markets,
+		SetupID: research.Setup, InventoryMode: research.InventoryMode, Assets: assets, Chains: chains, Markets: markets, QuoteSources: quoteSources,
 		PriceSource: ResolvedPriceSource{ID: market.SourceID(research.PriceSource), Base: market.AssetID(priceConfig.BaseAsset), Quote: market.AssetID(priceConfig.QuoteAsset), Primary: priceConfig.Primary, Fallback: priceConfig.Fallback},
 		FixedCost:   fixedCost, MinimumSize: minimum, MaximumSize: maximum, SizeSamples: research.Sizing.Samples, SizingAsset: sizingAsset, MinimumNet: minimumNet,
 	}, nil
@@ -430,7 +458,7 @@ func resolveMarket(id string, topology Topology, assets map[market.AssetID]marke
 		if err != nil || base.Token.ID == quote.Token.ID || base.Token.Asset == quote.Token.Asset {
 			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q requires distinct valid endpoints", id)
 		}
-		return ResolvedMarket{ID: market.MarketID(id), Venue: resolvedPath[0].Venue, Base: base, Quote: quote, Path: resolvedPath}, chain, nil
+		return ResolvedMarket{ID: market.MarketID(id), Venue: resolvedPath[0].Venue, Base: base, Quote: quote, Path: resolvedPath, ReferenceQuote: config.ReferenceQuote}, chain, nil
 	}
 	venueConfig, ok := topology.Venues[config.Venue]
 	if !ok {
@@ -452,7 +480,7 @@ func resolveMarket(id string, topology Topology, assets map[market.AssetID]marke
 	if err != nil {
 		return ResolvedMarket{}, ResolvedChain{}, err
 	}
-	return ResolvedMarket{ID: market.MarketID(id), Venue: venue, Base: base, Quote: quote, Path: []ResolvedHop{{Pool: config.Venue, Venue: venue, In: base, Out: quote}}}, chain, nil
+	return ResolvedMarket{ID: market.MarketID(id), Venue: venue, Base: base, Quote: quote, Path: []ResolvedHop{{Pool: config.Venue, Venue: venue, In: base, Out: quote}}, ReferenceQuote: config.ReferenceQuote}, chain, nil
 }
 
 func resolvePath(id string, config PathConfig, topology Topology, assets map[market.AssetID]market.Asset) ([]ResolvedHop, ResolvedChain, error) {
@@ -605,6 +633,19 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 		}
 	}
 	return ResolvedVenue{ID: id, Kind: config.Kind, Chain: config.Chain, Pool: pool, PoolText: poolText, Factory: factory, Reference: reference, FeeBPS: config.FeeBPS, Stable: config.Stable, MaxTickWords: config.MaxTickWords}, nil
+}
+
+func resolveQuoteSource(id string, config QuoteSourceConfig) (ResolvedQuoteSource, error) {
+	if strings.TrimSpace(id) == "" || config.Kind != "jupiter" || strings.TrimSpace(config.TakerEnv) == "" || !environmentName.MatchString(config.TakerEnv) {
+		return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid Jupiter profile", id)
+	}
+	if config.APIKeyEnv != "" && !environmentName.MatchString(config.APIKeyEnv) {
+		return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid API key environment", id)
+	}
+	if config.SlippageBPS > 10_000 || config.MaxAccounts > 256 {
+		return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid request limits", id)
+	}
+	return ResolvedQuoteSource{ID: id, Kind: config.Kind, BaseURL: config.BaseURL, TakerEnv: config.TakerEnv, APIKeyEnv: config.APIKeyEnv, SlippageBPS: config.SlippageBPS, MaxAccounts: config.MaxAccounts}, nil
 }
 
 func validateProvider(config ProviderConfig, chains map[string]ChainConfig) error {

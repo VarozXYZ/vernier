@@ -45,6 +45,9 @@ type streamSignal struct {
 // It never asks a venue for a quote in the event loop and it does not infer
 // gaps from block numbers. Feed reconnects own the full bootstrap lifecycle.
 func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
+	if r.requiresRouteRuntime() {
+		return r.runRouteStream(ctx, options)
+	}
 	if options.Updates < 0 {
 		return fmt.Errorf("stream updates cannot be negative")
 	}
