@@ -106,6 +106,15 @@ type Account struct {
 	Data       []byte
 }
 
+// AccountNotification contains the complete account value delivered by an
+// accountSubscribe WebSocket notification. The slot is the only ordering
+// evidence supplied by the node.
+type AccountNotification struct {
+	Slot    uint64
+	Account string
+	Value   Account
+}
+
 func (n *ReadOnlyNetwork) ReadAccount(ctx context.Context, address string) (Account, error) {
 	accounts, err := n.ReadMultipleAccounts(ctx, []string{address})
 	if err != nil {
@@ -264,6 +273,12 @@ type LogsSubscription interface {
 	Unsubscribe()
 }
 
+type AccountSubscription interface {
+	Err() <-chan error
+	Notifications() <-chan AccountNotification
+	Unsubscribe()
+}
+
 func (n *ReadOnlyNetwork) SubscribeLogs(ctx context.Context, pool string) (LogsSubscription, error) {
 	if strings.TrimSpace(pool) == "" {
 		return nil, fmt.Errorf("pool account is required")
@@ -296,6 +311,42 @@ func (n *ReadOnlyNetwork) SubscribeLogs(ctx context.Context, pool string) (LogsS
 		return nil, fmt.Errorf("invalid logsSubscribe response")
 	}
 	subscription := &logsSubscription{conn: conn, id: response.Result, errors: make(chan error, 1), notifications: make(chan LogNotification, 128), done: make(chan struct{})}
+	go subscription.readLoop()
+	return subscription, nil
+}
+
+func (n *ReadOnlyNetwork) SubscribeAccount(ctx context.Context, account string) (AccountSubscription, error) {
+	if strings.TrimSpace(account) == "" {
+		return nil, fmt.Errorf("account is required")
+	}
+	conn, _, err := n.dialer.DialContext(ctx, n.websocketURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s WebSocket endpoint: %w", n.label, err)
+	}
+	id := n.requestID.Add(1)
+	request := rpcRequest{JSONRPC: "2.0", ID: id, Method: "accountSubscribe", Params: []any{account, map[string]string{"commitment": "processed", "encoding": "base64"}}}
+	if err := conn.WriteJSON(request); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	var response struct {
+		ID     uint64    `json:"id"`
+		Result uint64    `json:"result"`
+		Error  *RPCError `json:"error"`
+	}
+	if err := conn.ReadJSON(&response); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if response.Error != nil {
+		conn.Close()
+		return nil, response.Error
+	}
+	if response.ID != id {
+		conn.Close()
+		return nil, fmt.Errorf("invalid accountSubscribe response")
+	}
+	subscription := &accountSubscription{conn: conn, account: account, id: response.Result, errors: make(chan error, 1), notifications: make(chan AccountNotification, 128), done: make(chan struct{})}
 	go subscription.readLoop()
 	return subscription, nil
 }
@@ -363,3 +414,72 @@ func (s *logsSubscription) readLoop() {
 }
 
 var _ LogsSubscription = (*logsSubscription)(nil)
+
+type accountSubscription struct {
+	mu            sync.Mutex
+	conn          *websocket.Conn
+	account       string
+	id            uint64
+	errors        chan error
+	notifications chan AccountNotification
+	done          chan struct{}
+	once          sync.Once
+}
+
+func (s *accountSubscription) Err() <-chan error                         { return s.errors }
+func (s *accountSubscription) Notifications() <-chan AccountNotification { return s.notifications }
+func (s *accountSubscription) Unsubscribe() {
+	s.once.Do(func() {
+		close(s.done)
+		s.mu.Lock()
+		_ = s.conn.WriteJSON(rpcRequest{JSONRPC: "2.0", ID: s.id + 1, Method: "accountUnsubscribe", Params: []any{s.id}})
+		_ = s.conn.Close()
+		s.mu.Unlock()
+	})
+}
+
+func (s *accountSubscription) readLoop() {
+	defer close(s.notifications)
+	defer close(s.errors)
+	for {
+		var message struct {
+			Method string `json:"method"`
+			Params struct {
+				Result struct {
+					Context struct {
+						Slot uint64 `json:"slot"`
+					} `json:"context"`
+					Value *jsonAccountValue `json:"value"`
+				} `json:"result"`
+			} `json:"params"`
+		}
+		if err := s.conn.ReadJSON(&message); err != nil {
+			select {
+			case <-s.done:
+				return
+			case s.errors <- err:
+			}
+			return
+		}
+		if message.Method != "accountNotification" || message.Params.Result.Value == nil {
+			continue
+		}
+		value, err := message.Params.Result.Value.account()
+		if err != nil {
+			select {
+			case <-s.done:
+				return
+			case s.errors <- err:
+			}
+			return
+		}
+		notification := AccountNotification{Slot: message.Params.Result.Context.Slot, Account: s.account, Value: value}
+		select {
+		case <-s.done:
+			return
+		case s.notifications <- notification:
+		}
+	}
+}
+
+var _ AccountSubscription = (*accountSubscription)(nil)

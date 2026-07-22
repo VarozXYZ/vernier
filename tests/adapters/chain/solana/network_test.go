@@ -103,6 +103,50 @@ func TestLogsSubscriptionUsesMentionFilterAndPublishesSlot(t *testing.T) {
 	}
 }
 
+func TestAccountSubscriptionPublishesAccountDataAndSlot(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var request map[string]any
+		if err := conn.ReadJSON(&request); err != nil {
+			return
+		}
+		if request["method"] != "accountSubscribe" {
+			t.Errorf("unexpected method: %#v", request["method"])
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": request["id"], "result": 8})
+		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "method": "accountNotification", "params": map[string]any{"result": map[string]any{"context": map[string]any{"slot": 123}, "value": map[string]any{"lamports": 7, "owner": "owner", "executable": false, "rentEpoch": 1, "data": []string{"AQID", "base64"}}}}})
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	network, err := solana.NewReadOnlyNetwork("solana", "test", "http://127.0.0.1:1", websocketURL(server.URL), server.Client(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription, err := network.SubscribeAccount(context.Background(), "pool-account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Unsubscribe()
+	select {
+	case notification := <-subscription.Notifications():
+		if notification.Slot != 123 || notification.Account != "pool-account" || notification.Value.Lamports != 7 || string(notification.Value.Data) != "\x01\x02\x03" {
+			t.Fatalf("unexpected notification %+v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for account notification")
+	}
+}
+
 func websocketURL(httpURL string) string {
 	parsed, _ := url.Parse(httpURL)
 	parsed.Scheme = "ws"
