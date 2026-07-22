@@ -169,6 +169,33 @@ sizing sample. Add `--calculations full` when auditing the complete curve,
 quotes, costs, snapshots, and parity evidence. This output switch is separate
 from `--log-level debug`, which is reserved for runtime diagnostics.
 
+### Running a configured route
+
+The same command starts Research for any private modular manifest. Keep that
+manifest and its topology/policy files outside the public tree, and provide
+only endpoint, taker, and optional provider-key values through `.env`:
+
+~~~console
+go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env --format text
+~~~
+
+For a live, read-only run use the pool-filtered subscriptions and emit one
+report per accepted route update:
+
+~~~console
+go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env --stream --updates 1 --format jsonl --log-level info
+~~~
+
+Startup validates every configured endpoint, bootstraps every hop in both
+markets, and waits for complete route snapshots before the first local
+evaluation. The point-in-time command exits after that evaluation. Stream mode
+then starts one feed per hop; an accepted event identifies its triggering hop,
+updates only that mirror, and reevaluates the composed route. A configured
+external quote source is called only after local sizing has selected the best
+candidate, on a background path, so its latency cannot delay or change the
+local Research result. No signer, broadcast, bridge, or raw-event persistence
+is reachable from this command.
+
 Stream mode caches the external cost evidence and never performs venue parity
 RPC calls on the event loop. A healthy WebSocket has no age expiry. Events
 proven older by block evidence are ignored; a confirmed disconnect degrades

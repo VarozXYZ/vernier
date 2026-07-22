@@ -178,7 +178,9 @@ paths:
     hops: [{pool: sol_asset_a, token_in: asset_a_sol, token_out: sol_sol}, {pool: sol_asset_b, token_in: sol_sol, token_out: asset_b_sol}]
 markets:
   rh: {path: rh_path, base_token: asset_a_rh, quote_token: asset_b_rh}
-  sol: {path: sol_path, base_token: asset_a_sol, quote_token: asset_b_sol}
+  sol: {path: sol_path, base_token: asset_a_sol, quote_token: asset_b_sol, reference_quote: external}
+quote_sources:
+  external: {kind: jupiter, taker_env: PUBLIC_TAKER, slippage_bps: 50, max_accounts: 64}
 price_sources:
   asset_b_usd: {base_asset: asset_b, quote_asset: usd, primary: {kind: coingecko, coin_id: usd-coin, currency: usd}, fallback: {kind: chainlink, chain: robinhood, feed_address: "0x0000000000000000000000000000000000000007"}}
 `
@@ -190,7 +192,7 @@ research: {route: {run_id: route, setup: route_setup, inventory_mode: prepositio
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Chains["solana"].Kind != "solana" || config.Chains["solana"].HTTPURLEnv != "SOL_HTTP" || len(config.Markets[0].Path) != 2 || len(config.Markets[1].Path) != 2 {
+	if config.Chains["solana"].Kind != "solana" || config.Chains["solana"].HTTPURLEnv != "SOL_HTTP" || len(config.Markets[0].Path) != 2 || len(config.Markets[1].Path) != 2 || config.Markets[1].ReferenceQuote != "external" || config.QuoteSources["external"].Kind != "jupiter" {
 		t.Fatalf("unexpected cross-chain config: %+v", config)
 	}
 }

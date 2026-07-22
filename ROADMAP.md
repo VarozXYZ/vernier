@@ -28,9 +28,11 @@ degradation explicitly.
 
 The cross-chain route slice now also has protocol-neutral multi-hop snapshots,
 read-only Solana RPC/log capabilities, canonical Meteora DLMM and Orca
-Whirlpool local quote models, and optional Jupiter reference evidence. Runtime
-composition remains experimental; signing, broadcast, bridges, and event
-persistence are not part of this milestone.
+Whirlpool local quote models, and optional Jupiter reference evidence. The
+`research compare-live` command can bootstrap and stream any private modular
+route manifest without putting that topology in the public tree. Runtime
+composition and protocol coverage remain experimental; signing, broadcast,
+bridges, and event persistence are not part of this milestone.
 
 ## 3. Durable Research
 
