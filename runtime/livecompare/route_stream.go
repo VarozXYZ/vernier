@@ -146,7 +146,7 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 			if err := options.OnReport(report); err != nil {
 				return err
 			}
-			if len(r.config.QuoteSources) > 0 || len(r.referenceSources) > 0 {
+			if r.referencesEnabled() && (len(r.config.QuoteSources) > 0 || len(r.referenceSources) > 0) {
 				referenceEvaluation := evaluations + 1
 				referenceSnapshots := append([]market.MarketSnapshot(nil), snapshots...)
 				referenceOpportunities := append([]arbitrage.Opportunity(nil), research.Opportunities...)
