@@ -136,6 +136,63 @@ func TestPublicVirtualSetupResolves(t *testing.T) {
 	}
 }
 
+func TestLoadConfigResolvesSolanaAndMultiHopPaths(t *testing.T) {
+	manifest := `schema_version: 1
+topology: topology.yaml
+policy: policy.yaml
+active_research: cashcat
+`
+	topology := `schema_version: 1
+chains:
+  robinhood: {kind: evm, label: Robinhood, chain_id: "4663", rpc_url_env: RH_RPC}
+  solana: {kind: solana, label: Solana, chain_id: solana, http_url_env: SOL_HTTP, websocket_url_env: SOL_WS}
+assets:
+  cashcat: {symbol: CASHCAT}
+  sol: {symbol: SOL}
+  usdg: {symbol: USDG}
+  usd: {symbol: USD}
+tokens:
+  cashcat_rh: {asset: cashcat, chain: robinhood, address: "0x0000000000000000000000000000000000000001", decimals: 18, symbol: CASHCAT}
+  weth_rh: {asset: sol, chain: robinhood, address: "0x0000000000000000000000000000000000000002", decimals: 18, symbol: WETH}
+  usdg_rh: {asset: usdg, chain: robinhood, address: "0x0000000000000000000000000000000000000003", decimals: 6, symbol: USDG}
+  cashcat_sol: {asset: cashcat, chain: solana, address: CashcatZMRn4Jv8sPQZUSsbTLi2PcPe1ssqbHcnaJqSS, decimals: 9, symbol: CASHCAT}
+  sol_sol: {asset: sol, chain: solana, address: So11111111111111111111111111111111111111112, decimals: 9, symbol: SOL}
+  usdg_sol: {asset: usdg, chain: solana, address: 2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH, decimals: 6, symbol: USDG}
+venues:
+  uniswap: {kind: uniswap_v3, chain: robinhood, pool_address: "0x0000000000000000000000000000000000000004", reference_address: "0x0000000000000000000000000000000000000005"}
+  meteora: {kind: meteora_dlmm, chain: solana, pool_address: pool-rh, reference_address: ""}
+  orca: {kind: orca_whirlpool, chain: solana, pool_address: pool-sol, reference_address: ""}
+pools:
+  rh_cashcat_weth: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000004"}
+  rh_weth_usdg: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000006"}
+  sol_cashcat: {venue: meteora, chain: solana, address: 9ecxXoNLdGrcizhAPYLHnwwBAWyVKBXYo7R2miN8hffF}
+  sol_usdg: {venue: orca, chain: solana, address: 5KqohoeGjTjyHAFJJywK4J7fkFuK82PfMyuseGgLKZu2}
+paths:
+  rh_path:
+    chain: robinhood
+    hops: [{pool: rh_cashcat_weth, token_in: cashcat_rh, token_out: weth_rh}, {pool: rh_weth_usdg, token_in: weth_rh, token_out: usdg_rh}]
+  sol_path:
+    chain: solana
+    hops: [{pool: sol_cashcat, token_in: cashcat_sol, token_out: sol_sol}, {pool: sol_usdg, token_in: sol_sol, token_out: usdg_sol}]
+markets:
+  rh: {path: rh_path, base_token: cashcat_rh, quote_token: usdg_rh}
+  sol: {path: sol_path, base_token: cashcat_sol, quote_token: usdg_sol}
+price_sources:
+  usdg_usd: {base_asset: usdg, quote_asset: usd, primary: {kind: coingecko, coin_id: usd-coin, currency: usd}, fallback: {kind: chainlink, chain: robinhood, feed_address: "0x0000000000000000000000000000000000000007"}}
+`
+	policy := `schema_version: 1
+setups: {cashcat_setup: {markets: [rh, sol]}}
+research: {cashcat: {run_id: cashcat, setup: cashcat_setup, inventory_mode: prepositioned, price_source: usdg_usd, fixed_cost: {asset: usd, amount: "0.5"}, min_net_profit: "0", sizing: {kind: linear_range, asset: quote, min: "100", max: "5000", samples: 10}}}
+`
+	config, err := configuration.LoadConfig(writeConfig(t, manifest, topology, policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Chains["solana"].Kind != "solana" || config.Chains["solana"].HTTPURLEnv != "SOL_HTTP" || len(config.Markets[0].Path) != 2 || len(config.Markets[1].Path) != 2 {
+		t.Fatalf("unexpected cross-chain config: %+v", config)
+	}
+}
+
 func writeConfig(t *testing.T, manifest, topology, policy string) string {
 	t.Helper()
 	directory := t.TempDir()
