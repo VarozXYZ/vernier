@@ -52,6 +52,7 @@ type Report struct {
 	Opportunities []arbitrage.Opportunity
 	IgnoredEvents []IgnoredEvent
 	FeedIncidents []FeedIncident
+	LocalTiming   strategy.EvaluationTiming
 }
 
 type Runner struct {
