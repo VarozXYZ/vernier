@@ -133,7 +133,7 @@ func (d *Decoder) decode(ctx context.Context, reader AccountReader, data []byte)
 		}
 		bins = append(bins, parsed...)
 	}
-	return NewStateUpdate(activeID, binStep, feeBPS, bins)
+	return NewStateUpdateWithFeeRate(activeID, binStep, totalRate, bins)
 }
 
 func parseBinArray(data []byte, expectedIndex int64, pool [32]byte) ([]Bin, error) {

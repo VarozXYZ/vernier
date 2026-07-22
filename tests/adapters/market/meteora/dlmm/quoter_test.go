@@ -120,6 +120,24 @@ func TestMeteoraDLMMStartsAtActiveBinInBothDirections(t *testing.T) {
 	if reverse.AmountOut.Units().Cmp(big.NewInt(50)) != 0 {
 		t.Fatalf("reverse quote = %s, want active-bin output 50", reverse.AmountOut.Units())
 	}
+	// Crossing the active bin must follow the protocol direction: X->Y moves
+	// to lower IDs, while Y->X moves to higher IDs.
+	wideX, _ := market.NewTokenAmount("x", big.NewInt(600))
+	wideForward, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: snapshot, TokenIn: "x", TokenOut: "y", AmountIn: wideX, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wideForward.AmountOut.Units().Cmp(big.NewInt(1100)) != 0 {
+		t.Fatalf("wide forward quote = %s, want 1100", wideForward.AmountOut.Units())
+	}
+	wideY, _ := market.NewTokenAmount("y", big.NewInt(1500))
+	wideReverse, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: snapshot, TokenIn: "y", TokenOut: "x", AmountIn: wideY, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wideReverse.AmountOut.Units().Cmp(big.NewInt(625)) != 0 {
+		t.Fatalf("wide reverse quote = %s, want 625", wideReverse.AmountOut.Units())
+	}
 }
 
 func testSnapshot(t *testing.T, id market.MarketID, data market.SnapshotData, hash [32]byte) market.MarketSnapshot {

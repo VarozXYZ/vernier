@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/VarozXYZ/vernier/adapters/market/liquiditycurve"
 	"github.com/VarozXYZ/vernier/domain/market"
 )
 
@@ -53,16 +54,20 @@ const priceScaleBits uint = 64
 type StateUpdate struct {
 	activeID int32
 	binStep  uint16
-	feeBPS   uint16
+	feeRate  uint64
 	bins     []Bin
 }
 
 func NewStateUpdate(activeID int32, binStep, feeBPS uint16, bins []Bin) (StateUpdate, error) {
-	state := Snapshot{schemaVersion: snapshotSchemaVersion, activeID: activeID, binStep: binStep, feeBPS: feeBPS, bins: cloneBins(bins)}
+	return NewStateUpdateWithFeeRate(activeID, binStep, uint64(feeBPS)*liquiditycurve.FeeRatePrecision/10_000, bins)
+}
+
+func NewStateUpdateWithFeeRate(activeID int32, binStep uint16, feeRate uint64, bins []Bin) (StateUpdate, error) {
+	state := Snapshot{schemaVersion: snapshotSchemaVersion, activeID: activeID, binStep: binStep, feeRate: feeRate, bins: cloneBins(bins)}
 	if err := state.validate(); err != nil {
 		return StateUpdate{}, err
 	}
-	return StateUpdate{activeID: activeID, binStep: binStep, feeBPS: feeBPS, bins: cloneBins(bins)}, nil
+	return StateUpdate{activeID: activeID, binStep: binStep, feeRate: feeRate, bins: cloneBins(bins)}, nil
 }
 func (StateUpdate) EventKind() string { return "meteora_dlmm/state/v2" }
 
@@ -97,18 +102,21 @@ type Snapshot struct {
 	schemaVersion uint16
 	activeID      int32
 	binStep       uint16
-	feeBPS        uint16
+	feeRate       uint64
 	bins          []Bin
 }
 
 func (Snapshot) SnapshotKind() string { return "meteora_dlmm/v2" }
 func (s Snapshot) ActiveID() int32    { return s.activeID }
 func (s Snapshot) BinStep() uint16    { return s.binStep }
-func (s Snapshot) FeeBPS() uint16     { return s.feeBPS }
-func (s Snapshot) Bins() []Bin        { return cloneBins(s.bins) }
+func (s Snapshot) FeeRate() uint64    { return s.feeRate }
+func (s Snapshot) FeeBPS() uint16 {
+	return uint16((s.feeRate*10_000 + liquiditycurve.FeeRatePrecision - 1) / liquiditycurve.FeeRatePrecision)
+}
+func (s Snapshot) Bins() []Bin { return cloneBins(s.bins) }
 
 func (s Snapshot) validate() error {
-	if s.schemaVersion != snapshotSchemaVersion || s.binStep == 0 || s.feeBPS >= 10_000 || len(s.bins) == 0 {
+	if s.schemaVersion != snapshotSchemaVersion || s.binStep == 0 || s.feeRate >= liquiditycurve.FeeRatePrecision || len(s.bins) == 0 {
 		return fmt.Errorf("invalid Meteora DLMM state")
 	}
 	previous := int32(-1 << 31)
@@ -137,7 +145,7 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 	var next Snapshot
 	switch update := event.(type) {
 	case StateUpdate:
-		next = Snapshot{schemaVersion: snapshotSchemaVersion, activeID: update.activeID, binStep: update.binStep, feeBPS: update.feeBPS, bins: cloneBins(update.bins)}
+		next = Snapshot{schemaVersion: snapshotSchemaVersion, activeID: update.activeID, binStep: update.binStep, feeRate: update.feeRate, bins: cloneBins(update.bins)}
 	case SwapUpdate:
 		current, err := require(previous)
 		if err != nil {
@@ -211,7 +219,7 @@ func clone(value *big.Int) *big.Int {
 }
 func hashState(state Snapshot) [sha256.Size]byte {
 	var builder strings.Builder
-	fmt.Fprintf(&builder, "%d|%d|%d|%d", state.schemaVersion, state.activeID, state.binStep, state.feeBPS)
+	fmt.Fprintf(&builder, "%d|%d|%d|%d", state.schemaVersion, state.activeID, state.binStep, state.feeRate)
 	for _, bin := range state.bins {
 		fmt.Fprintf(&builder, "|%d:%s:%s:%s", bin.id, bin.reserveX, bin.reserveY, bin.priceX64)
 	}
