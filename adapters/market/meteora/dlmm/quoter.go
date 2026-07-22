@@ -86,6 +86,9 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 	scale := new(big.Int).Lsh(big.NewInt(1), priceScaleBits)
 	if tokenIn == q.tokenX {
 		for _, bin := range state.bins {
+			if bin.id < state.activeID {
+				continue
+			}
 			if bin.reserveY.Sign() > 0 {
 				// The protocol consumes Y liquidity at the bin price. The
 				// corresponding X input capacity is rounded up.
@@ -96,6 +99,9 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 	} else {
 		for i := len(state.bins) - 1; i >= 0; i-- {
 			bin := state.bins[i]
+			if bin.id > state.activeID {
+				continue
+			}
 			if bin.reserveX.Sign() > 0 {
 				input := ceilMulDiv(bin.reserveX, bin.priceX64, scale)
 				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveX})
