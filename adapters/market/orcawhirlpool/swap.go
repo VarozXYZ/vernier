@@ -39,7 +39,10 @@ func swap(state Snapshot, aToB bool, amount *big.Int, exactInput bool) (*big.Int
 				if aToB {
 					target, _ = sqrtPriceFromTick(state.minTick)
 				} else {
-					target, _ = sqrtPriceFromTick(state.maxTick)
+					// Tick arrays cover the interval through the tick after their
+					// last stored index. B->A can therefore move to that upper
+					// boundary even when the last initialized tick is empty.
+					target, _ = sqrtPriceFromTick(state.maxTick + state.tickSpacing)
 				}
 			}
 		}

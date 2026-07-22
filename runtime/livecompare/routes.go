@@ -208,7 +208,7 @@ func (r *Runner) buildSolanaChild(hop configuration.ResolvedHop, childMarket mar
 	case "orca_whirlpool":
 		decoder, err = orcawhirlpool.NewDecoder(hop.Venue.PoolText)
 		if err == nil {
-			source, err = orcawhirlpool.NewQuoter(sourceID+"/local", childMarket, hop.In.Token.ID, hop.Out.Token.ID)
+			source, err = orcawhirlpool.NewQuoterWithAddresses(sourceID+"/local", childMarket, hop.In.Token.ID, hop.In.AddressText, hop.Out.Token.ID, hop.Out.AddressText)
 		}
 		reducer = orcawhirlpool.Reducer{}
 	default:
