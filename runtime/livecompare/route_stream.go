@@ -81,7 +81,6 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 	}
 	r.logger.Info("route stream started", "run", r.config.RunID, "markets", len(routes), "hops", routeHopCount(routes), "updates", options.Updates)
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	signals := make(chan streamSignal, 64)
 	type failure struct {
 		market market.MarketID
@@ -106,6 +105,10 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 	defer feeds.Wait()
 	var references sync.WaitGroup
 	defer references.Wait()
+	// Cancel the feed context before waiting for workers. Registering this
+	// defer after the waits makes it run first on return; otherwise updates>0
+	// can deadlock while feeds are still blocked on their subscriptions.
+	defer cancel()
 	evaluations := 0
 	for {
 		select {
