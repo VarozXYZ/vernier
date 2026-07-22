@@ -3,6 +3,7 @@ package quote
 
 import (
 	"context"
+	"crypto/sha256"
 	"time"
 
 	"github.com/VarozXYZ/vernier/domain/market"
@@ -36,4 +37,46 @@ type Source interface {
 type ExactOutputSource interface {
 	Source
 	QuoteExactOutput(context.Context, ExactOutputInput) (market.Quote, error)
+}
+
+type ReferenceStatus string
+
+const (
+	ReferenceAvailable   ReferenceStatus = "available"
+	ReferenceUnavailable ReferenceStatus = "unavailable"
+)
+
+type ReferenceHop struct {
+	AMM        string
+	Label      string
+	InputMint  string
+	OutputMint string
+	InAmount   string
+	OutAmount  string
+}
+
+// ReferenceEvidence is intentionally provider-neutral. Raw response bodies,
+// API keys, and transaction instructions are never retained.
+type ReferenceEvidence struct {
+	Provider     market.SourceID
+	Status       ReferenceStatus
+	AmountOut    market.TokenAmount
+	ContextSlot  uint64
+	Latency      time.Duration
+	ResponseHash [sha256.Size]byte
+	Route        []ReferenceHop
+	Error        string
+}
+
+type ReferenceResult struct {
+	Local    market.Quote
+	Evidence ReferenceEvidence
+}
+
+// ReferenceSource adds asynchronous external validation to a local quote.
+// Implementations must return the local result even when the reference is
+// unavailable; external providers never participate in the hot path.
+type ReferenceSource interface {
+	Source
+	QuoteWithReference(context.Context, Input) (ReferenceResult, error)
 }
