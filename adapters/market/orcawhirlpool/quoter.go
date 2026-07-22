@@ -10,7 +10,9 @@ import (
 )
 
 // Whirlpool prices are encoded as Q64.64 fixed-point values. q64 is the
-// fractional-bit count, not the fixed-point scale itself.
+// fractional-bit count, not the fixed-point scale itself. Quotes are computed
+// by the canonical swap-step arithmetic and cross the initialized tick range
+// carried by the snapshot; they do not use a constant-product approximation.
 const q64 uint = 64
 
 type Quoter struct {
@@ -35,11 +37,10 @@ func (q *Quoter) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	if err != nil {
 		return market.Quote{}, err
 	}
-	reserveIn, reserveOut, err := q.virtualReserves(state, input.TokenIn, input.TokenOut)
-	if err != nil {
-		return market.Quote{}, err
+	if !q.supportsDirection(input.TokenIn, input.TokenOut) {
+		return market.Quote{}, fmt.Errorf("unsupported Whirlpool token direction")
 	}
-	out, fee, err := exactInput(reserveIn, reserveOut, input.AmountIn.Units(), state.feeBPS)
+	out, fee, err := swap(state, input.TokenIn == q.tokenA, input.AmountIn.Units(), true)
 	if err != nil {
 		return market.Quote{}, err
 	}
@@ -54,11 +55,10 @@ func (q *Quoter) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 	if err != nil {
 		return market.Quote{}, err
 	}
-	reserveIn, reserveOut, err := q.virtualReserves(state, input.TokenIn, input.TokenOut)
-	if err != nil {
-		return market.Quote{}, err
+	if !q.supportsDirection(input.TokenIn, input.TokenOut) {
+		return market.Quote{}, fmt.Errorf("unsupported Whirlpool token direction")
 	}
-	in, fee, err := exactOutput(reserveIn, reserveOut, input.AmountOut.Units(), state.feeBPS)
+	in, fee, err := swap(state, input.TokenIn == q.tokenA, input.AmountOut.Units(), false)
 	if err != nil {
 		return market.Quote{}, err
 	}
@@ -80,67 +80,11 @@ func (q *Quoter) state(snapshot market.MarketSnapshot) (Snapshot, error) {
 	return state, nil
 }
 
-// segments derives the active virtual reserves from Q64.64 price and then
-// walks initialized ticks in direction order. The local reserve segment is
-// deterministic; a future decoder can provide additional covered segments
-// without changing the quote contract.
-func (q *Quoter) virtualReserves(state Snapshot, tokenIn, tokenOut market.TokenID) (*big.Int, *big.Int, error) {
+func (q *Quoter) supportsDirection(tokenIn, tokenOut market.TokenID) bool {
 	if tokenIn != q.tokenA && tokenIn != q.tokenB || tokenOut != q.tokenA && tokenOut != q.tokenB || tokenIn == tokenOut {
-		return nil, nil, fmt.Errorf("unsupported Whirlpool token direction")
+		return false
 	}
-	if state.liquidity.Sign() <= 0 {
-		return nil, nil, fmt.Errorf("whirlpool has no active liquidity")
-	}
-	q64Value := new(big.Int).Lsh(big.NewInt(1), q64)
-	reserveA := new(big.Int).Mul(state.liquidity, q64Value)
-	reserveA.Quo(reserveA, state.sqrtPriceX64)
-	reserveB := new(big.Int).Mul(state.liquidity, state.sqrtPriceX64)
-	reserveB.Quo(reserveB, q64Value)
-	if reserveA.Sign() <= 0 || reserveB.Sign() <= 0 {
-		return nil, nil, fmt.Errorf("whirlpool virtual reserves round to zero")
-	}
-	if tokenIn == q.tokenA {
-		return reserveA, reserveB, nil
-	}
-	return reserveB, reserveA, nil
-}
-
-func exactInput(reserveIn, reserveOut, amount *big.Int, feeBPS uint16) (*big.Int, *big.Int, error) {
-	if amount == nil || amount.Sign() <= 0 || reserveIn.Sign() <= 0 || reserveOut.Sign() <= 0 || feeBPS >= 10_000 {
-		return nil, nil, fmt.Errorf("invalid whirlpool exact-input request")
-	}
-	feeBase := big.NewInt(10_000)
-	feeRate := new(big.Int).SetUint64(uint64(feeBPS))
-	afterFee := new(big.Int).Mul(amount, new(big.Int).Sub(feeBase, feeRate))
-	afterFee.Quo(afterFee, feeBase)
-	if afterFee.Sign() <= 0 {
-		return nil, nil, fmt.Errorf("whirlpool input rounds to zero after fee")
-	}
-	denominator := new(big.Int).Add(reserveIn, afterFee)
-	out := new(big.Int).Mul(afterFee, reserveOut)
-	out.Quo(out, denominator)
-	if out.Sign() <= 0 || out.Cmp(reserveOut) >= 0 {
-		return nil, nil, fmt.Errorf("whirlpool output is outside active liquidity")
-	}
-	fee := new(big.Int).Sub(amount, afterFee)
-	return out, fee, nil
-}
-
-func exactOutput(reserveIn, reserveOut, amountOut *big.Int, feeBPS uint16) (*big.Int, *big.Int, error) {
-	if amountOut == nil || amountOut.Sign() <= 0 || reserveIn.Sign() <= 0 || reserveOut.Sign() <= 0 || feeBPS >= 10_000 || amountOut.Cmp(reserveOut) >= 0 {
-		return nil, nil, fmt.Errorf("invalid whirlpool exact-output request")
-	}
-	feeBase := big.NewInt(10_000)
-	denominator := new(big.Int).Sub(reserveOut, amountOut)
-	afterFee := new(big.Int).Mul(amountOut, reserveIn)
-	afterFee.Add(afterFee, new(big.Int).Sub(denominator, big.NewInt(1)))
-	afterFee.Quo(afterFee, denominator)
-	gross := new(big.Int).Mul(afterFee, feeBase)
-	feeRate := new(big.Int).SetUint64(uint64(feeBPS))
-	gross.Add(gross, new(big.Int).Sub(new(big.Int).Sub(feeBase, feeRate), big.NewInt(1)))
-	gross.Quo(gross, new(big.Int).Sub(feeBase, feeRate))
-	fee := new(big.Int).Sub(gross, afterFee)
-	return gross, fee, nil
+	return true
 }
 
 func (q *Quoter) result(input quoteport.Input, mode market.QuoteMode, amountIn market.TokenAmount, outputToken market.TokenID, outputUnits, feeUnits *big.Int) (market.Quote, error) {
