@@ -37,8 +37,11 @@ type Topology struct {
 	Assets        map[string]AssetConfig       `yaml:"assets"`
 	Tokens        map[string]TokenConfig       `yaml:"tokens"`
 	Venues        map[string]VenueConfig       `yaml:"venues"`
+	Pools         map[string]PoolConfig        `yaml:"pools"`
+	Paths         map[string]PathConfig        `yaml:"paths"`
 	Markets       map[string]MarketConfig      `yaml:"markets"`
 	PriceSources  map[string]PriceSourceConfig `yaml:"price_sources"`
+	QuoteSources  map[string]QuoteSourceConfig `yaml:"quote_sources"`
 }
 
 type Policy struct {
@@ -52,6 +55,8 @@ type ChainConfig struct {
 	Label            string `yaml:"label"`
 	ChainID          string `yaml:"chain_id"`
 	RPCURLEnv        string `yaml:"rpc_url_env"`
+	HTTPURLEnv       string `yaml:"http_url_env"`
+	WebSocketURLEnv  string `yaml:"websocket_url_env"`
 	RPCMinIntervalMS int    `yaml:"rpc_min_interval_ms"`
 }
 
@@ -78,10 +83,42 @@ type VenueConfig struct {
 	MaxTickWords     int    `yaml:"max_tick_words"`
 }
 
+// PoolConfig separates a concrete pool address from a reusable venue
+// protocol profile. Existing configurations may continue to put pool_address
+// on the venue; paths should use this type instead.
+type PoolConfig struct {
+	Venue            string `yaml:"venue"`
+	Chain            string `yaml:"chain"`
+	Address          string `yaml:"address"`
+	ReferenceAddress string `yaml:"reference_address"`
+	FeeBPS           uint16 `yaml:"fee_bps"`
+}
+
+type PathConfig struct {
+	Chain string          `yaml:"chain"`
+	Hops  []PathHopConfig `yaml:"hops"`
+}
+
+type PathHopConfig struct {
+	Pool     string `yaml:"pool"`
+	TokenIn  string `yaml:"token_in"`
+	TokenOut string `yaml:"token_out"`
+}
+
 type MarketConfig struct {
 	Venue      string `yaml:"venue"`
+	Path       string `yaml:"path"`
 	BaseToken  string `yaml:"base_token"`
 	QuoteToken string `yaml:"quote_token"`
+}
+
+type QuoteSourceConfig struct {
+	Kind        string `yaml:"kind"`
+	BaseURL     string `yaml:"base_url"`
+	TakerEnv    string `yaml:"taker_env"`
+	APIKeyEnv   string `yaml:"api_key_env"`
+	SlippageBPS uint16 `yaml:"slippage_bps"`
+	MaxAccounts uint16 `yaml:"max_accounts"`
 }
 
 type PriceSourceConfig struct {
@@ -130,16 +167,20 @@ type SizingConfig struct {
 }
 
 type ResolvedChain struct {
-	ID             string
-	Label          string
-	ChainID        *big.Int
-	RPCURLEnv      string
-	RPCMinInterval time.Duration
+	ID              string
+	Label           string
+	Kind            string
+	ChainID         *big.Int
+	RPCURLEnv       string
+	HTTPURLEnv      string
+	WebSocketURLEnv string
+	RPCMinInterval  time.Duration
 }
 
 type ResolvedToken struct {
-	Token   market.Token
-	Address common.Address
+	Token       market.Token
+	Address     common.Address
+	AddressText string
 }
 
 type ResolvedVenue struct {
@@ -147,6 +188,7 @@ type ResolvedVenue struct {
 	Kind         string
 	Chain        string
 	Pool         common.Address
+	PoolText     string
 	Factory      common.Address
 	Reference    common.Address
 	FeeBPS       uint16
@@ -159,6 +201,14 @@ type ResolvedMarket struct {
 	Venue ResolvedVenue
 	Base  ResolvedToken
 	Quote ResolvedToken
+	Path  []ResolvedHop
+}
+
+type ResolvedHop struct {
+	Pool  string
+	Venue ResolvedVenue
+	In    ResolvedToken
+	Out   ResolvedToken
 }
 
 type ResolvedPriceSource struct {
@@ -229,13 +279,31 @@ func (c ParsedConfig) ResolveEndpoints(lookup LookupEnv) (map[string]string, err
 	if lookup == nil {
 		return nil, fmt.Errorf("environment lookup is required")
 	}
-	endpoints := make(map[string]string, len(c.Chains))
+	endpoints := make(map[string]string, len(c.Chains)*2)
 	for id, chain := range c.Chains {
-		value, ok := lookup(chain.RPCURLEnv)
+		name := chain.RPCURLEnv
+		if name == "" {
+			name = chain.HTTPURLEnv
+		}
+		value, ok := lookup(name)
 		if !ok || strings.TrimSpace(value) == "" {
-			return nil, fmt.Errorf("required RPC endpoint for chain %q is unset", id)
+			return nil, fmt.Errorf("required endpoint for chain %q is unset", id)
 		}
 		endpoints[id] = value
+		if chain.HTTPURLEnv != "" {
+			value, ok = lookup(chain.HTTPURLEnv)
+			if !ok || strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("required HTTP endpoint for chain %q is unset", id)
+			}
+			endpoints[id+".http"] = value
+		}
+		if chain.WebSocketURLEnv != "" {
+			value, ok = lookup(chain.WebSocketURLEnv)
+			if !ok || strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("required WebSocket endpoint for chain %q is unset", id)
+			}
+			endpoints[id+".websocket"] = value
+		}
 	}
 	return endpoints, nil
 }
@@ -338,6 +406,32 @@ func resolveMarket(id string, topology Topology, assets map[market.AssetID]marke
 	if !ok {
 		return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("unknown market %q", id)
 	}
+	if config.Path != "" {
+		path, ok := topology.Paths[config.Path]
+		if !ok {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q references unknown path %q", id, config.Path)
+		}
+		resolvedPath, chain, err := resolvePath(config.Path, path, topology, assets)
+		if err != nil {
+			return ResolvedMarket{}, ResolvedChain{}, err
+		}
+		baseID, quoteID := config.BaseToken, config.QuoteToken
+		if baseID == "" {
+			baseID = path.Hops[0].TokenIn
+		}
+		if quoteID == "" {
+			quoteID = path.Hops[len(path.Hops)-1].TokenOut
+		}
+		base, err := resolveToken(baseID, topology.Tokens[baseID], chain.ID, assets)
+		if err != nil {
+			return ResolvedMarket{}, ResolvedChain{}, err
+		}
+		quote, err := resolveToken(quoteID, topology.Tokens[quoteID], chain.ID, assets)
+		if err != nil || base.Token.ID == quote.Token.ID || base.Token.Asset == quote.Token.Asset {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q requires distinct valid endpoints", id)
+		}
+		return ResolvedMarket{ID: market.MarketID(id), Venue: resolvedPath[0].Venue, Base: base, Quote: quote, Path: resolvedPath}, chain, nil
+	}
 	venueConfig, ok := topology.Venues[config.Venue]
 	if !ok {
 		return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q references unknown venue", id)
@@ -358,48 +452,140 @@ func resolveMarket(id string, topology Topology, assets map[market.AssetID]marke
 	if err != nil {
 		return ResolvedMarket{}, ResolvedChain{}, err
 	}
-	return ResolvedMarket{ID: market.MarketID(id), Venue: venue, Base: base, Quote: quote}, chain, nil
+	return ResolvedMarket{ID: market.MarketID(id), Venue: venue, Base: base, Quote: quote, Path: []ResolvedHop{{Pool: config.Venue, Venue: venue, In: base, Out: quote}}}, chain, nil
+}
+
+func resolvePath(id string, config PathConfig, topology Topology, assets map[market.AssetID]market.Asset) ([]ResolvedHop, ResolvedChain, error) {
+	if config.Chain == "" || len(config.Hops) == 0 {
+		return nil, ResolvedChain{}, fmt.Errorf("path %q requires a chain and hops", id)
+	}
+	chain, err := resolveChain(config.Chain, topology.Chains[config.Chain])
+	if err != nil {
+		return nil, ResolvedChain{}, err
+	}
+	result := make([]ResolvedHop, 0, len(config.Hops))
+	var previous market.TokenID
+	for index, hop := range config.Hops {
+		pool, ok := topology.Pools[hop.Pool]
+		if !ok {
+			return nil, ResolvedChain{}, fmt.Errorf("path %q references unknown pool %q", id, hop.Pool)
+		}
+		if pool.Chain != "" && pool.Chain != config.Chain {
+			return nil, ResolvedChain{}, fmt.Errorf("pool %q belongs to chain %q, path uses %q", hop.Pool, pool.Chain, config.Chain)
+		}
+		venueConfig, ok := topology.Venues[pool.Venue]
+		if !ok {
+			return nil, ResolvedChain{}, fmt.Errorf("pool %q references unknown venue", hop.Pool)
+		}
+		venueConfig.Chain = config.Chain
+		if pool.Address != "" {
+			venueConfig.PoolAddress = pool.Address
+		}
+		if pool.ReferenceAddress != "" {
+			venueConfig.ReferenceAddress = pool.ReferenceAddress
+		}
+		if pool.FeeBPS != 0 {
+			venueConfig.FeeBPS = pool.FeeBPS
+		}
+		venue, err := resolveVenue(pool.Venue, venueConfig)
+		if err != nil {
+			return nil, ResolvedChain{}, err
+		}
+		in, err := resolveToken(hop.TokenIn, topology.Tokens[hop.TokenIn], config.Chain, assets)
+		if err != nil {
+			return nil, ResolvedChain{}, err
+		}
+		out, err := resolveToken(hop.TokenOut, topology.Tokens[hop.TokenOut], config.Chain, assets)
+		if err != nil {
+			return nil, ResolvedChain{}, err
+		}
+		if in.Token.ID == out.Token.ID || in.Token.Asset == out.Token.Asset {
+			return nil, ResolvedChain{}, fmt.Errorf("path %q hop %d requires distinct tokens", id, index)
+		}
+		if previous != "" && previous != in.Token.ID {
+			return nil, ResolvedChain{}, fmt.Errorf("path %q is discontinuous at hop %d", id, index)
+		}
+		previous = out.Token.ID
+		result = append(result, ResolvedHop{Pool: hop.Pool, Venue: venue, In: in, Out: out})
+	}
+	return result, chain, nil
 }
 
 func resolveChain(id string, config ChainConfig) (ResolvedChain, error) {
 	chainID, ok := new(big.Int).SetString(config.ChainID, 10)
-	if id == "" || config.Kind != "evm" || strings.TrimSpace(config.Label) == "" || !ok || chainID.Sign() <= 0 ||
-		!environmentName.MatchString(config.RPCURLEnv) || config.RPCMinIntervalMS < 0 || config.RPCMinIntervalMS > 10_000 {
-		return ResolvedChain{}, fmt.Errorf("chain %q has invalid EVM profile", id)
+	if id == "" || (config.Kind != "evm" && config.Kind != "solana") || strings.TrimSpace(config.Label) == "" || config.RPCMinIntervalMS < 0 || config.RPCMinIntervalMS > 10_000 {
+		return ResolvedChain{}, fmt.Errorf("chain %q has invalid profile", id)
 	}
-	return ResolvedChain{ID: id, Label: config.Label, ChainID: chainID, RPCURLEnv: config.RPCURLEnv, RPCMinInterval: time.Duration(config.RPCMinIntervalMS) * time.Millisecond}, nil
+	if config.Kind == "evm" && (!ok || chainID.Sign() <= 0) {
+		return ResolvedChain{}, fmt.Errorf("chain %q has invalid EVM chain ID", id)
+	}
+	if config.Kind == "solana" {
+		chainID = new(big.Int)
+	}
+	httpEnv, wsEnv := config.HTTPURLEnv, config.WebSocketURLEnv
+	if config.RPCURLEnv != "" && httpEnv == "" && wsEnv == "" {
+		wsEnv = config.RPCURLEnv
+	}
+	if config.Kind == "solana" && (httpEnv == "" || wsEnv == "") {
+		return ResolvedChain{}, fmt.Errorf("Solana chain %q requires separate HTTP and WebSocket endpoints", id)
+	}
+	for name, value := range map[string]string{"RPC": config.RPCURLEnv, "HTTP": httpEnv, "WebSocket": wsEnv} {
+		if value != "" && !environmentName.MatchString(value) {
+			return ResolvedChain{}, fmt.Errorf("chain %q has invalid %s endpoint environment", id, name)
+		}
+	}
+	return ResolvedChain{ID: id, Label: config.Label, Kind: config.Kind, ChainID: chainID, RPCURLEnv: config.RPCURLEnv, HTTPURLEnv: httpEnv, WebSocketURLEnv: wsEnv, RPCMinInterval: time.Duration(config.RPCMinIntervalMS) * time.Millisecond}, nil
 }
 
 func resolveToken(id string, config TokenConfig, chain string, assets map[market.AssetID]market.Asset) (ResolvedToken, error) {
 	asset := market.AssetID(config.Asset)
-	tokenAddress, err := address(config.Address)
-	if id == "" || config.Chain != chain || config.Decimals > 36 || strings.TrimSpace(config.Symbol) == "" || err != nil {
+	tokenAddress := common.Address{}
+	if id == "" || config.Chain != chain || config.Decimals > 36 || strings.TrimSpace(config.Symbol) == "" || strings.TrimSpace(config.Address) == "" {
 		return ResolvedToken{}, fmt.Errorf("token %q has invalid configuration", id)
 	}
 	if _, ok := assets[asset]; !ok {
 		return ResolvedToken{}, fmt.Errorf("token %q references unknown asset", id)
 	}
-	return ResolvedToken{Token: market.Token{ID: market.TokenID(id), Asset: asset, Chain: market.ChainID(chain), Decimals: config.Decimals, Symbol: config.Symbol}, Address: tokenAddress}, nil
+	if common.IsHexAddress(config.Address) {
+		var err error
+		tokenAddress, err = address(config.Address)
+		if err != nil {
+			return ResolvedToken{}, fmt.Errorf("token %q has invalid EVM address", id)
+		}
+	} else if len(config.Address) < 32 {
+		return ResolvedToken{}, fmt.Errorf("token %q has invalid public key", id)
+	}
+	return ResolvedToken{Token: market.Token{ID: market.TokenID(id), Asset: asset, Chain: market.ChainID(chain), Decimals: config.Decimals, Symbol: config.Symbol}, Address: tokenAddress, AddressText: config.Address}, nil
 }
 
 func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
-	if config.Kind != "uniswap_v2" && config.Kind != "uniswap_v3" && config.Kind != "aerodrome_slipstream" && config.Kind != "aerodrome_volatile" {
+	if config.Kind != "uniswap_v2" && config.Kind != "uniswap_v3" && config.Kind != "aerodrome_slipstream" && config.Kind != "aerodrome_volatile" && config.Kind != "meteora_dlmm" && config.Kind != "orca_whirlpool" {
 		return ResolvedVenue{}, fmt.Errorf("venue %q has unsupported kind %q", id, config.Kind)
 	}
-	pool, err := address(config.PoolAddress)
-	if err != nil {
-		return ResolvedVenue{}, fmt.Errorf("venue %q pool: %w", id, err)
+	pool := common.Address{}
+	poolText := strings.TrimSpace(config.PoolAddress)
+	var err error
+	if common.IsHexAddress(poolText) {
+		pool, err = address(poolText)
+	} else if config.Kind != "meteora_dlmm" && config.Kind != "orca_whirlpool" {
+		err = fmt.Errorf("address is not hexadecimal")
+	}
+	if err != nil || poolText == "" {
+		return ResolvedVenue{}, fmt.Errorf("venue %q pool: invalid address", id)
 	}
 	factory := common.Address{}
-	if config.Kind != "uniswap_v3" || config.FactoryAddress != "" {
+	if config.Kind != "uniswap_v3" && config.Kind != "meteora_dlmm" && config.Kind != "orca_whirlpool" || config.FactoryAddress != "" {
 		factory, err = address(config.FactoryAddress)
 		if err != nil {
 			return ResolvedVenue{}, fmt.Errorf("venue %q factory: %w", id, err)
 		}
 	}
-	reference, err := address(config.ReferenceAddress)
-	if err != nil {
-		return ResolvedVenue{}, fmt.Errorf("venue %q reference: %w", id, err)
+	reference := common.Address{}
+	if config.ReferenceAddress != "" {
+		reference, err = address(config.ReferenceAddress)
+		if err != nil {
+			return ResolvedVenue{}, fmt.Errorf("venue %q reference: %w", id, err)
+		}
 	}
 	if (config.Kind == "uniswap_v2" || config.Kind == "aerodrome_volatile") && (config.FeeBPS == 0 || config.FeeBPS >= 10_000) {
 		return ResolvedVenue{}, fmt.Errorf("venue %q requires a valid fee", id)
@@ -410,7 +596,7 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 	if config.Kind == "aerodrome_volatile" && config.Stable {
 		return ResolvedVenue{}, fmt.Errorf("venue %q is volatile and cannot set stable: true", id)
 	}
-	if config.Kind == "uniswap_v3" || config.Kind == "aerodrome_slipstream" {
+	if config.Kind == "uniswap_v3" || config.Kind == "aerodrome_slipstream" || config.Kind == "orca_whirlpool" {
 		if config.MaxTickWords == 0 {
 			config.MaxTickWords = 64
 		}
@@ -418,7 +604,7 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 			return ResolvedVenue{}, fmt.Errorf("venue %q has invalid tick coverage", id)
 		}
 	}
-	return ResolvedVenue{ID: id, Kind: config.Kind, Chain: config.Chain, Pool: pool, Factory: factory, Reference: reference, FeeBPS: config.FeeBPS, Stable: config.Stable, MaxTickWords: config.MaxTickWords}, nil
+	return ResolvedVenue{ID: id, Kind: config.Kind, Chain: config.Chain, Pool: pool, PoolText: poolText, Factory: factory, Reference: reference, FeeBPS: config.FeeBPS, Stable: config.Stable, MaxTickWords: config.MaxTickWords}, nil
 }
 
 func validateProvider(config ProviderConfig, chains map[string]ChainConfig) error {
