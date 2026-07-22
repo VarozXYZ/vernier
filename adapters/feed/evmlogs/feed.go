@@ -165,7 +165,12 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 		return false, false, err
 	}
 	f.logger.Info("feed bootstrap completed", "market", f.market, "block", block.Number, "duration", time.Since(bootstrapStarted))
-	if err := sink.Publish(ctx, f.event(block, data)); err != nil {
+	bootstrapEvent := f.event(block, data)
+	if resetSink, ok := sink.(feedport.ResetSink); ok {
+		if err := resetSink.Reset(ctx, bootstrapEvent); err != nil {
+			return false, false, err
+		}
+	} else if err := sink.Publish(ctx, bootstrapEvent); err != nil {
 		return false, false, err
 	}
 	if err := sink.SetHealth(ctx, feedport.HealthUpdate{Health: market.HealthHealthy, ObservedAt: f.clock().UTC()}); err != nil {

@@ -70,8 +70,31 @@ func (m *Mirror) Apply(ctx context.Context, event market.MarketEvent) (feedport.
 			}, nil
 		}
 	}
+	return m.applyLocked(ctx, event, false)
+}
+
+// Reset replaces the protocol state with a complete bootstrap. Version
+// numbers remain monotonic so caches cannot mistake a reset for old state.
+func (m *Mirror) Reset(ctx context.Context, event market.MarketEvent) (feedport.ApplyResult, error) {
+	if err := ctx.Err(); err != nil {
+		return feedport.ApplyResult{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if event.Market != m.market || event.Source != m.source {
+		return feedport.ApplyResult{}, fmt.Errorf("event market/source does not match mirror")
+	}
+	return m.applyLocked(ctx, event, true)
+}
+
+func (m *Mirror) applyLocked(ctx context.Context, event market.MarketEvent, reset bool) (feedport.ApplyResult, error) {
+	if !reset && m.hasState {
+		if stale, reason := m.orderer.Stale(m.current.Metadata(), event); stale {
+			return feedport.ApplyResult{Disposition: feedport.ApplyDispositionIgnoredStale, Reason: reason, Snapshot: m.current}, nil
+		}
+	}
 	var previous market.SnapshotData
-	if m.hasState {
+	if m.hasState && !reset {
 		previous = m.current.Data()
 	}
 	data, stateHash, err := m.reducer.Reduce(ctx, previous, event.Data)
