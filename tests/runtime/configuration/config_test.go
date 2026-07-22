@@ -140,49 +140,49 @@ func TestLoadConfigResolvesSolanaAndMultiHopPaths(t *testing.T) {
 	manifest := `schema_version: 1
 topology: topology.yaml
 policy: policy.yaml
-active_research: cashcat
+active_research: route
 `
 	topology := `schema_version: 1
 chains:
   robinhood: {kind: evm, label: Robinhood, chain_id: "4663", rpc_url_env: RH_RPC}
   solana: {kind: solana, label: Solana, chain_id: solana, http_url_env: SOL_HTTP, websocket_url_env: SOL_WS}
 assets:
-  cashcat: {symbol: CASHCAT}
+  asset_a: {symbol: ASSET_A}
   sol: {symbol: SOL}
-  usdg: {symbol: USDG}
+  asset_b: {symbol: ASSET_B}
   usd: {symbol: USD}
 tokens:
-  cashcat_rh: {asset: cashcat, chain: robinhood, address: "0x0000000000000000000000000000000000000001", decimals: 18, symbol: CASHCAT}
+  asset_a_rh: {asset: asset_a, chain: robinhood, address: "0x0000000000000000000000000000000000000001", decimals: 18, symbol: ASSET_A}
   weth_rh: {asset: sol, chain: robinhood, address: "0x0000000000000000000000000000000000000002", decimals: 18, symbol: WETH}
-  usdg_rh: {asset: usdg, chain: robinhood, address: "0x0000000000000000000000000000000000000003", decimals: 6, symbol: USDG}
-  cashcat_sol: {asset: cashcat, chain: solana, address: CashcatSynthetic111111111111111111111111, decimals: 9, symbol: CASHCAT}
+  asset_b_rh: {asset: asset_b, chain: robinhood, address: "0x0000000000000000000000000000000000000003", decimals: 6, symbol: ASSET_B}
+  asset_a_sol: {asset: asset_a, chain: solana, address: AssetASynthetic111111111111111111111111, decimals: 9, symbol: ASSET_A}
   sol_sol: {asset: sol, chain: solana, address: SolSynthetic111111111111111111111111111, decimals: 9, symbol: SOL}
-  usdg_sol: {asset: usdg, chain: solana, address: USDGSynthetic11111111111111111111111111, decimals: 6, symbol: USDG}
+  asset_b_sol: {asset: asset_b, chain: solana, address: AssetBSynthetic111111111111111111111111, decimals: 6, symbol: ASSET_B}
 venues:
   uniswap: {kind: uniswap_v3, chain: robinhood, pool_address: "0x0000000000000000000000000000000000000004", reference_address: "0x0000000000000000000000000000000000000005"}
   meteora: {kind: meteora_dlmm, chain: solana, pool_address: MeteoraVenueSynthetic1111111111111111, reference_address: ""}
   orca: {kind: orca_whirlpool, chain: solana, pool_address: OrcaVenueSynthetic111111111111111111, reference_address: ""}
 pools:
-  rh_cashcat_weth: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000004"}
-  rh_weth_usdg: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000006"}
-  sol_cashcat: {venue: meteora, chain: solana, address: MeteoraPoolSynthetic11111111111111111111}
-  sol_usdg: {venue: orca, chain: solana, address: OrcaPoolSynthetic1111111111111111111111}
+  rh_asset_a_weth: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000004"}
+  rh_weth_asset_b: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000006"}
+  sol_asset_a: {venue: meteora, chain: solana, address: MeteoraPoolSynthetic11111111111111111111}
+  sol_asset_b: {venue: orca, chain: solana, address: OrcaPoolSynthetic1111111111111111111111}
 paths:
   rh_path:
     chain: robinhood
-    hops: [{pool: rh_cashcat_weth, token_in: cashcat_rh, token_out: weth_rh}, {pool: rh_weth_usdg, token_in: weth_rh, token_out: usdg_rh}]
+    hops: [{pool: rh_asset_a_weth, token_in: asset_a_rh, token_out: weth_rh}, {pool: rh_weth_asset_b, token_in: weth_rh, token_out: asset_b_rh}]
   sol_path:
     chain: solana
-    hops: [{pool: sol_cashcat, token_in: cashcat_sol, token_out: sol_sol}, {pool: sol_usdg, token_in: sol_sol, token_out: usdg_sol}]
+    hops: [{pool: sol_asset_a, token_in: asset_a_sol, token_out: sol_sol}, {pool: sol_asset_b, token_in: sol_sol, token_out: asset_b_sol}]
 markets:
-  rh: {path: rh_path, base_token: cashcat_rh, quote_token: usdg_rh}
-  sol: {path: sol_path, base_token: cashcat_sol, quote_token: usdg_sol}
+  rh: {path: rh_path, base_token: asset_a_rh, quote_token: asset_b_rh}
+  sol: {path: sol_path, base_token: asset_a_sol, quote_token: asset_b_sol}
 price_sources:
-  usdg_usd: {base_asset: usdg, quote_asset: usd, primary: {kind: coingecko, coin_id: usd-coin, currency: usd}, fallback: {kind: chainlink, chain: robinhood, feed_address: "0x0000000000000000000000000000000000000007"}}
+  asset_b_usd: {base_asset: asset_b, quote_asset: usd, primary: {kind: coingecko, coin_id: usd-coin, currency: usd}, fallback: {kind: chainlink, chain: robinhood, feed_address: "0x0000000000000000000000000000000000000007"}}
 `
 	policy := `schema_version: 1
-setups: {cashcat_setup: {markets: [rh, sol]}}
-research: {cashcat: {run_id: cashcat, setup: cashcat_setup, inventory_mode: prepositioned, price_source: usdg_usd, fixed_cost: {asset: usd, amount: "0.5"}, min_net_profit: "0", sizing: {kind: linear_range, asset: quote, min: "100", max: "5000", samples: 10}}}
+setups: {route_setup: {markets: [rh, sol]}}
+research: {route: {run_id: route, setup: route_setup, inventory_mode: prepositioned, price_source: asset_b_usd, fixed_cost: {asset: usd, amount: "0.5"}, min_net_profit: "0", sizing: {kind: linear_range, asset: quote, min: "100", max: "5000", samples: 10}}}
 `
 	config, err := configuration.LoadConfig(writeConfig(t, manifest, topology, policy))
 	if err != nil {

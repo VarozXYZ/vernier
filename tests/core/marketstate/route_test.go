@@ -21,7 +21,7 @@ func TestRouteMirrorAppliesChildrenAndAggregatesHealth(t *testing.T) {
 		return child
 	}
 	first, second := makeChild("hop-a"), makeChild("hop-b")
-	route, err := marketstate.NewRouteMirror("cashcat-usdg", "route", []feedport.Mirror{first, second}, func() time.Time { return now })
+	route, err := marketstate.NewRouteMirror("route-asset-a-asset-b", "route", []feedport.Mirror{first, second}, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
 	}
