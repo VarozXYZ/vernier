@@ -14,7 +14,7 @@ import (
 )
 
 func TestPublicSetupMatchesVenueReferences(t *testing.T) {
-	for _, name := range []string{"VERNIER_ROBINHOOD_WS_URL", "VERNIER_BASE_WS_URL"} {
+	for _, name := range []string{"ROBINHOOD_WS_URL", "BASE_WS_URL"} {
 		if os.Getenv(name) == "" {
 			t.Skip("public VIRTUAL integration requires configured RPC endpoints")
 		}
@@ -62,7 +62,7 @@ func TestPublicSetupMatchesVenueReferences(t *testing.T) {
 }
 
 func TestPublicSetupStreamEmitsBootstrapEvaluation(t *testing.T) {
-	for _, name := range []string{"VERNIER_ROBINHOOD_WS_URL", "VERNIER_BASE_WS_URL"} {
+	for _, name := range []string{"ROBINHOOD_WS_URL", "BASE_WS_URL"} {
 		if os.Getenv(name) == "" {
 			t.Skip("public VIRTUAL stream integration requires configured RPC endpoints")
 		}
