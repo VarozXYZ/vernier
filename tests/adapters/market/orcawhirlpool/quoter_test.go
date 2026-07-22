@@ -31,8 +31,8 @@ func TestWhirlpoolVirtualReserveQuoteIsIntegerAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quote.AmountOut.Units().Cmp(big.NewInt(99)) != 0 {
-		t.Fatalf("amount out = %s", quote.AmountOut.Units())
+	if quote.AmountOut.Units().Cmp(big.NewInt(90)) != 0 {
+		t.Fatalf("amount out = %s, want constant-product output 90", quote.AmountOut.Units())
 	}
 	state := snapshot.Data().(orcawhirlpool.Snapshot)
 	price.SetInt64(1)
@@ -63,8 +63,8 @@ func TestWhirlpoolVirtualReserveUsesQ64Scale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quote.AmountOut.Units().Cmp(big.NewInt(400)) != 0 {
-		t.Fatalf("amount out = %s, want 400", quote.AmountOut.Units())
+	if quote.AmountOut.Units().Cmp(big.NewInt(333)) != 0 {
+		t.Fatalf("amount out = %s, want 333", quote.AmountOut.Units())
 	}
 }
 

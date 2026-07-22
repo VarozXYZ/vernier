@@ -17,6 +17,9 @@ import (
 type localSource struct{}
 
 func (localSource) ID() market.SourceID { return "local" }
+func (localSource) LastTiming() quoteport.Timing {
+	return quoteport.Timing{Cached: true, Hops: []quoteport.HopTiming{{Market: "hop", AmountIn: "100", AmountOut: "90"}}}
+}
 func (localSource) Quote(_ context.Context, input quoteport.Input) (market.Quote, error) {
 	out, _ := market.NewTokenAmount(input.TokenOut, big.NewInt(90))
 	return market.NewQuote(market.Quote{Source: "local", Market: "pool", SnapshotVersion: 1, Purpose: input.Purpose, Mode: market.QuoteModeExactInput, AmountIn: input.AmountIn, AmountOut: out, QuotedAt: input.QuotedAt})
@@ -45,6 +48,10 @@ func TestJupiterReturnsLocalQuoteAndRouteEvidence(t *testing.T) {
 	}
 	if result.Local.AmountOut.Units().Cmp(big.NewInt(90)) != 0 || result.Evidence.Status != quoteport.ReferenceAvailable || result.Evidence.AmountOut.Units().Cmp(big.NewInt(95)) != 0 || result.Evidence.ContextSlot != 123 || len(result.Evidence.Route) != 1 {
 		t.Fatalf("unexpected result %+v", result)
+	}
+	trace := source.LastTiming()
+	if !trace.Cached || len(trace.Hops) != 1 || trace.Hops[0].Market != "hop" {
+		t.Fatalf("jupiter wrapper hid local timing: %+v", trace)
 	}
 }
 

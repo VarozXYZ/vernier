@@ -38,6 +38,10 @@ type HopTiming struct {
 	Market   market.MarketID
 	Duration time.Duration
 	Cached   bool
+	// Amounts are raw token units. They are observational data only and do
+	// not participate in quote economics.
+	AmountIn  string
+	AmountOut string
 }
 
 type Timing struct {
