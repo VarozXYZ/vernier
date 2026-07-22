@@ -54,6 +54,35 @@ func TestReadOnlyNetworkReadsSlotsAndAccounts(t *testing.T) {
 	}
 }
 
+func TestReadOnlyNetworkReadsProgramAccounts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Method != "getProgramAccounts" {
+			t.Fatalf("unexpected method %s", request.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[{"pubkey":"account","account":{"lamports":9,"owner":"owner","executable":false,"rentEpoch":4,"data":["AQID","base64"]}}]}`))
+	}))
+	defer server.Close()
+	network, err := solana.NewReadOnlyNetwork("solana", "test", server.URL, websocketURL(server.URL), server.Client(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := uint64(3)
+	accounts, err := network.ReadProgramAccounts(context.Background(), "program", []solana.ProgramFilter{{DataSize: &size}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 || accounts[0].Account != "account" || string(accounts[0].Value.Data) != "\x01\x02\x03" {
+		t.Fatalf("unexpected program accounts: %+v", accounts)
+	}
+}
+
 func TestLogsSubscriptionUsesMentionFilterAndPublishesSlot(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -144,6 +173,50 @@ func TestAccountSubscriptionPublishesAccountDataAndSlot(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for account notification")
+	}
+}
+
+func TestProgramSubscriptionPublishesAccountDataAndSlot(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var request map[string]any
+		if err := conn.ReadJSON(&request); err != nil {
+			return
+		}
+		if request["method"] != "programSubscribe" {
+			t.Errorf("unexpected method: %#v", request["method"])
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": request["id"], "result": 8})
+		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "method": "programNotification", "params": map[string]any{"result": map[string]any{"context": map[string]any{"slot": 321}, "value": map[string]any{"pubkey": "tick-account", "account": map[string]any{"lamports": 7, "owner": "owner", "executable": false, "rentEpoch": 1, "data": []string{"AQID", "base64"}}}}}})
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	network, err := solana.NewReadOnlyNetwork("solana", "test", "http://127.0.0.1:1", websocketURL(server.URL), server.Client(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription, err := network.SubscribeProgram(context.Background(), solana.ProgramSubscriptionRequest{Program: "program"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Unsubscribe()
+	select {
+	case notification := <-subscription.Notifications():
+		if notification.Slot != 321 || notification.Account != "tick-account" || notification.Value.Lamports != 7 || string(notification.Value.Data) != "\x01\x02\x03" {
+			t.Fatalf("unexpected notification %+v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for program notification")
 	}
 }
 
