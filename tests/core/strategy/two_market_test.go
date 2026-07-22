@@ -122,6 +122,37 @@ func TestTwoMarketUsesHealthySnapshotsWithoutAgeExpiry(t *testing.T) {
 	}
 }
 
+func TestTwoMarketTimingSeparatesSequentialLocalQuotesAndCacheHits(t *testing.T) {
+	fixture := newStrategyFixture(t, "1", "0.5")
+	evaluation := fixture.evaluation(t, fixture.snapshots, fixture.now)
+	_, first, err := fixture.strategy.EvaluateWithTiming(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Directions) != 2 || first.Duration < 0 {
+		t.Fatalf("unexpected evaluation timing: %+v", first)
+	}
+	for _, direction := range first.Directions {
+		if len(direction.Quotes) != 4 {
+			t.Fatalf("expected buy/sell timing for both sizes, got %+v", direction)
+		}
+		if direction.Quotes[0].Leg != "buy" || direction.Quotes[1].Leg != "sell" {
+			t.Fatalf("quotes must preserve buy then sell order: %+v", direction.Quotes)
+		}
+	}
+	_, second, err := fixture.strategy.EvaluateWithTiming(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, direction := range second.Directions {
+		for _, quote := range direction.Quotes {
+			if !quote.Cached {
+				t.Fatalf("unchanged snapshot quote was recalculated: %+v", quote)
+			}
+		}
+	}
+}
+
 type strategyFixture struct {
 	registry  *market.Registry
 	strategy  *strategy.TwoMarketCrossChainArbitrage

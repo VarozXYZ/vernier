@@ -47,12 +47,12 @@ func (c *quoteCache) getOrCompute(
 	purpose market.QuotePurpose,
 	quotedAt time.Time,
 	compute func() (market.Quote, error),
-) (market.Quote, error) {
+) (market.Quote, bool, error) {
 	if source == nil || compute == nil {
-		return market.Quote{}, fmt.Errorf("quote source and computation are required")
+		return market.Quote{}, false, fmt.Errorf("quote source and computation are required")
 	}
 	if err := ctx.Err(); err != nil {
-		return market.Quote{}, err
+		return market.Quote{}, false, err
 	}
 	metadata := snapshot.Metadata()
 	key := quoteCacheKey{
@@ -71,14 +71,15 @@ func (c *quoteCache) getOrCompute(
 		c.states[metadata.Market] = state
 	}
 	if cached, ok := state.quotes[key]; ok {
-		return rebind(cached, snapshot, quotedAt)
+		quote, err := rebind(cached, snapshot, quotedAt)
+		return quote, true, err
 	}
 	quote, err := compute()
 	if err != nil {
-		return market.Quote{}, err
+		return market.Quote{}, false, err
 	}
 	state.quotes[key] = quote
-	return quote, nil
+	return quote, false, nil
 }
 
 func rebind(cached market.Quote, snapshot market.MarketSnapshot, quotedAt time.Time) (market.Quote, error) {
