@@ -77,6 +77,9 @@ func TestRunExitCodes(t *testing.T) {
 		"stream requires jsonl":               {"compare-live", "--stream", "--format", "json"},
 		"continuous live mode is the default": {"compare-live", "--format", "json"},
 		"stream updates cannot be negative":   {"compare-live", "--stream", "--updates", "-1"},
+		"setup cannot combine config":         {"compare-live", "--setup", "setup-a", "--config", "manifest.yaml"},
+		"setup cannot combine env file":       {"compare-live", "--setup", "setup-a", "--env-file", ".env.other"},
+		"setup must be a directory name":      {"compare-live", "--setup", "../setup-a"},
 		"bad live log level":                  {"compare-live", "--log-level", "trace"},
 		"bad calculation detail":              {"compare-live", "--calculations", "everything"},
 	} {
