@@ -15,6 +15,9 @@ explain every evaluated opportunity from immutable market snapshots.
   concentrated-liquidity local market adapters.
 - Read-only market observation: experimental, with configured EVM profiles,
   pool-filtered logs, and exact on-chain parity checks.
+- Cross-chain route composition: experimental, with multi-hop immutable
+  snapshots, Solana `logsSubscribe` feeds, Meteora DLMM and Orca Whirlpool
+  local integer quoters, and optional Jupiter v2 reference validation.
 - Point-in-time cross-chain comparison: experimental for canonical Uniswap V2
   and the Aerodrome Slipstream V3 variant.
 - Live execution: not implemented.
@@ -184,6 +187,13 @@ Compatible EVM networks share one implementation and differ through configured
 identity, chain ID, and endpoint profiles. Protocol or network-specific code is
 added only when behavior actually diverges. See
 [ADR 0004](decisions/0004-modular-composition.md).
+
+Solana topology uses separate `http_url_env` and `websocket_url_env` values.
+Pools are independent from venues, and a `path` lists ordered hops. A healthy
+pool-log subscription has no TTL or slot-gap rule; only a confirmed WebSocket
+disconnect degrades it, and reconnect bootstraps current state without
+backfill. Jupiter validation is asynchronous evidence for the locally selected
+size and never signs or broadcasts a transaction.
 
 ## Development
 

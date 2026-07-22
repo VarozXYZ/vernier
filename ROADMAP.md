@@ -26,6 +26,12 @@ continuous mode now shares the same mirrors and strategy, evaluates after
 both-pool bootstrap and accepted log updates, and exposes disconnect
 degradation explicitly.
 
+The cross-chain route slice now also has protocol-neutral multi-hop snapshots,
+read-only Solana RPC/log capabilities, canonical Meteora DLMM and Orca
+Whirlpool local quote models, and optional Jupiter reference evidence. Runtime
+composition remains experimental; signing, broadcast, bridges, and event
+persistence are not part of this milestone.
+
 ## 3. Durable Research
 
 Persist only economically meaningful opportunity windows and their compact
