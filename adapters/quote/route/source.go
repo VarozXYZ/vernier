@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/VarozXYZ/vernier/domain/market"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
@@ -26,6 +27,8 @@ type Source struct {
 	mu         sync.RWMutex
 	hopCache   map[hopKey]market.Quote
 	routeCache map[routeKey]market.Quote
+	timingMu   sync.RWMutex
+	lastTiming quoteport.Timing
 }
 
 type hopKey struct {
@@ -68,7 +71,27 @@ func New(id market.SourceID, candidate market.Market, hops []Hop) (*Source, erro
 
 func (s *Source) ID() market.SourceID { return s.id }
 
+func (s *Source) LastTiming() quoteport.Timing {
+	s.timingMu.RLock()
+	defer s.timingMu.RUnlock()
+	result := s.lastTiming
+	result.Hops = append([]quoteport.HopTiming(nil), result.Hops...)
+	return result
+}
+
+func (s *Source) setTiming(value quoteport.Timing) {
+	s.timingMu.Lock()
+	s.lastTiming = value
+	s.timingMu.Unlock()
+}
+
 func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote, error) {
+	started := time.Now()
+	timing := quoteport.Timing{}
+	defer func() {
+		timing.Duration = time.Since(started)
+		s.setTiming(timing)
+	}()
 	if err := ctx.Err(); err != nil {
 		return market.Quote{}, err
 	}
@@ -84,6 +107,7 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	cached, found := s.routeCache[routeKey]
 	s.mu.RUnlock()
 	if found {
+		timing.Cached = true
 		return cached, nil
 	}
 	current := input.AmountIn
@@ -101,6 +125,7 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 		result, cachedHop := s.hopCache[hopKey]
 		s.mu.RUnlock()
 		var err error
+		hopStarted := time.Now()
 		if !cachedHop {
 			result, err = hop.Source.Quote(ctx, quoteport.Input{Snapshot: snapshot, TokenIn: hop.In, TokenOut: hop.Out, AmountIn: current, Purpose: input.Purpose, QuotedAt: input.QuotedAt})
 			if err == nil {
@@ -112,6 +137,7 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 		if err != nil {
 			return market.Quote{}, fmt.Errorf("quote route hop %d: %w", index, err)
 		}
+		timing.Hops = append(timing.Hops, quoteport.HopTiming{Market: hop.Market, Duration: time.Since(hopStarted), Cached: cachedHop})
 		if index == 0 {
 			first = result
 		}
@@ -127,6 +153,12 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 }
 
 func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutputInput) (market.Quote, error) {
+	started := time.Now()
+	timing := quoteport.Timing{}
+	defer func() {
+		timing.Duration = time.Since(started)
+		s.setTiming(timing)
+	}()
 	if err := ctx.Err(); err != nil {
 		return market.Quote{}, err
 	}
@@ -139,6 +171,7 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 	cached, found := s.routeCache[routeKey]
 	s.mu.RUnlock()
 	if found {
+		timing.Cached = true
 		return cached, nil
 	}
 	current := input.AmountOut
@@ -158,6 +191,7 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 		result, cachedHop := s.hopCache[hopKey]
 		s.mu.RUnlock()
 		var err error
+		hopStarted := time.Now()
 		if !cachedHop {
 			result, err = source.QuoteExactOutput(ctx, quoteport.ExactOutputInput{Snapshot: snapshot, TokenIn: hop.In, TokenOut: hop.Out, AmountOut: current, Purpose: input.Purpose, QuotedAt: input.QuotedAt})
 			if err == nil {
@@ -169,6 +203,7 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 		if err != nil {
 			return market.Quote{}, fmt.Errorf("quote route hop %d: %w", index, err)
 		}
+		timing.Hops = append(timing.Hops, quoteport.HopTiming{Market: hop.Market, Duration: time.Since(hopStarted), Cached: cachedHop})
 		if index == len(s.hops)-1 {
 			final = result
 		}
@@ -194,3 +229,4 @@ func child(bundle market.SnapshotBundle, id market.MarketID) (market.MarketSnaps
 
 var _ quoteport.Source = (*Source)(nil)
 var _ quoteport.ExactOutputSource = (*Source)(nil)
+var _ quoteport.TimingSource = (*Source)(nil)

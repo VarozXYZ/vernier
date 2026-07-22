@@ -14,6 +14,34 @@ import (
 
 type Clock func() time.Time
 
+// QuoteTiming describes one deterministic local quote used by a direction.
+// Duration includes the cache lookup and, on a miss, the complete local
+// calculation. It never includes an external validation request.
+type QuoteTiming struct {
+	Market   market.MarketID
+	Leg      string
+	Mode     market.QuoteMode
+	Duration time.Duration
+	Cached   bool
+	Hops     []quoteport.HopTiming
+}
+
+// DirectionTiming keeps the sequential buy-then-sell timings together with
+// the total time spent evaluating one direction.
+type DirectionTiming struct {
+	Direction arbitrage.Direction
+	Duration  time.Duration
+	Quotes    []QuoteTiming
+}
+
+// EvaluationTiming is the local Research hot-path trace. The quote order is
+// the order in which the strategy evaluated it; sell quotes therefore follow
+// their dependent buy quotes.
+type EvaluationTiming struct {
+	Duration   time.Duration
+	Directions []DirectionTiming
+}
+
 type SizingAsset string
 
 const (
@@ -92,23 +120,39 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 func (s *TwoMarketCrossChainArbitrage) ID() arbitrage.StrategyID { return s.id }
 
 func (s *TwoMarketCrossChainArbitrage) Evaluate(ctx context.Context, evaluation arbitrage.Evaluation) ([]arbitrage.Opportunity, error) {
-	if evaluation.Strategy() != s.id {
-		return nil, fmt.Errorf("evaluation targets strategy %q, expected %q", evaluation.Strategy(), s.id)
-	}
-	if evaluation.Cost().Amount.Asset() != s.threshold.Asset() {
-		return nil, fmt.Errorf("cost asset does not match strategy quote asset")
-	}
-	opportunities := make([]arbitrage.Opportunity, 0, len(s.setup.Directions()))
-	for _, direction := range s.setup.Directions() {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		opportunities = append(opportunities, s.evaluateDirection(ctx, evaluation, direction))
-	}
-	return opportunities, nil
+	opportunities, _, err := s.EvaluateWithTiming(ctx, evaluation)
+	return opportunities, err
 }
 
-func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction) arbitrage.Opportunity {
+// EvaluateWithTiming evaluates both directions using only the fixed
+// snapshots in evaluation and returns the local timing trace alongside the
+// economic results. External reference providers are intentionally absent
+// from this method.
+func (s *TwoMarketCrossChainArbitrage) EvaluateWithTiming(ctx context.Context, evaluation arbitrage.Evaluation) ([]arbitrage.Opportunity, EvaluationTiming, error) {
+	if evaluation.Strategy() != s.id {
+		return nil, EvaluationTiming{}, fmt.Errorf("evaluation targets strategy %q, expected %q", evaluation.Strategy(), s.id)
+	}
+	if evaluation.Cost().Amount.Asset() != s.threshold.Asset() {
+		return nil, EvaluationTiming{}, fmt.Errorf("cost asset does not match strategy quote asset")
+	}
+	started := s.clock()
+	opportunities := make([]arbitrage.Opportunity, 0, len(s.setup.Directions()))
+	timing := EvaluationTiming{Directions: make([]DirectionTiming, 0, len(s.setup.Directions()))}
+	for _, direction := range s.setup.Directions() {
+		if err := ctx.Err(); err != nil {
+			return nil, EvaluationTiming{}, err
+		}
+		directionStarted := s.clock()
+		directionTiming := DirectionTiming{Direction: direction}
+		opportunities = append(opportunities, s.evaluateDirection(ctx, evaluation, direction, &directionTiming))
+		directionTiming.Duration = nonNegative(s.clock().Sub(directionStarted))
+		timing.Directions = append(timing.Directions, directionTiming)
+	}
+	timing.Duration = nonNegative(s.clock().Sub(started))
+	return opportunities, timing, nil
+}
+
+func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, timing *DirectionTiming) arbitrage.Opportunity {
 	opportunity := arbitrage.Opportunity{
 		Evaluation: evaluation.ID(), Run: evaluation.Run(), ConfigHash: evaluation.ConfigHash(),
 		Strategy: s.id, Direction: direction,
@@ -143,7 +187,7 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 	sellQuote, _ := s.registry.Token(sellMarket.QuoteToken)
 
 	for _, size := range s.grid.Values() {
-		candidate, err := s.candidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size)
+		candidate, err := s.candidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size, timing)
 		if err != nil {
 			opportunity.Reasons = append(opportunity.Reasons, err.Error())
 			continue
@@ -178,9 +222,9 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 	return s.finish(opportunity)
 }
 
-func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, size market.AssetQuantity) (arbitrage.Candidate, error) {
+func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, size market.AssetQuantity, timing *DirectionTiming) (arbitrage.Candidate, error) {
 	if s.sizingAsset == buyQuote.Asset {
-		return s.quoteSizedCandidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size)
+		return s.quoteSizedCandidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size, timing)
 	}
 	targetBase, err := size.ToTokenAmount(buyBase)
 	if err != nil || targetBase.IsZero() {
@@ -192,7 +236,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 		Snapshot: buySnapshot, TokenIn: buyQuote.ID, TokenOut: buyBase.ID,
 		TargetOut: targetBase, InitialHigh: initialHigh,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
-	})
+	}, timing, "buy")
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed")
 	}
@@ -210,7 +254,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	sell, err := s.input(ctx, s.sources[direction.SellMarket], quoteport.Input{
 		Snapshot: sellSnapshot, TokenIn: sellBase.ID, TokenOut: sellQuote.ID, AmountIn: sellInput,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
-	})
+	}, timing, "sell")
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed")
 	}
@@ -229,7 +273,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	}, nil
 }
 
-func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, budget market.AssetQuantity) (arbitrage.Candidate, error) {
+func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, budget market.AssetQuantity, timing *DirectionTiming) (arbitrage.Candidate, error) {
 	buyInput, err := budget.ToTokenAmount(buyQuote)
 	if err != nil || buyInput.IsZero() {
 		return arbitrage.Candidate{}, fmt.Errorf("size_rounds_to_zero")
@@ -237,7 +281,7 @@ func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, 
 	buy, err := s.input(ctx, s.sources[direction.BuyMarket], quoteport.Input{
 		Snapshot: buySnapshot, TokenIn: buyQuote.ID, TokenOut: buyBase.ID, AmountIn: buyInput,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
-	})
+	}, timing, "buy")
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed")
 	}
@@ -255,7 +299,7 @@ func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, 
 	sell, err := s.input(ctx, s.sources[direction.SellMarket], quoteport.Input{
 		Snapshot: sellSnapshot, TokenIn: sellBase.ID, TokenOut: sellQuote.ID, AmountIn: sellInput,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
-	})
+	}, timing, "sell")
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed")
 	}
@@ -275,16 +319,32 @@ func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, 
 	}, nil
 }
 
-func (s *TwoMarketCrossChainArbitrage) exactOutput(ctx context.Context, source quoteport.Source, request sizing.ExactOutputRequest) (market.Quote, error) {
-	return s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactOutput, request.TokenIn, request.TokenOut, request.TargetOut, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
+func (s *TwoMarketCrossChainArbitrage) exactOutput(ctx context.Context, source quoteport.Source, request sizing.ExactOutputRequest, timing *DirectionTiming, leg string) (market.Quote, error) {
+	started := s.clock()
+	quote, cached, err := s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactOutput, request.TokenIn, request.TokenOut, request.TargetOut, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
 		return sizing.MinimumInputForOutput(ctx, source, request)
 	})
+	s.recordQuoteTiming(timing, source, QuoteTiming{Market: request.Snapshot.Metadata().Market, Leg: leg, Mode: market.QuoteModeExactOutput, Duration: nonNegative(s.clock().Sub(started)), Cached: cached})
+	return quote, err
 }
 
-func (s *TwoMarketCrossChainArbitrage) input(ctx context.Context, source quoteport.Source, request quoteport.Input) (market.Quote, error) {
-	return s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactInput, request.TokenIn, request.TokenOut, request.AmountIn, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
+func (s *TwoMarketCrossChainArbitrage) input(ctx context.Context, source quoteport.Source, request quoteport.Input, timing *DirectionTiming, leg string) (market.Quote, error) {
+	started := s.clock()
+	quote, cached, err := s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactInput, request.TokenIn, request.TokenOut, request.AmountIn, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
 		return source.Quote(ctx, request)
 	})
+	s.recordQuoteTiming(timing, source, QuoteTiming{Market: request.Snapshot.Metadata().Market, Leg: leg, Mode: market.QuoteModeExactInput, Duration: nonNegative(s.clock().Sub(started)), Cached: cached})
+	return quote, err
+}
+
+func (s *TwoMarketCrossChainArbitrage) recordQuoteTiming(timing *DirectionTiming, source quoteport.Source, quote QuoteTiming) {
+	if timing != nil {
+		if traced, ok := source.(quoteport.TimingSource); ok {
+			trace := traced.LastTiming()
+			quote.Hops = append([]quoteport.HopTiming(nil), trace.Hops...)
+		}
+		timing.Quotes = append(timing.Quotes, quote)
+	}
 }
 
 func hasUnmodeledFee(quote market.Quote) bool {
@@ -309,4 +369,11 @@ func greater(left, right market.AssetQuantity) bool {
 func greaterOrEqual(left, right market.AssetQuantity) bool {
 	comparison, err := left.Cmp(right)
 	return err == nil && comparison >= 0
+}
+
+func nonNegative(value time.Duration) time.Duration {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
