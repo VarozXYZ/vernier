@@ -97,9 +97,18 @@ Canonical adapter reuse and network/fork boundaries are recorded in
 The `compare-live` composition reads two configured markets at explicit
 block hashes. It sizes in the quote asset by default, models prepositioned inventory,
 converts a fixed external cost through CoinGecko with Chainlink fallback,
-evaluates both directions, and checks every local leg against the venue
-reference quoter. Provider request pacing belongs to the EVM network layer,
-not to either market adapter.
+probes both markets locally before sizing, and checks selected local legs
+against the venue reference quoter. Provider request pacing belongs to the EVM
+network layer, not to either market adapter.
+
+The live strategy first runs three local quote-asset probes at evenly spaced
+points across the configured sizing range (minimum, middle, and maximum for
+the default). The market returning more base asset for the same quote budget
+wins a strict majority decision and becomes the buy leg; the other market is
+the sell leg. The full sizing curve is then evaluated only in that direction,
+so probe quotes can be reused from the local cache. A tie, equal output, or
+failed/incomplete probe safely falls back to evaluating both directions.
+The policy is recorded in [ADR 0007](decisions/0007-early-direction-discovery.md).
 
 Configuration is modular YAML: a manifest selects topology and policy files,
 while endpoint values and API keys remain in an ignored `.env` file. VIRTUAL

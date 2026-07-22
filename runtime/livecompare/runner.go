@@ -249,6 +249,10 @@ func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.Arbitrag
 	if err != nil {
 		return nil, err
 	}
+	discoverySamples := 0
+	if r.config.SizeSamples >= 3 {
+		discoverySamples = 3
+	}
 	threshold, err := market.NewAssetQuantity(r.config.Markets[0].Quote.Token.Asset, r.config.MinimumNet)
 	if err != nil {
 		return nil, err
@@ -256,6 +260,7 @@ func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.Arbitrag
 	return strategy.NewTwoMarket(strategy.TwoMarketConfig{
 		ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
 		Sources: sources, Grid: grid, Threshold: threshold, Clock: r.clock, SizingAsset: strategy.SizingAsset(r.config.SizingAsset),
+		DirectionDiscoverySamples: discoverySamples,
 	})
 }
 

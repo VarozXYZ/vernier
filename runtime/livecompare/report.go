@@ -61,6 +61,21 @@ func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions
 	); err != nil {
 		return err
 	}
+	if discovery := report.Research.LocalTiming.Discovery; discovery != nil {
+		if _, err := fmt.Fprintf(writer, "direction_discovery samples=%d duration=%s decision=%s selected=%s->%s\n", discovery.Samples, discovery.Duration, discovery.Decision, discovery.Selected.BuyMarket, discovery.Selected.SellMarket); err != nil {
+			return err
+		}
+		for index, probe := range discovery.Probes {
+			if _, err := fmt.Fprintf(writer, "direction_probe index=%d size=%s %s winner=%s reason=%s duration=%s\n", index, probe.Size.Decimal(8), probe.Size.Asset(), probe.Winner, probe.Reason, probe.Duration); err != nil {
+				return err
+			}
+			for _, output := range probe.Outputs {
+				if _, err := fmt.Fprintf(writer, "direction_probe_output market=%s output=%s %s duration=%s cached=%t\n", output.Market, output.Output.Decimal(8), output.Output.Asset(), output.Duration, output.Cached); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	for _, direction := range report.Research.LocalTiming.Directions {
 		if _, err := fmt.Fprintf(writer, "local_direction %s->%s duration=%s\n", direction.Direction.BuyMarket, direction.Direction.SellMarket, direction.Duration); err != nil {
 			return err
@@ -123,6 +138,11 @@ func writeTextSummary(writer io.Writer, report Report) error {
 		report.Research.Evaluations, report.Research.Status, len(report.Research.Opportunities),
 		report.Cost.Cost.Decimal(6), report.Cost.Cost.Asset(), report.Cost.Price.Source(), report.Research.LocalTiming.Duration, len(report.Reference), len(report.Parity)); err != nil {
 		return err
+	}
+	if discovery := report.Research.LocalTiming.Discovery; discovery != nil {
+		if _, err := fmt.Fprintf(writer, "direction_discovery samples=%d duration=%s decision=%s selected=%s->%s\n", discovery.Samples, discovery.Duration, discovery.Decision, discovery.Selected.BuyMarket, discovery.Selected.SellMarket); err != nil {
+			return err
+		}
 	}
 	for _, opportunity := range report.Research.Opportunities {
 		selected := "none"
@@ -268,10 +288,19 @@ type summaryPayload struct {
 	Evaluation      int                     `json:"evaluation"`
 	Status          runtimeresearch.Status  `json:"status"`
 	LocalDuration   string                  `json:"local_evaluation_duration"`
+	Discovery       *discoverySummaryDTO    `json:"direction_discovery,omitempty"`
 	Opportunities   []summaryOpportunityDTO `json:"opportunities"`
 	Cost            summaryCostDTO          `json:"cost"`
 	ParityChecks    int                     `json:"parity_checks"`
 	ReferenceChecks int                     `json:"external_reference_checks"`
+}
+
+type discoverySummaryDTO struct {
+	Samples    int    `json:"samples"`
+	Duration   string `json:"duration"`
+	Decision   string `json:"decision"`
+	BuyMarket  string `json:"buy_market,omitempty"`
+	SellMarket string `json:"sell_market,omitempty"`
 }
 
 type summaryOpportunityDTO struct {
@@ -302,6 +331,9 @@ func writeJSONSummary(writer io.Writer, report Report) error {
 		Status: report.Research.Status, LocalDuration: report.Research.LocalTiming.Duration.String(), Opportunities: make([]summaryOpportunityDTO, 0, len(report.Research.Opportunities)),
 		Cost:            summaryCostDTO{Amount: report.Cost.Cost.Decimal(8), Asset: string(report.Cost.Cost.Asset()), Source: string(report.Cost.Price.Source())},
 		ReferenceChecks: len(report.Reference), ParityChecks: len(report.Parity),
+	}
+	if discovery := report.Research.LocalTiming.Discovery; discovery != nil {
+		payload.Discovery = &discoverySummaryDTO{Samples: discovery.Samples, Duration: discovery.Duration.String(), Decision: discovery.Decision, BuyMarket: string(discovery.Selected.BuyMarket), SellMarket: string(discovery.Selected.SellMarket)}
 	}
 	for _, opportunity := range report.Research.Opportunities {
 		item := summaryOpportunityDTO{

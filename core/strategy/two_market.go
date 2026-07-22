@@ -34,11 +34,40 @@ type DirectionTiming struct {
 	Quotes    []QuoteTiming
 }
 
+// DirectionProbeTiming records one fixed quote-budget probe used to choose a
+// purchase market before the complete sizing curve is evaluated.
+type DirectionProbeTiming struct {
+	Size     market.AssetQuantity
+	Outputs  []DirectionProbeOutput
+	Winner   market.MarketID
+	Reason   string
+	Duration time.Duration
+}
+
+// DirectionProbeOutput is the comparable base-asset output from one market.
+type DirectionProbeOutput struct {
+	Market   market.MarketID
+	Output   market.AssetQuantity
+	Duration time.Duration
+	Cached   bool
+}
+
+// DirectionDiscoveryTiming records the early direction decision and its
+// evidence. An empty Selected value means the strategy used the safe fallback.
+type DirectionDiscoveryTiming struct {
+	Samples  int
+	Duration time.Duration
+	Selected arbitrage.Direction
+	Decision string
+	Probes   []DirectionProbeTiming
+}
+
 // EvaluationTiming is the local Research hot-path trace. The quote order is
 // the order in which the strategy evaluated it; sell quotes therefore follow
 // their dependent buy quotes.
 type EvaluationTiming struct {
 	Duration   time.Duration
+	Discovery  *DirectionDiscoveryTiming
 	Directions []DirectionTiming
 }
 
@@ -58,18 +87,23 @@ type TwoMarketConfig struct {
 	Threshold   market.AssetQuantity
 	Clock       Clock
 	SizingAsset SizingAsset
+	// DirectionDiscoverySamples enables a quick min/mid/max-style direction
+	// probe before exhaustive sizing. Zero preserves the explicit two-direction
+	// behavior for callers that need it.
+	DirectionDiscoverySamples int
 }
 
 type TwoMarketCrossChainArbitrage struct {
-	id          arbitrage.StrategyID
-	setup       arbitrage.ArbitrageSetup
-	registry    *market.Registry
-	sources     map[market.MarketID]quoteport.Source
-	grid        sizing.Grid
-	threshold   market.AssetQuantity
-	clock       Clock
-	cache       quoteCache
-	sizingAsset market.AssetID
+	id               arbitrage.StrategyID
+	setup            arbitrage.ArbitrageSetup
+	registry         *market.Registry
+	sources          map[market.MarketID]quoteport.Source
+	grid             sizing.Grid
+	threshold        market.AssetQuantity
+	clock            Clock
+	cache            quoteCache
+	sizingAsset      market.AssetID
+	discoverySamples int
 }
 
 func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error) {
@@ -99,6 +133,12 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	if config.Grid.Asset() != sizingAsset {
 		return nil, fmt.Errorf("sizing grid must use %s asset %q", basis, sizingAsset)
 	}
+	if config.DirectionDiscoverySamples != 0 && config.DirectionDiscoverySamples < 3 {
+		return nil, fmt.Errorf("direction discovery requires at least three samples")
+	}
+	if config.DirectionDiscoverySamples > len(config.Grid.Values()) {
+		return nil, fmt.Errorf("direction discovery samples exceed sizing grid")
+	}
 	if config.Threshold.Asset() != pair.QuoteAsset || config.Threshold.Sign() < 0 {
 		return nil, fmt.Errorf("non-negative threshold must use quote asset %q", pair.QuoteAsset)
 	}
@@ -113,7 +153,8 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	return &TwoMarketCrossChainArbitrage{
 		id: config.ID, setup: config.Setup, registry: config.Registry, sources: sources,
 		grid: config.Grid, threshold: config.Threshold, clock: config.Clock, sizingAsset: sizingAsset,
-		cache: newQuoteCache(),
+		discoverySamples: config.DirectionDiscoverySamples,
+		cache:            newQuoteCache(),
 	}, nil
 }
 
@@ -124,10 +165,11 @@ func (s *TwoMarketCrossChainArbitrage) Evaluate(ctx context.Context, evaluation 
 	return opportunities, err
 }
 
-// EvaluateWithTiming evaluates both directions using only the fixed
-// snapshots in evaluation and returns the local timing trace alongside the
-// economic results. External reference providers are intentionally absent
-// from this method.
+// EvaluateWithTiming evaluates fixed snapshots and returns the local timing
+// trace alongside the economic results. When direction discovery is enabled,
+// it selects one direction before exhaustive sizing; an uncertain decision
+// keeps both configured directions. External reference providers are
+// intentionally absent from this method.
 func (s *TwoMarketCrossChainArbitrage) EvaluateWithTiming(ctx context.Context, evaluation arbitrage.Evaluation) ([]arbitrage.Opportunity, EvaluationTiming, error) {
 	if evaluation.Strategy() != s.id {
 		return nil, EvaluationTiming{}, fmt.Errorf("evaluation targets strategy %q, expected %q", evaluation.Strategy(), s.id)
@@ -138,7 +180,18 @@ func (s *TwoMarketCrossChainArbitrage) EvaluateWithTiming(ctx context.Context, e
 	started := s.clock()
 	opportunities := make([]arbitrage.Opportunity, 0, len(s.setup.Directions()))
 	timing := EvaluationTiming{Directions: make([]DirectionTiming, 0, len(s.setup.Directions()))}
-	for _, direction := range s.setup.Directions() {
+	directions := s.setup.Directions()
+	if s.discoverySamples > 0 {
+		selected, discovery, discoveryErr := s.discoverDirection(ctx, evaluation)
+		if discoveryErr != nil {
+			return nil, EvaluationTiming{}, discoveryErr
+		}
+		timing.Discovery = &discovery
+		if selected != nil {
+			directions = []arbitrage.Direction{*selected}
+		}
+	}
+	for _, direction := range directions {
 		if err := ctx.Err(); err != nil {
 			return nil, EvaluationTiming{}, err
 		}
@@ -150,6 +203,148 @@ func (s *TwoMarketCrossChainArbitrage) EvaluateWithTiming(ctx context.Context, e
 	}
 	timing.Duration = nonNegative(s.clock().Sub(started))
 	return opportunities, timing, nil
+}
+
+// discoverDirection uses a small, deterministic probe set before the full
+// sizing curve. For quote-asset sizing, more base asset output means a lower
+// purchase price. A strict majority wins; ties, failed probes, and equal
+// outputs deliberately fall back to evaluating both directions.
+func (s *TwoMarketCrossChainArbitrage) discoverDirection(ctx context.Context, evaluation arbitrage.Evaluation) (*arbitrage.Direction, DirectionDiscoveryTiming, error) {
+	started := s.clock()
+	timing := DirectionDiscoveryTiming{Samples: s.discoverySamples}
+	directions := s.setup.Directions()
+	if len(directions) != 2 {
+		timing.Decision = "unsupported_setup"
+		timing.Duration = nonNegative(s.clock().Sub(started))
+		return nil, timing, nil
+	}
+	marketA, aOK := s.registry.Market(directions[0].BuyMarket)
+	marketB, bOK := s.registry.Market(directions[0].SellMarket)
+	if !aOK || !bOK {
+		timing.Decision = "unknown_market"
+		timing.Duration = nonNegative(s.clock().Sub(started))
+		return nil, timing, nil
+	}
+	snapshotA, aSnapshotOK := evaluation.Snapshot(marketA.ID)
+	snapshotB, bSnapshotOK := evaluation.Snapshot(marketB.ID)
+	if !aSnapshotOK || !bSnapshotOK {
+		timing.Decision = "missing_snapshot"
+		timing.Duration = nonNegative(s.clock().Sub(started))
+		return nil, timing, nil
+	}
+	tokenAQuote, aTokenOK := s.registry.Token(marketA.QuoteToken)
+	tokenBQuote, bTokenOK := s.registry.Token(marketB.QuoteToken)
+	tokenABase, aBaseOK := s.registry.Token(marketA.BaseToken)
+	tokenBBase, bBaseOK := s.registry.Token(marketB.BaseToken)
+	if !aTokenOK || !bTokenOK || !aBaseOK || !bBaseOK {
+		timing.Decision = "unknown_token"
+		timing.Duration = nonNegative(s.clock().Sub(started))
+		return nil, timing, nil
+	}
+	if s.sizingAsset != tokenAQuote.Asset || s.sizingAsset != tokenBQuote.Asset {
+		timing.Decision = "unsupported_sizing_asset"
+		timing.Duration = nonNegative(s.clock().Sub(started))
+		return nil, timing, nil
+	}
+	values := s.grid.Values()
+	wins := map[market.MarketID]int{marketA.ID: 0, marketB.ID: 0}
+	valid := 0
+	for sample := 0; sample < s.discoverySamples; sample++ {
+		if err := ctx.Err(); err != nil {
+			return nil, timing, err
+		}
+		index := sample * (len(values) - 1) / (s.discoverySamples - 1)
+		probe := DirectionProbeTiming{Size: values[index]}
+		probeStarted := s.clock()
+		probeQuotes := make([]struct {
+			market   market.MarketID
+			snapshot market.MarketSnapshot
+			tokenIn  market.Token
+			tokenOut market.Token
+		}, 2)
+		probeQuotes[0] = struct {
+			market   market.MarketID
+			snapshot market.MarketSnapshot
+			tokenIn  market.Token
+			tokenOut market.Token
+		}{marketA.ID, snapshotA, tokenAQuote, tokenABase}
+		probeQuotes[1] = struct {
+			market   market.MarketID
+			snapshot market.MarketSnapshot
+			tokenIn  market.Token
+			tokenOut market.Token
+		}{marketB.ID, snapshotB, tokenBQuote, tokenBBase}
+		for _, candidate := range probeQuotes {
+			quoteTiming := DirectionTiming{}
+			input, err := probe.Size.ToTokenAmount(candidate.tokenIn)
+			if err != nil || input.IsZero() {
+				probe.Reason = "probe_size_rounds_to_zero"
+				continue
+			}
+			quote, err := s.input(ctx, s.sources[candidate.market], quoteport.Input{
+				Snapshot: candidate.snapshot, TokenIn: candidate.tokenIn.ID, TokenOut: candidate.tokenOut.ID,
+				AmountIn: input, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
+			}, &quoteTiming, "discovery")
+			if err != nil && ctx.Err() != nil {
+				return nil, timing, ctx.Err()
+			}
+			var output market.AssetQuantity
+			if err == nil {
+				output, err = quote.AmountOut.ToAssetQuantity(candidate.tokenOut)
+			}
+			probeOutput := DirectionProbeOutput{Market: candidate.market}
+			for _, recorded := range quoteTiming.Quotes {
+				if recorded.Market == candidate.market {
+					probeOutput.Duration = recorded.Duration
+					probeOutput.Cached = recorded.Cached
+					break
+				}
+			}
+			if err != nil {
+				if probe.Reason == "" {
+					probe.Reason = "probe_quote_failed"
+				}
+				probe.Outputs = append(probe.Outputs, probeOutput)
+				continue
+			}
+			probeOutput.Output = output
+			probe.Outputs = append(probe.Outputs, probeOutput)
+		}
+		if len(probe.Outputs) == 2 && probe.Outputs[0].Output.Asset() == probe.Outputs[1].Output.Asset() {
+			comparison, err := probe.Outputs[0].Output.Cmp(probe.Outputs[1].Output)
+			if err == nil && comparison != 0 {
+				valid++
+				if comparison > 0 {
+					probe.Winner = marketA.ID
+					wins[marketA.ID]++
+				} else {
+					probe.Winner = marketB.ID
+					wins[marketB.ID]++
+				}
+			} else if probe.Reason == "" {
+				probe.Reason = "equal_probe_output"
+			}
+		} else if probe.Reason == "" {
+			probe.Reason = "incomplete_probe"
+		}
+		probe.Duration = nonNegative(s.clock().Sub(probeStarted))
+		timing.Probes = append(timing.Probes, probe)
+	}
+	if valid == s.discoverySamples && wins[marketA.ID] > valid/2 {
+		selected := arbitrage.Direction{BuyMarket: marketA.ID, SellMarket: marketB.ID}
+		timing.Selected, timing.Decision = selected, "majority"
+		timing.Duration = nonNegative(s.clock().Sub(started))
+		return &selected, timing, nil
+	}
+	if valid == s.discoverySamples && wins[marketB.ID] > valid/2 {
+		selected := arbitrage.Direction{BuyMarket: marketB.ID, SellMarket: marketA.ID}
+		timing.Selected, timing.Decision = selected, "majority"
+		timing.Duration = nonNegative(s.clock().Sub(started))
+		return &selected, timing, nil
+	}
+	timing.Decision = "uncertain_fallback_both"
+	timing.Duration = nonNegative(s.clock().Sub(started))
+	return nil, timing, nil
 }
 
 func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, timing *DirectionTiming) arbitrage.Opportunity {
