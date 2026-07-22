@@ -13,23 +13,42 @@ import (
 	"github.com/VarozXYZ/vernier/domain/market"
 )
 
-const snapshotSchemaVersion uint16 = 1
+const snapshotSchemaVersion uint16 = 2
 
 type Bin struct {
 	id       int32
 	reserveX *big.Int
 	reserveY *big.Int
+	priceX64 *big.Int
 }
 
 func NewBin(id int32, reserveX, reserveY *big.Int) (Bin, error) {
 	if reserveX == nil || reserveY == nil || reserveX.Sign() < 0 || reserveY.Sign() < 0 || reserveX.Sign() == 0 && reserveY.Sign() == 0 {
 		return Bin{}, fmt.Errorf("bin reserves must be non-negative and not both zero")
 	}
-	return Bin{id: id, reserveX: clone(reserveX), reserveY: clone(reserveY)}, nil
+	price := new(big.Int).Lsh(new(big.Int).Set(reserveY), priceScaleBits)
+	price.Quo(price, reserveX)
+	if price.Sign() <= 0 {
+		return Bin{}, fmt.Errorf("bin price rounds to zero")
+	}
+	return Bin{id: id, reserveX: clone(reserveX), reserveY: clone(reserveY), priceX64: price}, nil
+}
+
+// NewBinWithPrice preserves the protocol's fixed-point bin price. It is used
+// by on-chain decoders because a bin can be one-sided and its price cannot be
+// reconstructed from the two reserve amounts alone.
+func NewBinWithPrice(id int32, reserveX, reserveY, priceX64 *big.Int) (Bin, error) {
+	if reserveX == nil || reserveY == nil || priceX64 == nil || reserveX.Sign() < 0 || reserveY.Sign() < 0 || priceX64.Sign() <= 0 || reserveX.Sign() == 0 && reserveY.Sign() == 0 {
+		return Bin{}, fmt.Errorf("bin reserves and price must be valid")
+	}
+	return Bin{id: id, reserveX: clone(reserveX), reserveY: clone(reserveY), priceX64: clone(priceX64)}, nil
 }
 func (b Bin) ID() int32          { return b.id }
 func (b Bin) ReserveX() *big.Int { return clone(b.reserveX) }
 func (b Bin) ReserveY() *big.Int { return clone(b.reserveY) }
+func (b Bin) PriceX64() *big.Int { return clone(b.priceX64) }
+
+const priceScaleBits uint = 64
 
 type StateUpdate struct {
 	activeID int32
@@ -45,7 +64,7 @@ func NewStateUpdate(activeID int32, binStep, feeBPS uint16, bins []Bin) (StateUp
 	}
 	return StateUpdate{activeID: activeID, binStep: binStep, feeBPS: feeBPS, bins: cloneBins(bins)}, nil
 }
-func (StateUpdate) EventKind() string { return "meteora_dlmm/state/v1" }
+func (StateUpdate) EventKind() string { return "meteora_dlmm/state/v2" }
 
 type SwapUpdate struct {
 	activeID int32
@@ -82,7 +101,7 @@ type Snapshot struct {
 	bins          []Bin
 }
 
-func (Snapshot) SnapshotKind() string { return "meteora_dlmm/v1" }
+func (Snapshot) SnapshotKind() string { return "meteora_dlmm/v2" }
 func (s Snapshot) ActiveID() int32    { return s.activeID }
 func (s Snapshot) BinStep() uint16    { return s.binStep }
 func (s Snapshot) FeeBPS() uint16     { return s.feeBPS }
@@ -95,7 +114,7 @@ func (s Snapshot) validate() error {
 	previous := int32(-1 << 31)
 	foundActive := false
 	for _, bin := range s.bins {
-		if bin.reserveX == nil || bin.reserveY == nil || bin.id <= previous || bin.reserveX.Sign() < 0 || bin.reserveY.Sign() < 0 || bin.reserveX.Sign() == 0 && bin.reserveY.Sign() == 0 {
+		if bin.reserveX == nil || bin.reserveY == nil || bin.priceX64 == nil || bin.id <= previous || bin.reserveX.Sign() < 0 || bin.reserveY.Sign() < 0 || bin.priceX64.Sign() <= 0 || bin.reserveX.Sign() == 0 && bin.reserveY.Sign() == 0 {
 			return fmt.Errorf("invalid or unsorted Meteora bin %d", bin.id)
 		}
 		if bin.id == s.activeID {
@@ -180,7 +199,7 @@ func mergeBins(base, updates []Bin) []Bin {
 func cloneBins(input []Bin) []Bin {
 	result := make([]Bin, len(input))
 	for i, bin := range input {
-		result[i] = Bin{id: bin.id, reserveX: clone(bin.reserveX), reserveY: clone(bin.reserveY)}
+		result[i] = Bin{id: bin.id, reserveX: clone(bin.reserveX), reserveY: clone(bin.reserveY), priceX64: clone(bin.priceX64)}
 	}
 	return result
 }
@@ -194,7 +213,7 @@ func hashState(state Snapshot) [sha256.Size]byte {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "%d|%d|%d|%d", state.schemaVersion, state.activeID, state.binStep, state.feeBPS)
 	for _, bin := range state.bins {
-		fmt.Fprintf(&builder, "|%d:%s:%s", bin.id, bin.reserveX, bin.reserveY)
+		fmt.Fprintf(&builder, "|%d:%s:%s:%s", bin.id, bin.reserveX, bin.reserveY, bin.priceX64)
 	}
 	return sha256.Sum256([]byte(builder.String()))
 }

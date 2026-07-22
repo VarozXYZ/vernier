@@ -49,6 +49,8 @@ func TestDLMMAccountDecoder(t *testing.T) {
 	copy(binArrayData[24:56], poolBytes[:])
 	binary.LittleEndian.PutUint64(binArrayData[56:64], 1_000)
 	binary.LittleEndian.PutUint64(binArrayData[64:72], 2_000)
+	binary.LittleEndian.PutUint64(binArrayData[72:80], 2)
+	binary.LittleEndian.PutUint64(binArrayData[80:88], 0)
 	// Account index 0 and its active bin are returned under the only address
 	// requested by this synthetic bitmap.
 	programID, err := solana.DecodePublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo")
@@ -66,7 +68,7 @@ func TestDLMMAccountDecoder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.EventKind() != "meteora_dlmm/state/v1" {
+	if event.EventKind() != "meteora_dlmm/state/v2" {
 		t.Fatalf("unexpected event kind %q", event.EventKind())
 	}
 }
