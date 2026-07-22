@@ -91,9 +91,12 @@ func (f *Feed) Run(ctx context.Context, sink feedport.Sink) error {
 	}
 	established := false
 	delay := f.retry.Initial
+	f.logger.Info("feed run started", "market", f.market, "source", f.source)
 	for {
+		f.logger.Debug("feed session starting", "market", f.market)
 		bootstrapped, disconnected, err := f.runSession(ctx, sink)
 		if err == nil || ctx.Err() != nil {
+			f.logger.Debug("feed run stopped", "market", f.market, "reason", ctx.Err())
 			return ctx.Err()
 		}
 		if !established && !bootstrapped {
@@ -106,6 +109,7 @@ func (f *Feed) Run(ctx context.Context, sink feedport.Sink) error {
 		if !disconnected {
 			return err
 		}
+		f.logger.Warn("feed WebSocket disconnected", "market", f.market, "error", err)
 		if healthErr := sink.SetHealth(ctx, feedport.HealthUpdate{Health: market.HealthDegraded, Reason: "websocket_disconnected", ObservedAt: f.clock().UTC()}); healthErr != nil {
 			return healthErr
 		}
@@ -118,6 +122,7 @@ func (f *Feed) Run(ctx context.Context, sink feedport.Sink) error {
 				delay = f.retry.Maximum
 			}
 		}
+		f.logger.Info("feed reconnecting", "market", f.market, "retry_delay", delay)
 	}
 }
 
@@ -127,14 +132,18 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 		return false, true, err
 	}
 	defer subscription.Unsubscribe()
+	f.logger.Debug("feed subscribing to filtered logs", "market", f.market)
 	slot, err := f.network.CurrentSlot(ctx)
 	if err != nil {
 		return false, false, err
 	}
+	f.logger.Info("feed bootstrap started", "market", f.market, "slot", slot)
+	bootstrapStarted := time.Now()
 	data, err := f.decoder.Bootstrap(ctx, f.network, slot)
 	if err != nil {
 		return false, false, fmt.Errorf("bootstrap %s at slot %d: %w", f.market, slot, err)
 	}
+	f.logger.Info("feed bootstrap completed", "market", f.market, "slot", slot, "duration", time.Since(bootstrapStarted))
 	bootstrap := f.event(slot, "bootstrap", data)
 	if resetSink, ok := sink.(feedport.ResetSink); ok {
 		if err := resetSink.Reset(ctx, bootstrap); err != nil {
@@ -146,6 +155,7 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 	if err := sink.SetHealth(ctx, feedport.HealthUpdate{Health: market.HealthHealthy, ObservedAt: f.clock().UTC()}); err != nil {
 		return false, false, err
 	}
+	f.logger.Info("feed bootstrap applied", "market", f.market, "slot", slot)
 	established = true
 	highest := slot
 	for {
@@ -169,6 +179,8 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 				// current state. Silence and slot gaps are otherwise irrelevant.
 				continue
 			}
+			f.logger.Debug("feed event received", "market", f.market, "slot", notification.Slot, "signature", notification.Signature)
+			eventStarted := time.Now()
 			data, err := f.decoder.Decode(ctx, f.network, notification)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
@@ -183,6 +195,7 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 				if err := sink.Publish(ctx, f.event(notification.Slot, notification.Signature, item)); err != nil {
 					return true, false, err
 				}
+				f.logger.Debug("feed event applied", "market", f.market, "slot", notification.Slot, "signature", notification.Signature, "instruction", index, "duration", time.Since(eventStarted))
 			}
 			if notification.Slot > highest {
 				highest = notification.Slot

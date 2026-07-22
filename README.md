@@ -17,7 +17,8 @@ explain every evaluated opportunity from immutable market snapshots.
   pool-filtered logs, and exact on-chain parity checks.
 - Cross-chain route composition: experimental, with multi-hop immutable
   snapshots, Solana `logsSubscribe` feeds, Meteora DLMM and Orca Whirlpool
-  local integer quoters, and optional Jupiter v2 reference validation.
+  local integer quoters, bidirectional path quoting, and optional Jupiter v2
+  reference validation.
 - Point-in-time cross-chain comparison: experimental for canonical Uniswap V2
   and the Aerodrome Slipstream V3 variant.
 - Live execution: not implemented.
