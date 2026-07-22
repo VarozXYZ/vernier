@@ -54,4 +54,25 @@ func TestWhirlpoolAccountDecoder(t *testing.T) {
 	_ = child
 }
 
+func TestWhirlpoolAccountDecodeDoesNotReadNetwork(t *testing.T) {
+	data := make([]byte, 653)
+	copy(data, []byte{0x3f, 0x95, 0xd1, 0x0c, 0xe1, 0x80, 0x63, 0x09})
+	binary.LittleEndian.PutUint16(data[41:43], 64)
+	binary.LittleEndian.PutUint16(data[45:47], 30)
+	binary.LittleEndian.PutUint64(data[49:57], 1000)
+	binary.LittleEndian.PutUint64(data[65:73], 1<<32)
+	binary.LittleEndian.PutUint32(data[81:85], 12)
+	decoder, err := orcawhirlpool.NewDecoder("pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := decoder.DecodeAccount(context.Background(), solana.AccountNotification{Slot: 8, Account: "pool", Value: solana.Account{Data: data}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventKind() != "orca_whirlpool/pool/v1" {
+		t.Fatalf("unexpected account events: %+v", events)
+	}
+}
+
 var _ solanalogs.Network = fakeNetwork{}

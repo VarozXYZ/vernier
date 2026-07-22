@@ -1,6 +1,6 @@
-// Package solanalogs adapts Solana logsSubscribe notifications to normalized
-// market events. It never subscribes to new heads, infers gaps, or applies a
-// TTL to a healthy market mirror.
+// Package solanalogs adapts Solana logsSubscribe and accountSubscribe
+// notifications to normalized market events. It never subscribes to new
+// heads, infers gaps, or applies a TTL to a healthy market mirror.
 package solanalogs
 
 import (
@@ -24,12 +24,24 @@ type Network interface {
 	SubscribeLogs(context.Context, string) (solana.LogsSubscription, error)
 }
 
+type AccountNetwork interface {
+	SubscribeAccount(context.Context, string) (solana.AccountSubscription, error)
+}
+
 // Decoder owns protocol-specific account bootstrap and log interpretation. A
 // single notification may contain multiple instructions; returned data must
 // retain that instruction order.
 type Decoder interface {
 	Bootstrap(context.Context, Network, uint64) (market.EventData, error)
 	Decode(context.Context, Network, solana.LogNotification) ([]market.EventData, error)
+}
+
+// AccountDecoder is an optional protocol contract for mirrors whose state is
+// carried by account data rather than logs. Implementations must not perform
+// network reads from DecodeAccount.
+type AccountDecoder interface {
+	AccountSubscriptions() []string
+	DecodeAccount(context.Context, solana.AccountNotification) ([]market.EventData, error)
 }
 
 type Clock func() time.Time
@@ -127,6 +139,10 @@ func (f *Feed) Run(ctx context.Context, sink feedport.Sink) error {
 }
 
 func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established, disconnected bool, result error) {
+	accountDecoder, accountNetwork := f.accountMode()
+	if accountDecoder != nil && accountNetwork != nil {
+		return f.runAccountSession(ctx, sink, accountDecoder, accountNetwork)
+	}
 	subscription, err := f.network.SubscribeLogs(ctx, f.pool)
 	if err != nil {
 		return false, true, err
@@ -199,6 +215,132 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 			}
 			if notification.Slot > highest {
 				highest = notification.Slot
+			}
+		}
+	}
+}
+
+func (f *Feed) accountMode() (AccountDecoder, AccountNetwork) {
+	decoder, decoderOK := f.decoder.(AccountDecoder)
+	network, networkOK := f.network.(AccountNetwork)
+	if !decoderOK || !networkOK {
+		return nil, nil
+	}
+	return decoder, network
+}
+
+type accountUpdate struct {
+	notification solana.AccountNotification
+}
+
+func (f *Feed) runAccountSession(ctx context.Context, sink feedport.Sink, decoder AccountDecoder, network AccountNetwork) (bool, bool, error) {
+	slot, err := f.network.CurrentSlot(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	f.logger.Info("feed bootstrap started", "market", f.market, "slot", slot)
+	bootstrapStarted := time.Now()
+	data, err := f.decoder.Bootstrap(ctx, f.network, slot)
+	if err != nil {
+		return false, false, fmt.Errorf("bootstrap %s at slot %d: %w", f.market, slot, err)
+	}
+	f.logger.Info("feed bootstrap completed", "market", f.market, "slot", slot, "duration", time.Since(bootstrapStarted))
+	bootstrap := f.event(slot, "bootstrap", data)
+	if resetSink, ok := sink.(feedport.ResetSink); ok {
+		if err := resetSink.Reset(ctx, bootstrap); err != nil {
+			return false, false, err
+		}
+	} else if err := sink.Publish(ctx, bootstrap); err != nil {
+		return false, false, err
+	}
+	if err := sink.SetHealth(ctx, feedport.HealthUpdate{Health: market.HealthHealthy, ObservedAt: f.clock().UTC()}); err != nil {
+		return false, false, err
+	}
+	addresses := decoder.AccountSubscriptions()
+	if len(addresses) == 0 {
+		return false, false, fmt.Errorf("account feed %s has no subscriptions", f.market)
+	}
+	updates := make(chan accountUpdate, 128)
+	errorsCh := make(chan error, len(addresses))
+	subscriptions := make([]solana.AccountSubscription, 0, len(addresses))
+	for _, address := range addresses {
+		subscription, subscribeErr := network.SubscribeAccount(ctx, address)
+		if subscribeErr != nil {
+			for _, active := range subscriptions {
+				active.Unsubscribe()
+			}
+			return true, true, subscribeErr
+		}
+		subscriptions = append(subscriptions, subscription)
+		go forwardAccounts(ctx, subscription, updates, errorsCh)
+	}
+	defer func() {
+		for _, subscription := range subscriptions {
+			subscription.Unsubscribe()
+		}
+	}()
+	f.logger.Info("feed account subscriptions active", "market", f.market, "accounts", len(addresses))
+	highest := slot
+	for {
+		select {
+		case <-ctx.Done():
+			return true, false, ctx.Err()
+		case err := <-errorsCh:
+			if err == nil {
+				err = fmt.Errorf("solana account stream closed")
+			}
+			return true, true, err
+		case update := <-updates:
+			if update.notification.Slot < highest {
+				continue
+			}
+			started := time.Now()
+			data, decodeErr := decoder.DecodeAccount(ctx, update.notification)
+			if decodeErr != nil {
+				return true, false, fmt.Errorf("decode %s account %s: %w", f.market, update.notification.Account, decodeErr)
+			}
+			for index, item := range data {
+				if item == nil {
+					return true, false, fmt.Errorf("decode %s account %s returned nil event at index %d", f.market, update.notification.Account, index)
+				}
+				if err := sink.Publish(ctx, f.event(update.notification.Slot, "account:"+update.notification.Account, item)); err != nil {
+					return true, false, err
+				}
+				f.logger.Debug("feed account event applied", "market", f.market, "account", update.notification.Account, "slot", update.notification.Slot, "duration", time.Since(started))
+			}
+			if update.notification.Slot > highest {
+				highest = update.notification.Slot
+			}
+		}
+	}
+}
+
+func forwardAccounts(ctx context.Context, subscription solana.AccountSubscription, updates chan<- accountUpdate, errorsCh chan<- error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err, open := <-subscription.Err():
+			if !open || err == nil {
+				err = fmt.Errorf("solana account subscription closed")
+			}
+			select {
+			case errorsCh <- err:
+			case <-ctx.Done():
+			}
+			return
+		case notification, open := <-subscription.Notifications():
+			if !open {
+				select {
+				case errorsCh <- fmt.Errorf("solana account notification stream closed"):
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case updates <- accountUpdate{notification: notification}:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}

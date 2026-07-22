@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/VarozXYZ/vernier/adapters/chain/solana"
 	"github.com/VarozXYZ/vernier/adapters/feed/solanalogs"
@@ -28,7 +29,12 @@ type MultipleAccountReader interface {
 	ReadMultipleAccounts(context.Context, []string) ([]solana.Account, error)
 }
 
-type Decoder struct{ Pool string }
+type Decoder struct {
+	Pool          string
+	mu            sync.RWMutex
+	tickSpacing   int32
+	subscriptions []string
+}
 
 func NewDecoder(pool string) (*Decoder, error) {
 	if pool == "" {
@@ -49,12 +55,48 @@ func (d *Decoder) Bootstrap(ctx context.Context, network solanalogs.Network, _ u
 	return d.decode(ctx, reader, account.Data)
 }
 
-func (d *Decoder) Decode(ctx context.Context, network solanalogs.Network, _ solana.LogNotification) ([]market.EventData, error) {
-	data, err := d.Bootstrap(ctx, network, 0)
+func (d *Decoder) AccountSubscriptions() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return append([]string(nil), d.subscriptions...)
+}
+
+func (d *Decoder) Decode(ctx context.Context, _ solanalogs.Network, _ solana.LogNotification) ([]market.EventData, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("whirlpool log feed cannot update state without account data")
+}
+
+func (d *Decoder) DecodeAccount(ctx context.Context, notification solana.AccountNotification) ([]market.EventData, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if notification.Account == d.Pool {
+		update, err := d.decodePool(notification.Value.Data)
+		if err != nil {
+			return nil, err
+		}
+		return []market.EventData{update}, nil
+	}
+	d.mu.RLock()
+	spacing := d.tickSpacing
+	d.mu.RUnlock()
+	if spacing <= 0 {
+		return nil, fmt.Errorf("whirlpool tick spacing is unavailable")
+	}
+	ticks, start, ok, err := parseFixedTickArray(notification.Value.Data, spacing)
 	if err != nil {
 		return nil, err
 	}
-	return []market.EventData{data}, nil
+	if !ok {
+		return nil, fmt.Errorf("unsupported whirlpool tick array account")
+	}
+	update, err := newTickArrayUpdate(start, spacing, ticks)
+	if err != nil {
+		return nil, err
+	}
+	return []market.EventData{update}, nil
 }
 
 func (d *Decoder) decode(ctx context.Context, reader AccountReader, data []byte) (StateUpdate, error) {
@@ -67,52 +109,56 @@ func (d *Decoder) decode(ctx context.Context, reader AccountReader, data []byte)
 	feeRate := uint32(readU16(45))
 	tickSpacing := int32(readU16(41))
 	currentTick := readI32(81)
-	ticks, minTick, maxTick, err := d.readTicks(ctx, reader, currentTick, tickSpacing)
+	ticks, minTick, maxTick, subscriptions, err := d.readTicks(ctx, reader, currentTick, tickSpacing)
 	if err != nil {
 		return StateUpdate{}, err
 	}
+	d.mu.Lock()
+	d.tickSpacing = tickSpacing
+	d.subscriptions = append([]string{d.Pool}, subscriptions...)
+	d.mu.Unlock()
 	return NewCoveredStateUpdateWithFeeRate(readU128(65), currentTick, readU128(49), feeRate, tickSpacing, ticks, false, minTick, maxTick)
 }
 
-func (d *Decoder) readTicks(ctx context.Context, reader AccountReader, currentTick, spacing int32) ([]Tick, int32, int32, error) {
+func (d *Decoder) readTicks(ctx context.Context, reader AccountReader, currentTick, spacing int32) ([]Tick, int32, int32, []string, error) {
 	readerMany, ok := reader.(MultipleAccountReader)
 	if !ok {
 		// A reduced test reader may expose only the pool account. It cannot
 		// establish tick coverage, so keep the state bounded to the current tick.
-		return nil, currentTick, currentTick, nil
+		return nil, currentTick, currentTick, nil, nil
 	}
 	if spacing <= 0 {
-		return nil, 0, 0, fmt.Errorf("invalid Whirlpool tick spacing")
+		return nil, 0, 0, nil, fmt.Errorf("invalid whirlpool tick spacing")
 	}
 	arrayWidth := int64(fixedTickArraySize) * int64(spacing)
 	start := int32(floorDiv(int64(currentTick), arrayWidth) * arrayWidth)
 	pool, err := solana.DecodePublicKey(d.Pool)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, nil, err
 	}
 	program, err := solana.DecodePublicKey(whirlpoolProgram)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, nil, err
 	}
 	starts := []int32{start - int32(arrayWidth), start, start + int32(arrayWidth), start - 2*int32(arrayWidth), start + 2*int32(arrayWidth)}
 	addresses := make([]string, len(starts))
 	for i, value := range starts {
 		address, _, err := solana.FindProgramAddress([][]byte{[]byte("tick_array"), pool[:], []byte(strconv.FormatInt(int64(value), 10))}, program)
 		if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, 0, nil, err
 		}
 		addresses[i] = solana.EncodePublicKey(address)
 	}
 	accounts, err := readerMany.ReadMultipleAccounts(ctx, addresses)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, nil, err
 	}
 	var ticks []Tick
 	min, max := int32(1<<31-1), int32(-1<<31)
 	for _, account := range accounts {
 		parsed, startTick, ok, err := parseFixedTickArray(account.Data, spacing)
 		if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, 0, nil, err
 		}
 		if !ok {
 			continue
@@ -127,13 +173,22 @@ func (d *Decoder) readTicks(ctx context.Context, reader AccountReader, currentTi
 		}
 	}
 	if min > max {
-		return nil, currentTick, currentTick, nil
+		return nil, currentTick, currentTick, addresses, nil
 	}
 	if currentTick < min || currentTick > max {
-		return nil, currentTick, currentTick, nil
+		return nil, currentTick, currentTick, addresses, nil
 	}
 	sort.Slice(ticks, func(i, j int) bool { return ticks[i].index < ticks[j].index })
-	return ticks, min, max, nil
+	return ticks, min, max, addresses, nil
+}
+
+func (d *Decoder) decodePool(data []byte) (PoolUpdate, error) {
+	if len(data) < 653 || string(data[:8]) != whirlpoolDiscriminator {
+		return PoolUpdate{}, fmt.Errorf("invalid whirlpool account data")
+	}
+	feeRate := uint32(binary.LittleEndian.Uint16(data[45:47]))
+	tick := int32(binary.LittleEndian.Uint32(data[81:85]))
+	return newPoolUpdate(littleEndianInt(data[65:81]), tick, littleEndianInt(data[49:65]), feeRate)
 }
 
 func parseFixedTickArray(data []byte, spacing int32) ([]Tick, int32, bool, error) {
@@ -192,3 +247,4 @@ func littleEndianInt(value []byte) *big.Int {
 }
 
 var _ solanalogs.Decoder = (*Decoder)(nil)
+var _ solanalogs.AccountDecoder = (*Decoder)(nil)

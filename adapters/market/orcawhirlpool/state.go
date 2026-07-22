@@ -43,6 +43,35 @@ type StateUpdate struct {
 	maxTick      int32
 }
 
+type PoolUpdate struct {
+	sqrtPriceX64 *big.Int
+	tick         int32
+	liquidity    *big.Int
+	feeRate      uint32
+}
+
+func newPoolUpdate(sqrtPriceX64 *big.Int, tick int32, liquidity *big.Int, feeRate uint32) (PoolUpdate, error) {
+	if sqrtPriceX64 == nil || liquidity == nil || sqrtPriceX64.Sign() <= 0 || liquidity.Sign() < 0 || feeRate >= feeRatePrecision {
+		return PoolUpdate{}, fmt.Errorf("invalid Whirlpool pool update")
+	}
+	return PoolUpdate{sqrtPriceX64: clone(sqrtPriceX64), tick: tick, liquidity: clone(liquidity), feeRate: feeRate}, nil
+}
+func (PoolUpdate) EventKind() string { return "orca_whirlpool/pool/v1" }
+
+type TickArrayUpdate struct {
+	startTick int32
+	spacing   int32
+	ticks     []Tick
+}
+
+func newTickArrayUpdate(startTick, spacing int32, ticks []Tick) (TickArrayUpdate, error) {
+	if spacing <= 0 {
+		return TickArrayUpdate{}, fmt.Errorf("invalid Whirlpool tick array spacing")
+	}
+	return TickArrayUpdate{startTick: startTick, spacing: spacing, ticks: cloneTicks(ticks)}, nil
+}
+func (TickArrayUpdate) EventKind() string { return "orca_whirlpool/tick_array/v1" }
+
 func NewStateUpdate(sqrtPriceX64 *big.Int, tick int32, liquidity *big.Int, feeBPS uint16, tickSpacing int32, ticks []Tick) (StateUpdate, error) {
 	return NewCoveredStateUpdateWithFeeRate(sqrtPriceX64, tick, liquidity, uint32(feeBPS)*100, tickSpacing, ticks, true, 0, 0)
 }
@@ -144,6 +173,31 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 	switch update := event.(type) {
 	case StateUpdate:
 		next = Snapshot{schemaVersion: snapshotSchemaVersion, sqrtPriceX64: clone(update.sqrtPriceX64), tick: update.tick, liquidity: clone(update.liquidity), feeRate: update.feeRate, tickSpacing: update.tickSpacing, ticks: cloneTicks(update.ticks), fullCoverage: update.fullCoverage, minTick: update.minTick, maxTick: update.maxTick}
+	case PoolUpdate:
+		current, err := require(previous)
+		if err != nil {
+			return nil, [sha256.Size]byte{}, err
+		}
+		next = current
+		next.sqrtPriceX64 = clone(update.sqrtPriceX64)
+		next.tick = update.tick
+		next.liquidity = clone(update.liquidity)
+		next.feeRate = update.feeRate
+	case TickArrayUpdate:
+		current, err := require(previous)
+		if err != nil {
+			return nil, [sha256.Size]byte{}, err
+		}
+		next = current
+		arrayMax := update.startTick + int32(fixedTickArraySize-1)*update.spacing
+		filtered := make([]Tick, 0, len(next.ticks)+len(update.ticks))
+		for _, tick := range next.ticks {
+			if tick.index < update.startTick || tick.index > arrayMax {
+				filtered = append(filtered, tick)
+			}
+		}
+		next.ticks = append(filtered, cloneTicks(update.ticks)...)
+		sort.Slice(next.ticks, func(i, j int) bool { return next.ticks[i].index < next.ticks[j].index })
 	case SwapUpdate:
 		current, err := require(previous)
 		if err != nil {
@@ -218,6 +272,8 @@ func hashState(state Snapshot) [sha256.Size]byte {
 }
 
 var _ market.EventData = StateUpdate{}
+var _ market.EventData = PoolUpdate{}
+var _ market.EventData = TickArrayUpdate{}
 var _ market.EventData = SwapUpdate{}
 var _ market.EventData = LiquidityUpdate{}
 var _ market.EventData = TickUpdate{}
