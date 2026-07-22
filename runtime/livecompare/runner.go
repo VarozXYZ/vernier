@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
+	"github.com/VarozXYZ/vernier/adapters/chain/solana"
 	"github.com/VarozXYZ/vernier/adapters/feed/evmlogs"
 	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
 	"github.com/VarozXYZ/vernier/adapters/market/aerodrome"
@@ -38,21 +39,24 @@ import (
 var ErrParityMismatch = errors.New("local quote differs from venue reference")
 
 type Networks map[string]evm.Network
+type SolanaNetworks map[string]*solana.ReadOnlyNetwork
 
 type Options struct {
-	Clock       func() time.Time
-	LookupEnv   configuration.LookupEnv
-	PriceClient coingecko.Client
-	Logger      *slog.Logger
+	Clock          func() time.Time
+	LookupEnv      configuration.LookupEnv
+	PriceClient    coingecko.Client
+	SolanaNetworks SolanaNetworks
+	Logger         *slog.Logger
 }
 
 type Runner struct {
-	config   configuration.ParsedConfig
-	networks Networks
-	clock    func() time.Time
-	lookup   configuration.LookupEnv
-	client   coingecko.Client
-	logger   *slog.Logger
+	config         configuration.ParsedConfig
+	networks       Networks
+	clock          func() time.Time
+	lookup         configuration.LookupEnv
+	client         coingecko.Client
+	solanaNetworks SolanaNetworks
+	logger         *slog.Logger
 }
 
 type CostEvidence struct {
@@ -103,6 +107,12 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 	}
 	limited := make(Networks, len(config.Chains))
 	for id, profile := range config.Chains {
+		if profile.Kind == "solana" {
+			if options.SolanaNetworks == nil || options.SolanaNetworks[id] == nil {
+				return nil, fmt.Errorf("configured Solana network %q is required", id)
+			}
+			continue
+		}
 		network := networks[id]
 		if network == nil || network.ID() != id {
 			return nil, fmt.Errorf("configured EVM network %q is required", id)
@@ -113,7 +123,7 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		}
 		limited[id] = wrapped
 	}
-	return &Runner{config: config, networks: limited, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
+	return &Runner{config: config, networks: limited, solanaNetworks: options.SolanaNetworks, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
