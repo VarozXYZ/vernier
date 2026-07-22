@@ -9,12 +9,9 @@ import (
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 )
 
-// Whirlpool prices are encoded as Q64.64 fixed-point values. q64 is the
-// fractional-bit count, not the fixed-point scale itself. Quotes are computed
+// Whirlpool prices are encoded as Q64.64 fixed-point values. Quotes are computed
 // by the canonical swap-step arithmetic and cross the initialized tick range
 // carried by the snapshot; they do not use a constant-product approximation.
-const q64 uint = 64
-
 type Quoter struct {
 	id             market.SourceID
 	market         market.Market
