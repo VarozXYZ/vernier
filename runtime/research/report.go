@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VarozXYZ/vernier/core/strategy"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/market"
+	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 )
 
 func WriteJSON(writer io.Writer, report Report) error {
@@ -48,6 +50,7 @@ type reportDTO struct {
 	Opportunities []opportunityDTO  `json:"opportunities"`
 	IgnoredEvents []ignoredEventDTO `json:"ignored_events"`
 	FeedIncidents []feedIncidentDTO `json:"feed_incidents"`
+	LocalTiming   timingDTO         `json:"local_timing"`
 }
 
 type opportunityDTO struct {
@@ -160,6 +163,33 @@ type feedIncidentDTO struct {
 	ObservedAt string `json:"observed_at"`
 }
 
+type timingDTO struct {
+	Duration   string            `json:"duration"`
+	Directions []directionTiming `json:"directions"`
+}
+
+type directionTiming struct {
+	BuyMarket  string        `json:"buy_market"`
+	SellMarket string        `json:"sell_market"`
+	Duration   string        `json:"duration"`
+	Quotes     []quoteTiming `json:"quotes"`
+}
+
+type quoteTiming struct {
+	Market   string      `json:"market"`
+	Leg      string      `json:"leg"`
+	Mode     string      `json:"mode"`
+	Duration string      `json:"duration"`
+	Cached   bool        `json:"cached"`
+	Hops     []hopTiming `json:"hops,omitempty"`
+}
+
+type hopTiming struct {
+	Market   string `json:"market"`
+	Duration string `json:"duration"`
+	Cached   bool   `json:"cached"`
+}
+
 func newReportDTO(report Report) reportDTO {
 	dto := reportDTO{
 		SchemaVersion: 1, RunID: string(report.RunID), ConfigHash: report.ConfigHash,
@@ -167,6 +197,7 @@ func newReportDTO(report Report) reportDTO {
 		Opportunities: make([]opportunityDTO, 0, len(report.Opportunities)),
 		IgnoredEvents: make([]ignoredEventDTO, 0, len(report.IgnoredEvents)),
 		FeedIncidents: make([]feedIncidentDTO, 0, len(report.FeedIncidents)),
+		LocalTiming:   timing(report.LocalTiming),
 	}
 	for _, opportunity := range report.Opportunities {
 		dto.Opportunities = append(dto.Opportunities, newOpportunityDTO(opportunity))
@@ -185,6 +216,29 @@ func newReportDTO(report Report) reportDTO {
 		})
 	}
 	return dto
+}
+
+func timing(value strategy.EvaluationTiming) timingDTO {
+	dto := timingDTO{Duration: value.Duration.String(), Directions: make([]directionTiming, 0, len(value.Directions))}
+	for _, direction := range value.Directions {
+		item := directionTiming{BuyMarket: string(direction.Direction.BuyMarket), SellMarket: string(direction.Direction.SellMarket), Duration: direction.Duration.String(), Quotes: make([]quoteTiming, 0, len(direction.Quotes))}
+		for _, quote := range direction.Quotes {
+			item.Quotes = append(item.Quotes, quoteTiming{Market: string(quote.Market), Leg: quote.Leg, Mode: string(quote.Mode), Duration: quote.Duration.String(), Cached: quote.Cached, Hops: hopTimings(quote.Hops)})
+		}
+		dto.Directions = append(dto.Directions, item)
+	}
+	return dto
+}
+
+func hopTimings(values []quoteport.HopTiming) []hopTiming {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]hopTiming, 0, len(values))
+	for _, value := range values {
+		result = append(result, hopTiming{Market: string(value.Market), Duration: value.Duration.String(), Cached: value.Cached})
+	}
+	return result
 }
 
 func newOpportunityDTO(opportunity arbitrage.Opportunity) opportunityDTO {

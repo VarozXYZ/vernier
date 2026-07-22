@@ -57,6 +57,10 @@ func TestRouteCacheReusesUnchangedHop(t *testing.T) {
 	if first.calls.Load() != 1 || second.calls.Load() != 2 {
 		t.Fatalf("per-hop invalidation calls first=%d second=%d", first.calls.Load(), second.calls.Load())
 	}
+	trace := source.LastTiming()
+	if len(trace.Hops) != 2 || !trace.Hops[0].Cached || trace.Hops[1].Cached || trace.Duration < 0 {
+		t.Fatalf("unexpected per-hop timing after invalidation: %+v", trace)
+	}
 }
 
 func mustAmount(token market.TokenID, units int64) market.TokenAmount {

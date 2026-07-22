@@ -32,6 +32,28 @@ type Source interface {
 	Quote(context.Context, Input) (market.Quote, error)
 }
 
+// HopTiming is optional observability for composed sources. It is not part of
+// the economic quote and is therefore safe to omit for single-pool sources.
+type HopTiming struct {
+	Market   market.MarketID
+	Duration time.Duration
+	Cached   bool
+}
+
+type Timing struct {
+	Duration time.Duration
+	Cached   bool
+	Hops     []HopTiming
+}
+
+// TimingSource exposes the most recent local quote trace. Consumers must read
+// it immediately after Quote returns; implementations return a defensive
+// copy and remain protocol-neutral.
+type TimingSource interface {
+	Source
+	LastTiming() Timing
+}
+
 // ExactOutputSource is an optional local capability. Strategies can fall back
 // to deterministic exact-input search when a source does not implement it.
 type ExactOutputSource interface {
@@ -79,4 +101,13 @@ type ReferenceResult struct {
 type ReferenceSource interface {
 	Source
 	QuoteWithReference(context.Context, Input) (ReferenceResult, error)
+}
+
+// ExternalReferenceSource validates an already-computed local quote. This is
+// the non-blocking boundary used by Research: callers pass the selected local
+// quote so an external provider cannot recalculate the sizing curve or become
+// part of the local decision hot path.
+type ExternalReferenceSource interface {
+	Source
+	Reference(context.Context, Input, market.Quote) (ReferenceEvidence, error)
 }
