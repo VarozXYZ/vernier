@@ -70,6 +70,7 @@ func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
 	}
 	routes := make([]routeRuntime, 0, len(r.config.Markets))
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
+	referenceSources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
 	for _, configured := range r.config.Markets {
 		route, err := r.buildRoute(ctx, configured, registry, maximum, blocks, slots, startedAt)
@@ -82,7 +83,18 @@ func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
 		}
 		r.logger.Info("route bootstrap complete", "market", configured.ID, "hops", len(route.children), "version", snapshot.Metadata().Version)
 		routes = append(routes, route)
-		sources[configured.ID] = route.route.Source
+		source := quoteport.Source(route.route.Source)
+		if configured.ReferenceQuote != "" {
+			reference, err := r.externalSource(configured, source)
+			if err != nil {
+				return Report{}, err
+			}
+			if reference != nil {
+				source = reference
+				referenceSources[configured.ID] = reference
+			}
+		}
+		sources[configured.ID] = source
 		snapshots = append(snapshots, snapshot)
 	}
 	costEvidence, cost, err := r.cost(ctx, blocks, startedAt)
@@ -98,7 +110,11 @@ func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
 		return Report{}, err
 	}
 	r.logger.Info("route local research complete", "opportunities", len(research.Opportunities))
-	return Report{Research: research, Cost: costEvidence}, nil
+	availableReferences := r.referenceSourcesFor(sources)
+	for id, source := range referenceSources {
+		availableReferences[id] = source
+	}
+	return Report{Research: research, Cost: costEvidence, Reference: validateReferences(ctx, research.Opportunities, snapshots, availableReferences, research, r.clock)}, nil
 }
 
 func (r *Runner) currentSlots(ctx context.Context) (map[string]uint64, error) {
