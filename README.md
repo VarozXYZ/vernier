@@ -73,7 +73,7 @@ the maximum sizing bound supplies the coverage probes. Set the named
 endpoint environment variable locally, then run:
 
 ~~~console
-go run ./cmd/research observe-v3 --config config/local/vernier.yaml --market market_id --format jsonl --updates 1
+go run ./cmd/research observe-v3 --config config/<setup>/vernier.yaml --market market_id --format jsonl --updates 1
 ~~~
 
 The value updates=1 emits the bootstrap snapshot and waits for one block
@@ -112,8 +112,10 @@ failed/incomplete probe safely falls back to evaluating both directions.
 The policy is recorded in [ADR 0007](decisions/0007-early-direction-discovery.md).
 
 Configuration is modular YAML: a manifest selects topology and policy files,
-while endpoint values and API keys remain in an ignored setup profile such as
-`.env.virtual` or `.env.private`. Environment keys are deliberately short and
+while endpoint values and API keys remain in an ignored setup profile named
+`.env.<setup>`. `compare-live --setup <setup>` resolves a private manifest at
+`config/<setup>/vernier.yaml`; public examples keep their source under
+`examples/setups/<setup>/`. Environment keys are deliberately short and
 describe the provider directly (`ROBINHOOD_WS_URL`, `SOLANA_HTTP_URL`,
 `JUPITER_TAKER`); the selected filename provides setup isolation. VIRTUAL
 across Robinhood Chain and Base is the deliberately public reference setup in
@@ -126,7 +128,7 @@ The sizing policy uses `asset: quote` by default, so the configured bounds are
 WETH budgets for this VIRTUAL/WETH setup rather than VIRTUAL or ETH quantities.
 
 ~~~console
-go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --format text
+go run ./cmd/research compare-live --setup virtual --format text
 ~~~
 
 The first report is emitted after both pools complete their current-state
@@ -134,8 +136,10 @@ bootstrap; subsequent reports are triggered by accepted events or an explicit
 disconnect health change. Use `--updates 1` for a single report, or
 `--stream=false --format json` for an explicit point-in-time snapshot:
 
+The defaults are `format=text`, `log-level=info`, and `updates=0` (unlimited).
+
 ~~~console
-go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --updates 1 --format jsonl
+go run ./cmd/research compare-live --setup virtual --updates 1 --format jsonl
 ~~~
 
 Stream mode persists only economically meaningful opportunity windows. The
@@ -164,7 +168,7 @@ inspect a JSONL run without interleaving diagnostics in the terminal, redirect
 the two streams separately, for example:
 
 ~~~console
-go run ./cmd/research compare-live --config examples/setups/virtual/vernier.yaml --env-file .env.virtual --stream --updates 1 --format jsonl > report.jsonl 2> stream.log
+go run ./cmd/research compare-live --setup virtual --updates 1 --format jsonl > report.jsonl 2> stream.log
 ~~~
 
 The default report is an evaluation summary: it shows the selected size and
@@ -175,20 +179,20 @@ from `--log-level debug`, which is reserved for runtime diagnostics.
 
 ### Running a configured route
 
-The same command starts Research for any private modular manifest. Keep that
-manifest and its topology/policy files outside the public tree, and provide
-only endpoint, taker, and optional provider-key values through a setup-specific
-profile such as `.env.private`:
+The same command starts Research for any private modular setup. Keep that
+setup's manifest and topology/policy files outside the public tree, at
+`config/<setup>/`, and provide only endpoint, taker, and optional provider-key
+values through `.env.<setup>`:
 
 ~~~console
-go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env.private --format text
+go run ./cmd/research compare-live --setup <setup> --format text
 ~~~
 
 The command is already a live, read-only run. To emit one report per accepted
 route update in JSONL:
 
 ~~~console
-go run ./cmd/research compare-live --config <private-manifest.yaml> --env-file .env.private --updates 1 --format jsonl --log-level info
+go run ./cmd/research compare-live --setup <setup> --updates 1 --format jsonl --log-level info
 ~~~
 
 Startup validates every configured endpoint, bootstraps every hop in both

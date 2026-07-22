@@ -1,7 +1,7 @@
 # Secrets and local configuration
 .env
 .env.*
-/config/local/
+/config/*/
 
 # Local Research opportunity-window store
 .vernier/

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,11 +49,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("research compare-live", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "examples/setups/virtual/vernier.yaml", "path to YAML configuration manifest")
-	envPath := flags.String("env-file", ".env", "path to local environment file")
+	setup := flags.String("setup", "", "setup name; resolves config/<setup>/vernier.yaml and .env.<setup>")
+	configPath := flags.String("config", "", "path to YAML configuration manifest (compatibility override)")
+	envPath := flags.String("env-file", "", "path to local environment file (compatibility override)")
 	format := flags.String("format", "text", "output format: text or json (jsonl in stream mode)")
 	stream := flags.Bool("stream", true, "continuously evaluate both pools from WebSocket log feeds (use --stream=false for one snapshot)")
-	updates := flags.Int("updates", 0, "reports to emit in stream mode; zero runs until canceled")
+	updates := flags.Int("updates", 0, "reports to emit; zero runs until canceled")
 	logLevel := flags.String("log-level", "info", "diagnostic log level: debug, info, warn, or error")
 	calculations := flags.String("calculations", "summary", "calculation output: summary or full")
 	opportunityStorePath := flags.String("opportunity-store", ".vernier/opportunities.sqlite", "SQLite opportunity-window store; empty disables persistence")
@@ -64,17 +66,22 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "research compare-live: invalid arguments")
 		return 2
 	}
+	resolvedConfigPath, resolvedEnvPath, err := resolveCompareLivePaths(*setup, *configPath, *envPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
+		return 2
+	}
 	logger, err := observability.NewLogger(stderr, *logLevel)
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
 		return 2
 	}
-	logger.Info("loading live configuration", "path", *configPath, "mode", map[bool]string{true: "stream", false: "point_in_time"}[*stream])
-	if err := loadEnvFile(*envPath, os.LookupEnv, os.Setenv); err != nil {
+	logger.Info("loading live configuration", "path", resolvedConfigPath, "mode", map[bool]string{true: "stream", false: "point_in_time"}[*stream])
+	if err := loadEnvFile(resolvedEnvPath, os.LookupEnv, os.Setenv); err != nil {
 		fmt.Fprintln(stderr, "research compare-live: cannot load local environment")
 		return 2
 	}
-	config, err := configuration.LoadConfig(*configPath)
+	config, err := configuration.LoadConfig(resolvedConfigPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: %v\n", err)
 		return 2
@@ -371,6 +378,36 @@ func optionalJSONTime(value time.Time) string {
 }
 
 var envKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var setupName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+
+func resolveCompareLivePaths(setup, configPath, envPath string) (string, string, error) {
+	setup = strings.TrimSpace(setup)
+	if setup != "" {
+		if configPath != "" || envPath != "" {
+			return "", "", fmt.Errorf("--setup cannot be combined with --config or --env-file")
+		}
+		if !setupName.MatchString(setup) {
+			return "", "", fmt.Errorf("invalid setup name %q", setup)
+		}
+		configPath = filepath.Join("config", setup, "vernier.yaml")
+		// Public VIRTUAL remains under examples; private setups use config/<setup>.
+		// Prefer the private location whenever it exists.
+		if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
+			publicPath := filepath.Join("examples", "setups", setup, "vernier.yaml")
+			if _, publicErr := os.Stat(publicPath); publicErr == nil {
+				configPath = publicPath
+			}
+		}
+		return configPath, ".env." + setup, nil
+	}
+	if configPath == "" {
+		configPath = filepath.Join("examples", "setups", "virtual", "vernier.yaml")
+	}
+	if envPath == "" {
+		envPath = ".env"
+	}
+	return configPath, envPath, nil
+}
 
 func loadEnvFile(path string, lookup func(string) (string, bool), set func(string, string) error) error {
 	if strings.TrimSpace(path) == "" || lookup == nil || set == nil {
