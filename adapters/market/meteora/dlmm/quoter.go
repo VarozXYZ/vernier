@@ -83,17 +83,22 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 		return nil, fmt.Errorf("unsupported Meteora token direction")
 	}
 	result := make([]liquiditycurve.Segment, 0, len(state.bins))
+	scale := new(big.Int).Lsh(big.NewInt(1), priceScaleBits)
 	if tokenIn == q.tokenX {
 		for _, bin := range state.bins {
-			if bin.reserveX.Sign() > 0 && bin.reserveY.Sign() > 0 {
-				result = append(result, liquiditycurve.Segment{In: bin.reserveX, Out: bin.reserveY})
+			if bin.reserveY.Sign() > 0 {
+				// The protocol consumes Y liquidity at the bin price. The
+				// corresponding X input capacity is rounded up.
+				input := ceilMulDiv(bin.reserveY, scale, bin.priceX64)
+				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveY})
 			}
 		}
 	} else {
 		for i := len(state.bins) - 1; i >= 0; i-- {
 			bin := state.bins[i]
-			if bin.reserveX.Sign() > 0 && bin.reserveY.Sign() > 0 {
-				result = append(result, liquiditycurve.Segment{In: bin.reserveY, Out: bin.reserveX})
+			if bin.reserveX.Sign() > 0 {
+				input := ceilMulDiv(bin.reserveX, bin.priceX64, scale)
+				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveX})
 			}
 		}
 	}
@@ -101,6 +106,12 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 		return nil, fmt.Errorf("meteora DLMM has no active liquidity")
 	}
 	return result, nil
+}
+
+func ceilMulDiv(value, multiplier, divisor *big.Int) *big.Int {
+	product := new(big.Int).Mul(value, multiplier)
+	product.Add(product, new(big.Int).Sub(new(big.Int).Set(divisor), big.NewInt(1)))
+	return product.Quo(product, divisor)
 }
 
 func (q *Quoter) result(input quoteport.Input, mode market.QuoteMode, amountIn market.TokenAmount, outputToken market.TokenID, outputUnits, feeUnits *big.Int) (market.Quote, error) {

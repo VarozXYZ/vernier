@@ -10,7 +10,9 @@ import (
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 )
 
-const q64 uint64 = 1 << 6 // used only as a shift exponent below
+// Whirlpool prices are encoded as Q64.64 fixed-point values. q64 is the
+// fractional-bit count, not the fixed-point scale itself.
+const q64 uint = 64
 
 type Quoter struct {
 	id             market.SourceID
@@ -90,7 +92,7 @@ func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]l
 	if state.liquidity.Sign() <= 0 {
 		return nil, fmt.Errorf("whirlpool has no active liquidity")
 	}
-	q64Value := new(big.Int).Lsh(big.NewInt(1), uint(q64))
+	q64Value := new(big.Int).Lsh(big.NewInt(1), q64)
 	reserveA := new(big.Int).Mul(state.liquidity, q64Value)
 	reserveA.Quo(reserveA, state.sqrtPriceX64)
 	reserveB := new(big.Int).Mul(state.liquidity, state.sqrtPriceX64)
