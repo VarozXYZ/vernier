@@ -2,6 +2,7 @@ package strategy_test
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -182,6 +183,113 @@ func TestTwoMarketDiscoversDirectionBeforeExhaustiveSizing(t *testing.T) {
 			t.Fatalf("probe did not compare both markets: %+v", probe)
 		}
 	}
+}
+
+func TestTwoMarketPreservesQuoteErrorsInTimingAndReasons(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	registry := strategyRegistry(t)
+	setup, err := arbitrage.NewArbitrageSetup("setup", "pair", []market.MarketID{"market-a", "market-b"}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "10")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("route quote hop 0: incompatible snapshot")
+	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: "strategy", Setup: setup, Registry: registry,
+		Sources: map[market.MarketID]quoteport.Source{
+			"market-a": failingQuoteSource{id: "local-a", err: failure},
+			"market-b": failingQuoteSource{id: "local-b", err: failure},
+		},
+		Grid: grid, Threshold: quantity(t, "1"), Clock: func() time.Time { return now }, SizingAsset: strategy.SizingAssetQuote,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := []market.MarketSnapshot{
+		strategySnapshot(t, "market-a", "1000000000", "1800000000", now),
+		strategySnapshot(t, "market-b", "100000000000", "2200000000", now),
+	}
+	cost := arbitrage.CostSnapshot{ID: "fixed", Amount: quantity(t, "0"), CapturedAt: now}
+	evaluation, err := arbitrage.NewEvaluation("evaluation", "run", "strategy", "config-hash", snapshots, cost, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opportunities, timing, err := candidate.EvaluateWithTiming(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opportunities) != 2 || len(timing.Directions) != 2 {
+		t.Fatalf("expected both failed directions, opportunities=%d timing=%d", len(opportunities), len(timing.Directions))
+	}
+	for index, opportunity := range opportunities {
+		if len(opportunity.Reasons) != 1 || opportunity.Reasons[0] != "buy_quote_failed: "+failure.Error() {
+			t.Fatalf("direction %d lost quote error: %+v", index, opportunity.Reasons)
+		}
+		if len(timing.Directions[index].Quotes) != 1 || timing.Directions[index].Quotes[0].Error != failure.Error() {
+			t.Fatalf("direction %d lost quote timing error: %+v", index, timing.Directions[index].Quotes)
+		}
+	}
+}
+
+func TestTwoMarketDoesNotSelectDirectionFromFailedProbe(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	registry := strategyRegistry(t)
+	setup, err := arbitrage.NewArbitrageSetup("setup", "pair", []market.MarketID{"market-a", "market-b"}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "10"), quantity(t, "15"), quantity(t, "20")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marketA, _ := registry.Market("market-a")
+	quoterA, err := constantproduct.NewQuoter("local-a", marketA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: "strategy", Setup: setup, Registry: registry,
+		Sources: map[market.MarketID]quoteport.Source{
+			"market-a": quoterA,
+			"market-b": failingQuoteSource{id: "local-b", err: errors.New("insufficient curve liquidity")},
+		},
+		Grid: grid, Threshold: quantity(t, "1"), Clock: func() time.Time { return now }, SizingAsset: strategy.SizingAssetQuote, DirectionDiscoverySamples: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := []market.MarketSnapshot{
+		strategySnapshot(t, "market-a", "1000000000", "1800000000", now),
+		strategySnapshot(t, "market-b", "100000000000", "2200000000", now),
+	}
+	evaluation, err := arbitrage.NewEvaluation("evaluation", "run", "strategy", "config-hash", snapshots, arbitrage.CostSnapshot{ID: "fixed", Amount: quantity(t, "0"), CapturedAt: now}, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, timing, err := candidate.EvaluateWithTiming(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timing.Discovery == nil || timing.Discovery.Decision != "uncertain_fallback_both" || timing.Discovery.Selected != (arbitrage.Direction{}) {
+		t.Fatalf("failed probe selected a direction: %+v", timing.Discovery)
+	}
+	if len(timing.Directions) != 2 {
+		t.Fatalf("failed discovery must retain both directions, got %d", len(timing.Directions))
+	}
+}
+
+type failingQuoteSource struct {
+	id  market.SourceID
+	err error
+}
+
+func (s failingQuoteSource) ID() market.SourceID { return s.id }
+
+func (s failingQuoteSource) Quote(context.Context, quoteport.Input) (market.Quote, error) {
+	return market.Quote{}, s.err
 }
 
 type strategyFixture struct {

@@ -191,6 +191,7 @@ type discoveryProbeOut struct {
 	Output   quantityDTO `json:"output"`
 	Duration string      `json:"duration"`
 	Cached   bool        `json:"cached"`
+	Error    string      `json:"error,omitempty"`
 }
 
 type directionTiming struct {
@@ -206,6 +207,7 @@ type quoteTiming struct {
 	Mode     string      `json:"mode"`
 	Duration string      `json:"duration"`
 	Cached   bool        `json:"cached"`
+	Error    string      `json:"error,omitempty"`
 	Hops     []hopTiming `json:"hops,omitempty"`
 }
 
@@ -251,7 +253,7 @@ func timing(value strategy.EvaluationTiming) timingDTO {
 		for _, probe := range discovery.Probes {
 			item := discoveryProbe{Size: quantity(probe.Size), Winner: string(probe.Winner), Reason: probe.Reason, Duration: probe.Duration.String(), Outputs: make([]discoveryProbeOut, 0, len(probe.Outputs))}
 			for _, output := range probe.Outputs {
-				item.Outputs = append(item.Outputs, discoveryProbeOut{Market: string(output.Market), Output: quantity(output.Output), Duration: output.Duration.String(), Cached: output.Cached})
+				item.Outputs = append(item.Outputs, discoveryProbeOut{Market: string(output.Market), Output: quantity(output.Output), Duration: output.Duration.String(), Cached: output.Cached, Error: output.Error})
 			}
 			dto.Discovery.Probes = append(dto.Discovery.Probes, item)
 		}
@@ -259,7 +261,7 @@ func timing(value strategy.EvaluationTiming) timingDTO {
 	for _, direction := range value.Directions {
 		item := directionTiming{BuyMarket: string(direction.Direction.BuyMarket), SellMarket: string(direction.Direction.SellMarket), Duration: direction.Duration.String(), Quotes: make([]quoteTiming, 0, len(direction.Quotes))}
 		for _, quote := range direction.Quotes {
-			item.Quotes = append(item.Quotes, quoteTiming{Market: string(quote.Market), Leg: quote.Leg, Mode: string(quote.Mode), Duration: quote.Duration.String(), Cached: quote.Cached, Hops: hopTimings(quote.Hops)})
+			item.Quotes = append(item.Quotes, quoteTiming{Market: string(quote.Market), Leg: quote.Leg, Mode: string(quote.Mode), Duration: quote.Duration.String(), Cached: quote.Cached, Error: quote.Error, Hops: hopTimings(quote.Hops)})
 		}
 		dto.Directions = append(dto.Directions, item)
 	}

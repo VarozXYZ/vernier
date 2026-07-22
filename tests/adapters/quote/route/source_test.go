@@ -30,6 +30,12 @@ func (s *countingSource) Quote(_ context.Context, input quoteport.Input) (market
 	return market.NewQuote(market.Quote{Source: s.id, Market: input.Snapshot.Metadata().Market, SnapshotVersion: input.Snapshot.Metadata().Version, SnapshotHash: input.Snapshot.Metadata().StateHash, Purpose: input.Purpose, Mode: market.QuoteModeExactInput, AmountIn: input.AmountIn, AmountOut: out, QuotedAt: input.QuotedAt})
 }
 
+func (s *countingSource) QuoteExactOutput(_ context.Context, input quoteport.ExactOutputInput) (market.Quote, error) {
+	s.calls.Add(1)
+	in, _ := market.NewTokenAmount(input.TokenIn, new(big.Int).Add(input.AmountOut.Units(), big.NewInt(1)))
+	return market.NewQuote(market.Quote{Source: s.id, Market: input.Snapshot.Metadata().Market, SnapshotVersion: input.Snapshot.Metadata().Version, SnapshotHash: input.Snapshot.Metadata().StateHash, Purpose: input.Purpose, Mode: market.QuoteModeExactOutput, AmountIn: in, AmountOut: input.AmountOut, QuotedAt: input.QuotedAt})
+}
+
 func TestRouteCacheReusesUnchangedHop(t *testing.T) {
 	first := &countingSource{id: "first"}
 	second := &countingSource{id: "second"}
@@ -60,6 +66,34 @@ func TestRouteCacheReusesUnchangedHop(t *testing.T) {
 	trace := source.LastTiming()
 	if len(trace.Hops) != 2 || !trace.Hops[0].Cached || trace.Hops[1].Cached || trace.Duration < 0 {
 		t.Fatalf("unexpected per-hop timing after invalidation: %+v", trace)
+	}
+}
+
+func TestRouteQuotesReverseDirection(t *testing.T) {
+	first := &countingSource{id: "first"}
+	second := &countingSource{id: "second"}
+	source, err := routequote.New("route-local", market.Market{ID: "route", BaseToken: "base", QuoteToken: "quote"}, []routequote.Hop{{Market: "hop1", In: "base", Out: "mid", Source: first}, {Market: "hop2", In: "mid", Out: "quote", Source: second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := quoteport.Input{Snapshot: routeSnapshot(t, snapshot(t, "hop1", 1, 1), snapshot(t, "hop2", 1, 2)), TokenIn: "quote", TokenOut: "base", AmountIn: mustAmount("quote", 10), Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()}
+	result, err := source.Quote(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AmountOut.Token() != "base" || result.AmountOut.Units().Cmp(big.NewInt(12)) != 0 {
+		t.Fatalf("unexpected reverse output: %s", result.AmountOut)
+	}
+	if first.calls.Load() != 1 || second.calls.Load() != 1 {
+		t.Fatalf("reverse route did not quote both hops first=%d second=%d", first.calls.Load(), second.calls.Load())
+	}
+
+	exactOutput, err := source.QuoteExactOutput(context.Background(), quoteport.ExactOutputInput{Snapshot: input.Snapshot, TokenIn: "quote", TokenOut: "base", AmountOut: mustAmount("base", 10), Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exactOutput.AmountIn.Token() != "quote" || exactOutput.AmountIn.Units().Cmp(big.NewInt(12)) != 0 || exactOutput.AmountOut.Units().Cmp(big.NewInt(10)) != 0 {
+		t.Fatalf("unexpected reverse exact-output quote: in=%s out=%s", exactOutput.AmountIn, exactOutput.AmountOut)
 	}
 }
 

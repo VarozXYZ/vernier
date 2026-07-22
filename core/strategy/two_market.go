@@ -23,6 +23,7 @@ type QuoteTiming struct {
 	Mode     market.QuoteMode
 	Duration time.Duration
 	Cached   bool
+	Error    string
 	Hops     []quoteport.HopTiming
 }
 
@@ -50,6 +51,7 @@ type DirectionProbeOutput struct {
 	Output   market.AssetQuantity
 	Duration time.Duration
 	Cached   bool
+	Error    string
 }
 
 // DirectionDiscoveryTiming records the early direction decision and its
@@ -304,13 +306,15 @@ func (s *TwoMarketCrossChainArbitrage) discoverDirection(ctx context.Context, ev
 				if probe.Reason == "" {
 					probe.Reason = "probe_quote_failed"
 				}
+				probeOutput.Output, _ = market.NewAssetQuantity(candidate.tokenOut.Asset, new(big.Rat))
+				probeOutput.Error = err.Error()
 				probe.Outputs = append(probe.Outputs, probeOutput)
 				continue
 			}
 			probeOutput.Output = output
 			probe.Outputs = append(probe.Outputs, probeOutput)
 		}
-		if len(probe.Outputs) == 2 && probe.Outputs[0].Output.Asset() == probe.Outputs[1].Output.Asset() {
+		if len(probe.Outputs) == 2 && probe.Outputs[0].Error == "" && probe.Outputs[1].Error == "" && probe.Outputs[0].Output.Asset() == probe.Outputs[1].Output.Asset() {
 			comparison, err := probe.Outputs[0].Output.Cmp(probe.Outputs[1].Output)
 			if err == nil && comparison != 0 {
 				valid++
@@ -433,7 +437,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	}, timing, "buy")
 	if err != nil {
-		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed")
+		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed: %w", err)
 	}
 	if hasUnmodeledFee(buy) {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_has_unmodeled_fee")
@@ -451,7 +455,7 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	}, timing, "sell")
 	if err != nil {
-		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed")
+		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed: %w", err)
 	}
 	if hasUnmodeledFee(sell) {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_has_unmodeled_fee")
@@ -478,7 +482,7 @@ func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, 
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	}, timing, "buy")
 	if err != nil {
-		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed")
+		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed: %w", err)
 	}
 	if hasUnmodeledFee(buy) {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_has_unmodeled_fee")
@@ -496,7 +500,7 @@ func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, 
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	}, timing, "sell")
 	if err != nil {
-		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed")
+		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed: %w", err)
 	}
 	if hasUnmodeledFee(sell) {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_has_unmodeled_fee")
@@ -519,7 +523,7 @@ func (s *TwoMarketCrossChainArbitrage) exactOutput(ctx context.Context, source q
 	quote, cached, err := s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactOutput, request.TokenIn, request.TokenOut, request.TargetOut, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
 		return sizing.MinimumInputForOutput(ctx, source, request)
 	})
-	s.recordQuoteTiming(timing, source, QuoteTiming{Market: request.Snapshot.Metadata().Market, Leg: leg, Mode: market.QuoteModeExactOutput, Duration: nonNegative(s.clock().Sub(started)), Cached: cached})
+	s.recordQuoteTiming(timing, source, QuoteTiming{Market: request.Snapshot.Metadata().Market, Leg: leg, Mode: market.QuoteModeExactOutput, Duration: nonNegative(s.clock().Sub(started)), Cached: cached, Error: quoteError(err)})
 	return quote, err
 }
 
@@ -528,8 +532,15 @@ func (s *TwoMarketCrossChainArbitrage) input(ctx context.Context, source quotepo
 	quote, cached, err := s.cache.getOrCompute(ctx, request.Snapshot, source, market.QuoteModeExactInput, request.TokenIn, request.TokenOut, request.AmountIn, request.Purpose, request.QuotedAt, func() (market.Quote, error) {
 		return source.Quote(ctx, request)
 	})
-	s.recordQuoteTiming(timing, source, QuoteTiming{Market: request.Snapshot.Metadata().Market, Leg: leg, Mode: market.QuoteModeExactInput, Duration: nonNegative(s.clock().Sub(started)), Cached: cached})
+	s.recordQuoteTiming(timing, source, QuoteTiming{Market: request.Snapshot.Metadata().Market, Leg: leg, Mode: market.QuoteModeExactInput, Duration: nonNegative(s.clock().Sub(started)), Cached: cached, Error: quoteError(err)})
 	return quote, err
+}
+
+func quoteError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (s *TwoMarketCrossChainArbitrage) recordQuoteTiming(timing *DirectionTiming, source quoteport.Source, quote QuoteTiming) {

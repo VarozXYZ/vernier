@@ -68,6 +68,41 @@ func TestFullOutputRemainsAvailableExplicitly(t *testing.T) {
 	}
 }
 
+func TestFullOutputIncludesQuoteErrors(t *testing.T) {
+	probeSize, err := market.ParseAssetQuantity("quote", "10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero, err := market.ParseAssetQuantity("base", "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := "route quote hop 0: incompatible snapshot"
+	report := fullReport(t)
+	report.Research = runtimeresearch.Report{
+		LocalTiming: strategy.EvaluationTiming{
+			Discovery: &strategy.DirectionDiscoveryTiming{
+				Samples: 1, Probes: []strategy.DirectionProbeTiming{{Size: probeSize, Reason: "probe_quote_failed", Outputs: []strategy.DirectionProbeOutput{{Market: "market-a", Output: zero, Error: reason}}}},
+			},
+			Directions: []strategy.DirectionTiming{{Direction: marketDirection("market-a", "market-b"), Quotes: []strategy.QuoteTiming{{Market: "market-a", Leg: "buy", Mode: market.QuoteModeExactInput, Error: reason}}}},
+		},
+	}
+	var text bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&text, report, livecompare.OutputOptions{Calculations: livecompare.CalculationFull}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), `error="route quote hop 0: incompatible snapshot"`) {
+		t.Fatalf("full text omitted quote error: %s", text.String())
+	}
+	var jsonl bytes.Buffer
+	if err := livecompare.WriteJSONLineWithOptions(&jsonl, report, livecompare.OutputOptions{Calculations: livecompare.CalculationFull}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jsonl.String(), `"error":"route quote hop 0: incompatible snapshot"`) {
+		t.Fatalf("full JSON omitted quote error: %s", jsonl.String())
+	}
+}
+
 func TestReferenceOutputPreservesLocalExternalDeltaAndTimings(t *testing.T) {
 	local := mustTokenAmount(t, "token-out", "90")
 	remote := mustTokenAmount(t, "token-out", "95")

@@ -1,6 +1,6 @@
 // Package route composes protocol-neutral hop quoters into one market quote
-// source. The caller provides the configured hop order; no DEX-specific type
-// leaks through this package.
+// source. The caller provides the configured hop order; the source can quote
+// that path in either direction without leaking DEX-specific types.
 package route
 
 import (
@@ -98,6 +98,10 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	if input.Snapshot.Metadata().Market != s.market.ID {
 		return market.Quote{}, fmt.Errorf("snapshot belongs to market %q, expected %q", input.Snapshot.Metadata().Market, s.market.ID)
 	}
+	reverse, err := s.reverseFor(input.TokenIn, input.TokenOut)
+	if err != nil {
+		return market.Quote{}, err
+	}
 	bundle, ok := input.Snapshot.Data().(market.SnapshotBundle)
 	if !ok {
 		return market.Quote{}, fmt.Errorf("route quote requires a snapshot bundle")
@@ -112,7 +116,8 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	}
 	current := input.AmountIn
 	var first market.Quote
-	for index, hop := range s.hops {
+	for index := range s.hops {
+		hop := s.hopAt(index, reverse)
 		snapshot, ok := child(bundle, hop.Market)
 		if !ok {
 			return market.Quote{}, fmt.Errorf("route snapshot is missing hop %q", hop.Market)
@@ -162,6 +167,10 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 	if err := ctx.Err(); err != nil {
 		return market.Quote{}, err
 	}
+	reverse, err := s.reverseFor(input.TokenIn, input.TokenOut)
+	if err != nil {
+		return market.Quote{}, err
+	}
 	bundle, ok := input.Snapshot.Data().(market.SnapshotBundle)
 	if !ok {
 		return market.Quote{}, fmt.Errorf("route quote requires a snapshot bundle")
@@ -177,7 +186,7 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 	current := input.AmountOut
 	var final market.Quote
 	for index := len(s.hops) - 1; index >= 0; index-- {
-		hop := s.hops[index]
+		hop := s.hopAt(index, reverse)
 		source, ok := hop.Source.(quoteport.ExactOutputSource)
 		if !ok {
 			return market.Quote{}, fmt.Errorf("route hop %d does not support exact output", index)
@@ -216,6 +225,25 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 		s.mu.Unlock()
 	}
 	return result, err
+}
+
+func (s *Source) reverseFor(tokenIn, tokenOut market.TokenID) (bool, error) {
+	switch {
+	case tokenIn == s.market.BaseToken && tokenOut == s.market.QuoteToken:
+		return false, nil
+	case tokenIn == s.market.QuoteToken && tokenOut == s.market.BaseToken:
+		return true, nil
+	default:
+		return false, fmt.Errorf("route does not support token direction %q -> %q", tokenIn, tokenOut)
+	}
+}
+
+func (s *Source) hopAt(index int, reverse bool) Hop {
+	if !reverse {
+		return s.hops[index]
+	}
+	hop := s.hops[len(s.hops)-1-index]
+	return Hop{Market: hop.Market, In: hop.Out, Out: hop.In, Source: hop.Source}
 }
 
 func child(bundle market.SnapshotBundle, id market.MarketID) (market.MarketSnapshot, bool) {

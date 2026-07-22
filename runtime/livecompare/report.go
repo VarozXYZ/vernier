@@ -70,7 +70,15 @@ func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions
 				return err
 			}
 			for _, output := range probe.Outputs {
-				if _, err := fmt.Fprintf(writer, "direction_probe_output market=%s output=%s %s duration=%s cached=%t\n", output.Market, output.Output.Decimal(8), output.Output.Asset(), output.Duration, output.Cached); err != nil {
+				if _, err := fmt.Fprintf(writer, "direction_probe_output market=%s output=%s %s duration=%s cached=%t", output.Market, output.Output.Decimal(8), output.Output.Asset(), output.Duration, output.Cached); err != nil {
+					return err
+				}
+				if output.Error != "" {
+					if _, err := fmt.Fprintf(writer, " error=%q", output.Error); err != nil {
+						return err
+					}
+				}
+				if _, err := fmt.Fprintln(writer); err != nil {
 					return err
 				}
 			}
@@ -81,7 +89,15 @@ func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions
 			return err
 		}
 		for _, quote := range direction.Quotes {
-			if _, err := fmt.Fprintf(writer, "local_quote %s leg=%s mode=%s duration=%s cached=%t\n", quote.Market, quote.Leg, quote.Mode, quote.Duration, quote.Cached); err != nil {
+			if _, err := fmt.Fprintf(writer, "local_quote %s leg=%s mode=%s duration=%s cached=%t", quote.Market, quote.Leg, quote.Mode, quote.Duration, quote.Cached); err != nil {
+				return err
+			}
+			if quote.Error != "" {
+				if _, err := fmt.Fprintf(writer, " error=%q", quote.Error); err != nil {
+					return err
+				}
+			}
+			if _, err := fmt.Fprintln(writer); err != nil {
 				return err
 			}
 			for _, hop := range quote.Hops {

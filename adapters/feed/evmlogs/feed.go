@@ -224,7 +224,7 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 					return true, false, err
 				}
 				processedLogs[key] = struct{}{}
-				f.logger.Info("feed event applied", "market", f.market, "block", active.Number, "tx_hash", observed.TxHash.Hex(), "log_index", observed.Index, "duration", time.Since(eventStarted))
+				f.logger.Debug("feed event applied", "market", f.market, "block", active.Number, "tx_hash", observed.TxHash.Hex(), "log_index", observed.Index, "duration", time.Since(eventStarted))
 				if active.Number > highest {
 					highest = active.Number
 				}
@@ -256,7 +256,7 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 				return true, false, err
 			}
 			processedBlocks[active.Hash] = struct{}{}
-			f.logger.Info("feed block applied", "market", f.market, "block", active.Number, "logs", len(blockLogs), "duration", time.Since(blockStarted))
+			f.logger.Debug("feed block applied", "market", f.market, "block", active.Number, "logs", len(blockLogs), "duration", time.Since(blockStarted))
 			if active.Number > highest {
 				highest = active.Number
 			}
