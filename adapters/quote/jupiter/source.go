@@ -103,20 +103,34 @@ func (s *Source) QuoteWithReference(ctx context.Context, input quoteport.Input) 
 	if err != nil {
 		return quoteport.ReferenceResult{}, err
 	}
+	evidence, err := s.Reference(ctx, input, local)
+	return quoteport.ReferenceResult{Local: local, Evidence: evidence}, err
+}
+
+// Reference validates one already-selected local quote against Jupiter. It
+// deliberately does not call s.local.Quote: the strategy has already paid
+// for that deterministic calculation and passes the exact quote here.
+func (s *Source) Reference(ctx context.Context, input quoteport.Input, local market.Quote) (quoteport.ReferenceEvidence, error) {
 	key := referenceKey{version: input.Snapshot.Metadata().Version, hash: input.Snapshot.Metadata().StateHash, in: input.TokenIn, out: input.TokenOut, amount: input.AmountIn.String()}
 	s.mu.RLock()
 	cached, found := s.cache[key]
 	s.mu.RUnlock()
 	if found {
-		return cached, nil
+		return cached.Evidence, nil
 	}
 	started := s.clock().UTC()
 	evidence := quoteport.ReferenceEvidence{Provider: s.id, Status: quoteport.ReferenceUnavailable, Latency: 0}
+	metadata := input.Snapshot.Metadata()
+	if (metadata.Version > 0 && (local.SnapshotVersion != metadata.Version || local.SnapshotHash != metadata.StateHash)) || local.AmountIn.Token() != input.TokenIn || local.AmountIn.Units().Cmp(input.AmountIn.Units()) != 0 || local.AmountOut.Token() != input.TokenOut {
+		evidence.Error = "local quote does not match the selected snapshot or input"
+		evidence.Latency = s.clock().Sub(started)
+		return evidence, nil
+	}
 	inputMint, inputOK := s.mints[input.TokenIn]
 	outputMint, outputOK := s.mints[input.TokenOut]
 	if !inputOK || !outputOK {
 		evidence.Error = "token mint mapping is missing"
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	query := url.Values{}
 	query.Set("inputMint", inputMint)
@@ -129,7 +143,7 @@ func (s *Source) QuoteWithReference(ctx context.Context, input quoteport.Input) 
 	if err != nil {
 		evidence.Error = err.Error()
 		evidence.Latency = s.clock().Sub(started)
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	if s.apiKey != "" {
 		header := s.apiKeyHeader
@@ -142,38 +156,38 @@ func (s *Source) QuoteWithReference(ctx context.Context, input quoteport.Input) 
 	if err != nil {
 		evidence.Error = err.Error()
 		evidence.Latency = s.clock().Sub(started)
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	defer response.Body.Close()
 	body, readErr := io.ReadAll(response.Body)
 	evidence.Latency = s.clock().Sub(started)
 	if readErr != nil {
 		evidence.Error = readErr.Error()
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	evidence.ResponseHash = sha256.Sum256(body)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		evidence.Error = fmt.Sprintf("HTTP status %s", response.Status)
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	var payload buildResponse
 	if err := json.Unmarshal(body, &payload); err != nil {
 		evidence.Error = err.Error()
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	if payload.OutAmount == "" {
 		evidence.Error = "Jupiter response has no outAmount"
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	outUnits, ok := new(big.Int).SetString(payload.OutAmount, 10)
 	if !ok || outUnits.Sign() < 0 {
 		evidence.Error = "Jupiter outAmount is not a non-negative integer"
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	amountOut, err := market.NewTokenAmount(input.TokenOut, outUnits)
 	if err != nil {
 		evidence.Error = err.Error()
-		return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+		return evidence, nil
 	}
 	evidence.Status = quoteport.ReferenceAvailable
 	evidence.AmountOut = amountOut
@@ -185,7 +199,7 @@ func (s *Source) QuoteWithReference(ctx context.Context, input quoteport.Input) 
 	s.mu.Lock()
 	s.cache[key] = result
 	s.mu.Unlock()
-	return result, nil
+	return evidence, nil
 }
 
 type buildResponse struct {
@@ -204,3 +218,4 @@ type buildResponse struct {
 }
 
 var _ quoteport.ReferenceSource = (*Source)(nil)
+var _ quoteport.ExternalReferenceSource = (*Source)(nil)
