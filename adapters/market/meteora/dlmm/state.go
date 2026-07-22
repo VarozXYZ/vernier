@@ -95,7 +95,7 @@ func (s Snapshot) validate() error {
 	previous := int32(-1 << 31)
 	foundActive := false
 	for _, bin := range s.bins {
-		if bin.id <= previous || bin.reserveX.Sign() < 0 || bin.reserveY.Sign() < 0 || bin.reserveX.Sign() == 0 && bin.reserveY.Sign() == 0 {
+		if bin.reserveX == nil || bin.reserveY == nil || bin.id <= previous || bin.reserveX.Sign() < 0 || bin.reserveY.Sign() < 0 || bin.reserveX.Sign() == 0 && bin.reserveY.Sign() == 0 {
 			return fmt.Errorf("invalid or unsorted Meteora bin %d", bin.id)
 		}
 		if bin.id == s.activeID {
