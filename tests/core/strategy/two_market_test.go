@@ -153,6 +153,37 @@ func TestTwoMarketTimingSeparatesSequentialLocalQuotesAndCacheHits(t *testing.T)
 	}
 }
 
+func TestTwoMarketDiscoversDirectionBeforeExhaustiveSizing(t *testing.T) {
+	fixture := newQuoteDiscoveryFixture(t)
+	opportunities, timing, err := fixture.strategy.EvaluateWithTiming(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timing.Discovery == nil {
+		t.Fatal("expected direction discovery timing")
+	}
+	if timing.Discovery.Decision != "majority" {
+		t.Fatalf("expected a strict majority decision, got %+v", timing.Discovery)
+	}
+	if timing.Discovery.Selected.BuyMarket != "market-a" || timing.Discovery.Selected.SellMarket != "market-b" {
+		t.Fatalf("unexpected selected direction: %+v", timing.Discovery.Selected)
+	}
+	if len(timing.Discovery.Probes) != 3 {
+		t.Fatalf("expected three direction probes, got %d", len(timing.Discovery.Probes))
+	}
+	if len(timing.Directions) != 1 {
+		t.Fatalf("expected exhaustive sizing for the selected direction only, got %d directions", len(timing.Directions))
+	}
+	if len(opportunities) != 1 || opportunities[0].Direction != timing.Discovery.Selected {
+		t.Fatalf("opportunity did not retain selected direction: %+v", opportunities)
+	}
+	for _, probe := range timing.Discovery.Probes {
+		if probe.Winner != "market-a" || len(probe.Outputs) != 2 {
+			t.Fatalf("probe did not compare both markets: %+v", probe)
+		}
+	}
+}
+
 type strategyFixture struct {
 	registry  *market.Registry
 	strategy  *strategy.TwoMarketCrossChainArbitrage
@@ -193,6 +224,39 @@ func newStrategyFixture(t *testing.T, thresholdText, costText string) strategyFi
 	return strategyFixture{
 		registry: registry, strategy: candidate, snapshots: []market.MarketSnapshot{snapshotA, snapshotB},
 		cost: arbitrage.CostSnapshot{ID: "fixed", Amount: cost, CapturedAt: now}, now: now,
+	}
+}
+
+func newQuoteDiscoveryFixture(t *testing.T) strategyFixture {
+	t.Helper()
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	registry := strategyRegistry(t)
+	setup, err := arbitrage.NewArbitrageSetup("setup", "pair", []market.MarketID{"market-a", "market-b"}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "10"), quantity(t, "15"), quantity(t, "20")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marketA, _ := registry.Market("market-a")
+	marketB, _ := registry.Market("market-b")
+	snapshotA := strategySnapshot(t, marketA.ID, "1000000000", "1800000000", now)
+	snapshotB := strategySnapshot(t, marketB.ID, "100000000000", "2200000000", now)
+	quoterA, _ := constantproduct.NewQuoter("local-a", marketA)
+	quoterB, _ := constantproduct.NewQuoter("local-b", marketB)
+	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: "strategy", Setup: setup, Registry: registry,
+		Sources: map[market.MarketID]quoteport.Source{"market-a": quoterA, "market-b": quoterB},
+		Grid:    grid, Threshold: quantity(t, "1"), Clock: func() time.Time { return now.Add(5 * time.Millisecond) },
+		SizingAsset: strategy.SizingAssetQuote, DirectionDiscoverySamples: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strategyFixture{
+		registry: registry, strategy: candidate, snapshots: []market.MarketSnapshot{snapshotA, snapshotB},
+		cost: arbitrage.CostSnapshot{ID: "fixed", Amount: quantity(t, "0.5"), CapturedAt: now}, now: now,
 	}
 }
 

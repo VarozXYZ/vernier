@@ -165,7 +165,32 @@ type feedIncidentDTO struct {
 
 type timingDTO struct {
 	Duration   string            `json:"duration"`
+	Discovery  *discoveryTiming  `json:"discovery,omitempty"`
 	Directions []directionTiming `json:"directions"`
+}
+
+type discoveryTiming struct {
+	Samples    int              `json:"samples"`
+	Duration   string           `json:"duration"`
+	Decision   string           `json:"decision"`
+	BuyMarket  string           `json:"buy_market,omitempty"`
+	SellMarket string           `json:"sell_market,omitempty"`
+	Probes     []discoveryProbe `json:"probes"`
+}
+
+type discoveryProbe struct {
+	Size     quantityDTO         `json:"size"`
+	Outputs  []discoveryProbeOut `json:"outputs"`
+	Winner   string              `json:"winner,omitempty"`
+	Reason   string              `json:"reason,omitempty"`
+	Duration string              `json:"duration"`
+}
+
+type discoveryProbeOut struct {
+	Market   string      `json:"market"`
+	Output   quantityDTO `json:"output"`
+	Duration string      `json:"duration"`
+	Cached   bool        `json:"cached"`
 }
 
 type directionTiming struct {
@@ -220,6 +245,17 @@ func newReportDTO(report Report) reportDTO {
 
 func timing(value strategy.EvaluationTiming) timingDTO {
 	dto := timingDTO{Duration: value.Duration.String(), Directions: make([]directionTiming, 0, len(value.Directions))}
+	if value.Discovery != nil {
+		discovery := value.Discovery
+		dto.Discovery = &discoveryTiming{Samples: discovery.Samples, Duration: discovery.Duration.String(), Decision: discovery.Decision, BuyMarket: string(discovery.Selected.BuyMarket), SellMarket: string(discovery.Selected.SellMarket), Probes: make([]discoveryProbe, 0, len(discovery.Probes))}
+		for _, probe := range discovery.Probes {
+			item := discoveryProbe{Size: quantity(probe.Size), Winner: string(probe.Winner), Reason: probe.Reason, Duration: probe.Duration.String(), Outputs: make([]discoveryProbeOut, 0, len(probe.Outputs))}
+			for _, output := range probe.Outputs {
+				item.Outputs = append(item.Outputs, discoveryProbeOut{Market: string(output.Market), Output: quantity(output.Output), Duration: output.Duration.String(), Cached: output.Cached})
+			}
+			dto.Discovery.Probes = append(dto.Discovery.Probes, item)
+		}
+	}
 	for _, direction := range value.Directions {
 		item := directionTiming{BuyMarket: string(direction.Direction.BuyMarket), SellMarket: string(direction.Direction.SellMarket), Duration: direction.Duration.String(), Quotes: make([]quoteTiming, 0, len(direction.Quotes))}
 		for _, quote := range direction.Quotes {

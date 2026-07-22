@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VarozXYZ/vernier/core/strategy"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/market"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
@@ -14,8 +15,16 @@ import (
 )
 
 func TestSummaryOutputOmitsRunMetadataAndCalculationCurve(t *testing.T) {
+	probeSize, err := market.ParseAssetQuantity("quote", "10")
+	if err != nil {
+		t.Fatal(err)
+	}
 	report := livecompare.Report{Research: runtimeresearch.Report{
 		RunID: "private-run", ConfigHash: "private-config", Status: runtimeresearch.StatusHealthy, Evaluations: 4,
+		LocalTiming: strategy.EvaluationTiming{Discovery: &strategy.DirectionDiscoveryTiming{
+			Samples: 3, Duration: 2 * time.Millisecond, Decision: "majority",
+			Selected: marketDirection("market-a", "market-b"), Probes: []strategy.DirectionProbeTiming{{Size: probeSize, Winner: "market-a", Duration: time.Millisecond}},
+		}},
 	}}
 	var text bytes.Buffer
 	if err := livecompare.WriteTextWithOptions(&text, report, livecompare.OutputOptions{Calculations: livecompare.CalculationSummary}); err != nil {
@@ -27,6 +36,9 @@ func TestSummaryOutputOmitsRunMetadataAndCalculationCurve(t *testing.T) {
 	if !strings.Contains(text.String(), "evaluation: 4") {
 		t.Fatalf("summary output omitted evaluation number: %s", text.String())
 	}
+	if !strings.Contains(text.String(), "direction_discovery samples=3") {
+		t.Fatalf("summary output omitted direction discovery: %s", text.String())
+	}
 
 	var jsonl bytes.Buffer
 	if err := livecompare.WriteJSONLineWithOptions(&jsonl, report, livecompare.OutputOptions{Calculations: livecompare.CalculationSummary}); err != nil {
@@ -37,6 +49,9 @@ func TestSummaryOutputOmitsRunMetadataAndCalculationCurve(t *testing.T) {
 	}
 	if !strings.Contains(jsonl.String(), "\"kind\":\"evaluation\"") {
 		t.Fatalf("summary JSONL has no evaluation kind: %s", jsonl.String())
+	}
+	if !strings.Contains(jsonl.String(), "\"direction_discovery\"") {
+		t.Fatalf("summary JSONL omitted direction discovery: %s", jsonl.String())
 	}
 }
 
