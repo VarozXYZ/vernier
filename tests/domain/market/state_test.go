@@ -84,3 +84,36 @@ func TestSourceReferenceRequiresKindAndValueTogether(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshotBundleCopiesChildrenAndHashesVersions(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	makeSnapshot := func(id market.MarketID, version uint64, value string) market.MarketSnapshot {
+		snapshot, err := market.NewMarketSnapshot(market.SnapshotMetadata{
+			Market: id, Source: "source", Version: version,
+			EventPosition:  market.SourcePosition{Kind: "slot", Value: version},
+			EventReference: market.SourceReference{Kind: "signature", Value: value},
+			ReceivedAt:     now, AppliedAt: now, Health: market.HealthHealthy, HealthChangedAt: now,
+		}, testSnapshotData{kind: value})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	first := makeSnapshot("hop-a", 2, "a")
+	second := makeSnapshot("hop-b", 7, "b")
+	bundle, err := market.NewSnapshotBundle("route", []market.MarketSnapshot{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Version() != 7 || bundle.Route() != "route" || bundle.SnapshotKind() == "" {
+		t.Fatalf("unexpected bundle identity: route=%s version=%d kind=%s", bundle.Route(), bundle.Version(), bundle.SnapshotKind())
+	}
+	children := bundle.Snapshots()
+	children[0] = second
+	if bundle.Snapshots()[0].Metadata().Market != "hop-a" {
+		t.Fatal("bundle children were aliased")
+	}
+	if _, err := market.NewSnapshotBundle("route", []market.MarketSnapshot{first, first}); err == nil {
+		t.Fatal("duplicate child markets must be rejected")
+	}
+}

@@ -2,6 +2,7 @@ package market
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"time"
 )
@@ -141,6 +142,63 @@ type MarketSnapshot struct {
 	metadata SnapshotMetadata
 	data     SnapshotData
 }
+
+// SnapshotBundle is the immutable state of a complete multi-hop market. The
+// child snapshots retain ownership of each pool's protocol-specific state;
+// the bundle only composes their identities and hashes for a route-level
+// evaluation.
+type SnapshotBundle struct {
+	route     MarketID
+	snapshots []MarketSnapshot
+	version   uint64
+	hash      [sha256.Size]byte
+}
+
+func NewSnapshotBundle(route MarketID, snapshots []MarketSnapshot) (SnapshotBundle, error) {
+	if route == "" {
+		return SnapshotBundle{}, fmt.Errorf("route market is required")
+	}
+	if len(snapshots) == 0 {
+		return SnapshotBundle{}, fmt.Errorf("at least one child snapshot is required")
+	}
+	seen := make(map[MarketID]struct{}, len(snapshots))
+	var version uint64
+	hasher := sha256.New()
+	hasher.Write([]byte(route))
+	for _, snapshot := range snapshots {
+		metadata := snapshot.Metadata()
+		if metadata.Market == "" || metadata.Version == 0 {
+			return SnapshotBundle{}, fmt.Errorf("child snapshot has invalid identity")
+		}
+		if _, ok := seen[metadata.Market]; ok {
+			return SnapshotBundle{}, fmt.Errorf("duplicate child snapshot market %q", metadata.Market)
+		}
+		seen[metadata.Market] = struct{}{}
+		if metadata.Version > version {
+			version = metadata.Version
+		}
+		hasher.Write([]byte(metadata.Market))
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], metadata.Version)
+		hasher.Write(encoded[:])
+		hasher.Write(metadata.StateHash[:])
+		hasher.Write([]byte(metadata.Health))
+	}
+	if version == 0 {
+		return SnapshotBundle{}, fmt.Errorf("child snapshot version must be positive")
+	}
+	var hash [sha256.Size]byte
+	copy(hash[:], hasher.Sum(nil))
+	return SnapshotBundle{route: route, snapshots: append([]MarketSnapshot(nil), snapshots...), version: version, hash: hash}, nil
+}
+
+func (b SnapshotBundle) Route() MarketID         { return b.route }
+func (b SnapshotBundle) Version() uint64         { return b.version }
+func (b SnapshotBundle) Hash() [sha256.Size]byte { return b.hash }
+func (b SnapshotBundle) Snapshots() []MarketSnapshot {
+	return append([]MarketSnapshot(nil), b.snapshots...)
+}
+func (b SnapshotBundle) SnapshotKind() string { return "market_snapshot_bundle/v1" }
 
 func NewMarketSnapshot(metadata SnapshotMetadata, data SnapshotData) (MarketSnapshot, error) {
 	if metadata.Market == "" || metadata.Source == "" {

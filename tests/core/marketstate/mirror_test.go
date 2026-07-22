@@ -70,3 +70,34 @@ func TestMirrorOwnsLifecycleButNotProtocolState(t *testing.T) {
 		t.Fatalf("reducer state = %+v", current.Data())
 	}
 }
+
+func TestMirrorResetReplacesStateAndKeepsMonotonicVersion(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	mirror, err := marketstate.NewMirror("market", "source", opaqueReducer{}, arrivalOrder{}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	newEvent := func(value int, reference string) market.MarketEvent {
+		event, err := market.NewMarketEvent(market.MarketEvent{
+			Market: "market", Source: "source", ReceivedAt: now,
+			Reference: market.SourceReference{Kind: "test", Value: reference}, Data: opaqueEvent{value: value},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return event
+	}
+	if _, err := mirror.Apply(context.Background(), newEvent(10, "event")); err != nil {
+		t.Fatal(err)
+	}
+	result, err := mirror.Reset(context.Background(), newEvent(3, "bootstrap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Snapshot.Metadata().Version != 2 {
+		t.Fatalf("reset version = %d, want 2", result.Snapshot.Metadata().Version)
+	}
+	if got := result.Snapshot.Data().(opaqueState).value; got != 3 {
+		t.Fatalf("reset retained old state: %d", got)
+	}
+}

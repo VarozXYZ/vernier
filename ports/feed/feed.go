@@ -13,6 +13,13 @@ type EventSink interface {
 	Publish(context.Context, market.MarketEvent) error
 }
 
+// ResetSink is an optional extension used by reconnecting feeds. A reset is
+// a complete current-state bootstrap and must replace the mirror state; it is
+// deliberately separate from normal event publication.
+type ResetSink interface {
+	Reset(context.Context, market.MarketEvent) error
+}
+
 // Sink receives market events and explicit feed-liveness changes. Ordering and
 // health remain independent signals.
 type Sink interface {
@@ -28,6 +35,7 @@ type Feed interface {
 type Mirror interface {
 	MarketID() market.MarketID
 	Apply(context.Context, market.MarketEvent) (ApplyResult, error)
+	Reset(context.Context, market.MarketEvent) (ApplyResult, error)
 	SetHealth(context.Context, HealthUpdate) error
 	Current() (market.MarketSnapshot, bool)
 	Health() market.Health
