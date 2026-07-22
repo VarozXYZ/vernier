@@ -140,6 +140,26 @@ func TestMeteoraDLMMStartsAtActiveBinInBothDirections(t *testing.T) {
 	}
 }
 
+func TestMeteoraDLMMDynamicFeeRisesAcrossBins(t *testing.T) {
+	price := new(big.Int).Lsh(big.NewInt(1), 64)
+	active, err := dlmm.NewBinWithPrice(1, big.NewInt(1000), big.NewInt(1000), price)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateUpdate, err := dlmm.NewDynamicStateUpdate(1, 10, 100, 0, 1_000, 100_000, 0, 2, []dlmm.Bin{active})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _, err := (dlmm.Reducer{}).Reduce(context.Background(), nil, stateUpdate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := data.(dlmm.Snapshot)
+	if state.FeeRateForBin(0) <= state.FeeRateForBin(1) {
+		t.Fatalf("dynamic fee did not rise across bins: near=%d next=%d", state.FeeRateForBin(1), state.FeeRateForBin(0))
+	}
+}
+
 func testSnapshot(t *testing.T, id market.MarketID, data market.SnapshotData, hash [32]byte) market.MarketSnapshot {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	snapshot, err := market.NewMarketSnapshot(market.SnapshotMetadata{Market: id, Source: "feed", Version: 1, ReceivedAt: now, AppliedAt: now, Health: market.HealthHealthy, HealthChangedAt: now, StateHash: hash}, data)

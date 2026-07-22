@@ -52,10 +52,16 @@ func (b Bin) PriceX64() *big.Int { return clone(b.priceX64) }
 const priceScaleBits uint = 64
 
 type StateUpdate struct {
-	activeID int32
-	binStep  uint16
-	feeRate  uint64
-	bins     []Bin
+	activeID        int32
+	binStep         uint16
+	feeRate         uint64
+	baseFactor      uint16
+	baseFeePower    uint8
+	variableControl uint32
+	maxVolatility   uint32
+	volatilityRef   uint32
+	indexReference  int32
+	bins            []Bin
 }
 
 func NewStateUpdate(activeID int32, binStep, feeBPS uint16, bins []Bin) (StateUpdate, error) {
@@ -68,6 +74,15 @@ func NewStateUpdateWithFeeRate(activeID int32, binStep uint16, feeRate uint64, b
 		return StateUpdate{}, err
 	}
 	return StateUpdate{activeID: activeID, binStep: binStep, feeRate: feeRate, bins: cloneBins(bins)}, nil
+}
+
+func NewDynamicStateUpdate(activeID int32, binStep, baseFactor uint16, baseFeePower uint8, variableControl, maxVolatility, volatilityRef uint32, indexReference int32, bins []Bin) (StateUpdate, error) {
+	rate := dynamicFeeRate(indexReference, activeID, binStep, baseFactor, baseFeePower, variableControl, maxVolatility, volatilityRef)
+	state := Snapshot{schemaVersion: snapshotSchemaVersion, activeID: activeID, binStep: binStep, feeRate: rate, baseFactor: baseFactor, baseFeePower: baseFeePower, variableControl: variableControl, maxVolatility: maxVolatility, volatilityRef: volatilityRef, indexReference: indexReference, bins: cloneBins(bins)}
+	if err := state.validate(); err != nil {
+		return StateUpdate{}, err
+	}
+	return StateUpdate{activeID: activeID, binStep: binStep, feeRate: rate, baseFactor: baseFactor, baseFeePower: baseFeePower, variableControl: variableControl, maxVolatility: maxVolatility, volatilityRef: volatilityRef, indexReference: indexReference, bins: cloneBins(bins)}, nil
 }
 func (StateUpdate) EventKind() string { return "meteora_dlmm/state/v2" }
 
@@ -99,11 +114,17 @@ func NewLiquidityUpdate(id int32, deltaX, deltaY *big.Int) (LiquidityUpdate, err
 func (LiquidityUpdate) EventKind() string { return "meteora_dlmm/liquidity/v1" }
 
 type Snapshot struct {
-	schemaVersion uint16
-	activeID      int32
-	binStep       uint16
-	feeRate       uint64
-	bins          []Bin
+	schemaVersion   uint16
+	activeID        int32
+	binStep         uint16
+	feeRate         uint64
+	baseFactor      uint16
+	baseFeePower    uint8
+	variableControl uint32
+	maxVolatility   uint32
+	volatilityRef   uint32
+	indexReference  int32
+	bins            []Bin
 }
 
 func (Snapshot) SnapshotKind() string { return "meteora_dlmm/v2" }
@@ -113,10 +134,16 @@ func (s Snapshot) FeeRate() uint64    { return s.feeRate }
 func (s Snapshot) FeeBPS() uint16 {
 	return uint16((s.feeRate*10_000 + liquiditycurve.FeeRatePrecision - 1) / liquiditycurve.FeeRatePrecision)
 }
+func (s Snapshot) FeeRateForBin(id int32) uint64 {
+	if s.variableControl == 0 || s.maxVolatility == 0 {
+		return s.feeRate
+	}
+	return dynamicFeeRate(s.indexReference, id, s.binStep, s.baseFactor, s.baseFeePower, s.variableControl, s.maxVolatility, s.volatilityRef)
+}
 func (s Snapshot) Bins() []Bin { return cloneBins(s.bins) }
 
 func (s Snapshot) validate() error {
-	if s.schemaVersion != snapshotSchemaVersion || s.binStep == 0 || s.feeRate >= liquiditycurve.FeeRatePrecision || len(s.bins) == 0 {
+	if s.schemaVersion != snapshotSchemaVersion || s.binStep == 0 || s.feeRate >= liquiditycurve.FeeRatePrecision || len(s.bins) == 0 || s.maxVolatility > 0 && s.variableControl > 0 && s.baseFactor == 0 {
 		return fmt.Errorf("invalid Meteora DLMM state")
 	}
 	previous := int32(-1 << 31)
@@ -145,7 +172,7 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 	var next Snapshot
 	switch update := event.(type) {
 	case StateUpdate:
-		next = Snapshot{schemaVersion: snapshotSchemaVersion, activeID: update.activeID, binStep: update.binStep, feeRate: update.feeRate, bins: cloneBins(update.bins)}
+		next = Snapshot{schemaVersion: snapshotSchemaVersion, activeID: update.activeID, binStep: update.binStep, feeRate: update.feeRate, baseFactor: update.baseFactor, baseFeePower: update.baseFeePower, variableControl: update.variableControl, maxVolatility: update.maxVolatility, volatilityRef: update.volatilityRef, indexReference: update.indexReference, bins: cloneBins(update.bins)}
 	case SwapUpdate:
 		current, err := require(previous)
 		if err != nil {
@@ -219,11 +246,32 @@ func clone(value *big.Int) *big.Int {
 }
 func hashState(state Snapshot) [sha256.Size]byte {
 	var builder strings.Builder
-	fmt.Fprintf(&builder, "%d|%d|%d|%d", state.schemaVersion, state.activeID, state.binStep, state.feeRate)
+	fmt.Fprintf(&builder, "%d|%d|%d|%d|%d|%d|%d|%d|%d|%d", state.schemaVersion, state.activeID, state.binStep, state.feeRate, state.baseFactor, state.baseFeePower, state.variableControl, state.maxVolatility, state.volatilityRef, state.indexReference)
 	for _, bin := range state.bins {
 		fmt.Fprintf(&builder, "|%d:%s:%s:%s", bin.id, bin.reserveX, bin.reserveY, bin.priceX64)
 	}
 	return sha256.Sum256([]byte(builder.String()))
+}
+
+func dynamicFeeRate(activeID, binID int32, binStep, baseFactor uint16, baseFeePower uint8, variableControl, maxVolatility, volatilityRef uint32) uint64 {
+	delta := uint64(activeID - binID)
+	if activeID < binID {
+		delta = uint64(binID - activeID)
+	}
+	volatility := uint64(volatilityRef) + delta*10_000
+	if volatility > uint64(maxVolatility) {
+		volatility = uint64(maxVolatility)
+	}
+	base := uint64(baseFactor) * uint64(binStep) * 10
+	for i := uint8(0); i < baseFeePower; i++ {
+		base *= 10
+	}
+	variable := (uint64(variableControl)*uint64(binStep)*uint64(binStep)*volatility*volatility + 99_999_999_999) / 100_000_000_000
+	total := base + variable
+	if total > 100_000_000 {
+		return 100_000_000
+	}
+	return total
 }
 
 var _ market.EventData = StateUpdate{}
