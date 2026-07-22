@@ -155,18 +155,18 @@ tokens:
   cashcat_rh: {asset: cashcat, chain: robinhood, address: "0x0000000000000000000000000000000000000001", decimals: 18, symbol: CASHCAT}
   weth_rh: {asset: sol, chain: robinhood, address: "0x0000000000000000000000000000000000000002", decimals: 18, symbol: WETH}
   usdg_rh: {asset: usdg, chain: robinhood, address: "0x0000000000000000000000000000000000000003", decimals: 6, symbol: USDG}
-  cashcat_sol: {asset: cashcat, chain: solana, address: CashcatZMRn4Jv8sPQZUSsbTLi2PcPe1ssqbHcnaJqSS, decimals: 9, symbol: CASHCAT}
-  sol_sol: {asset: sol, chain: solana, address: So11111111111111111111111111111111111111112, decimals: 9, symbol: SOL}
-  usdg_sol: {asset: usdg, chain: solana, address: 2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH, decimals: 6, symbol: USDG}
+  cashcat_sol: {asset: cashcat, chain: solana, address: CashcatSynthetic111111111111111111111111, decimals: 9, symbol: CASHCAT}
+  sol_sol: {asset: sol, chain: solana, address: SolSynthetic111111111111111111111111111, decimals: 9, symbol: SOL}
+  usdg_sol: {asset: usdg, chain: solana, address: USDGSynthetic11111111111111111111111111, decimals: 6, symbol: USDG}
 venues:
   uniswap: {kind: uniswap_v3, chain: robinhood, pool_address: "0x0000000000000000000000000000000000000004", reference_address: "0x0000000000000000000000000000000000000005"}
-  meteora: {kind: meteora_dlmm, chain: solana, pool_address: pool-rh, reference_address: ""}
-  orca: {kind: orca_whirlpool, chain: solana, pool_address: pool-sol, reference_address: ""}
+  meteora: {kind: meteora_dlmm, chain: solana, pool_address: MeteoraVenueSynthetic1111111111111111, reference_address: ""}
+  orca: {kind: orca_whirlpool, chain: solana, pool_address: OrcaVenueSynthetic111111111111111111, reference_address: ""}
 pools:
   rh_cashcat_weth: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000004"}
   rh_weth_usdg: {venue: uniswap, chain: robinhood, address: "0x0000000000000000000000000000000000000006"}
-  sol_cashcat: {venue: meteora, chain: solana, address: 9ecxXoNLdGrcizhAPYLHnwwBAWyVKBXYo7R2miN8hffF}
-  sol_usdg: {venue: orca, chain: solana, address: 5KqohoeGjTjyHAFJJywK4J7fkFuK82PfMyuseGgLKZu2}
+  sol_cashcat: {venue: meteora, chain: solana, address: MeteoraPoolSynthetic11111111111111111111}
+  sol_usdg: {venue: orca, chain: solana, address: OrcaPoolSynthetic1111111111111111111111}
 paths:
   rh_path:
     chain: robinhood
