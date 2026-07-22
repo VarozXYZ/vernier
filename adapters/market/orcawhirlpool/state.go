@@ -178,7 +178,7 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 func require(previous market.SnapshotData) (Snapshot, error) {
 	state, ok := previous.(Snapshot)
 	if !ok || state.schemaVersion != snapshotSchemaVersion {
-		return Snapshot{}, fmt.Errorf("Whirlpool update requires a compatible snapshot")
+		return Snapshot{}, fmt.Errorf("whirlpool update requires a compatible snapshot")
 	}
 	state.sqrtPriceX64 = clone(state.sqrtPriceX64)
 	state.liquidity = clone(state.liquidity)
