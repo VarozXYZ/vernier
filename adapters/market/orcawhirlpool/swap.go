@@ -123,7 +123,7 @@ func computeStep(remaining *big.Int, feeRate uint32, liquidity, current, target 
 		return swapStep{}, fmt.Errorf("invalid Whirlpool swap step")
 	}
 	if aToB && target.Cmp(current) > 0 || !aToB && target.Cmp(current) < 0 {
-		return swapStep{}, fmt.Errorf("Whirlpool target moves in the wrong direction")
+		return swapStep{}, fmt.Errorf("whirlpool target moves in the wrong direction")
 	}
 	feeBase := new(big.Int).SetUint64(uint64(feeRatePrecision))
 	netFactor := new(big.Int).SetUint64(uint64(feeRatePrecision - feeRate))
@@ -305,7 +305,7 @@ func nextSqrtPrice(price, liquidity, amount *big.Int, exactInput, aToB bool) (*b
 		} else {
 			denominator.Sub(denominator, product)
 			if denominator.Sign() <= 0 {
-				return nil, fmt.Errorf("Whirlpool output exceeds liquidity")
+				return nil, fmt.Errorf("whirlpool output exceeds liquidity")
 			}
 		}
 		return divRound(numerator, denominator, true), nil
@@ -316,7 +316,7 @@ func nextSqrtPrice(price, liquidity, amount *big.Int, exactInput, aToB bool) (*b
 		return new(big.Int).Add(price, delta), nil
 	}
 	if price.Cmp(delta) < 0 {
-		return nil, fmt.Errorf("Whirlpool price underflow")
+		return nil, fmt.Errorf("whirlpool price underflow")
 	}
 	return new(big.Int).Sub(price, delta), nil
 }
