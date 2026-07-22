@@ -107,20 +107,20 @@ func (q *Quoter) virtualReserves(state Snapshot, tokenIn, tokenOut market.TokenI
 
 func exactInput(reserveIn, reserveOut, amount *big.Int, feeBPS uint16) (*big.Int, *big.Int, error) {
 	if amount == nil || amount.Sign() <= 0 || reserveIn.Sign() <= 0 || reserveOut.Sign() <= 0 || feeBPS >= 10_000 {
-		return nil, nil, fmt.Errorf("invalid Whirlpool exact-input request")
+		return nil, nil, fmt.Errorf("invalid whirlpool exact-input request")
 	}
 	feeBase := big.NewInt(10_000)
 	feeRate := new(big.Int).SetUint64(uint64(feeBPS))
 	afterFee := new(big.Int).Mul(amount, new(big.Int).Sub(feeBase, feeRate))
 	afterFee.Quo(afterFee, feeBase)
 	if afterFee.Sign() <= 0 {
-		return nil, nil, fmt.Errorf("Whirlpool input rounds to zero after fee")
+		return nil, nil, fmt.Errorf("whirlpool input rounds to zero after fee")
 	}
 	denominator := new(big.Int).Add(reserveIn, afterFee)
 	out := new(big.Int).Mul(afterFee, reserveOut)
 	out.Quo(out, denominator)
 	if out.Sign() <= 0 || out.Cmp(reserveOut) >= 0 {
-		return nil, nil, fmt.Errorf("Whirlpool output is outside active liquidity")
+		return nil, nil, fmt.Errorf("whirlpool output is outside active liquidity")
 	}
 	fee := new(big.Int).Sub(amount, afterFee)
 	return out, fee, nil
@@ -128,7 +128,7 @@ func exactInput(reserveIn, reserveOut, amount *big.Int, feeBPS uint16) (*big.Int
 
 func exactOutput(reserveIn, reserveOut, amountOut *big.Int, feeBPS uint16) (*big.Int, *big.Int, error) {
 	if amountOut == nil || amountOut.Sign() <= 0 || reserveIn.Sign() <= 0 || reserveOut.Sign() <= 0 || feeBPS >= 10_000 || amountOut.Cmp(reserveOut) >= 0 {
-		return nil, nil, fmt.Errorf("invalid Whirlpool exact-output request")
+		return nil, nil, fmt.Errorf("invalid whirlpool exact-output request")
 	}
 	feeBase := big.NewInt(10_000)
 	denominator := new(big.Int).Sub(reserveOut, amountOut)
