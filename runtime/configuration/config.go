@@ -527,7 +527,7 @@ func resolveChain(id string, config ChainConfig) (ResolvedChain, error) {
 		wsEnv = config.RPCURLEnv
 	}
 	if config.Kind == "solana" && (httpEnv == "" || wsEnv == "") {
-		return ResolvedChain{}, fmt.Errorf("Solana chain %q requires separate HTTP and WebSocket endpoints", id)
+		return ResolvedChain{}, fmt.Errorf("solana chain %q requires separate HTTP and WebSocket endpoints", id)
 	}
 	for name, value := range map[string]string{"RPC": config.RPCURLEnv, "HTTP": httpEnv, "WebSocket": wsEnv} {
 		if value != "" && !environmentName.MatchString(value) {

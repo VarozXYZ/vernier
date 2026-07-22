@@ -143,10 +143,10 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 			found = true
 		}
 		if !found {
-			return nil, [sha256.Size]byte{}, fmt.Errorf("Meteora liquidity update references unknown bin %d", update.id)
+			return nil, [sha256.Size]byte{}, fmt.Errorf("meteora liquidity update references unknown bin %d", update.id)
 		}
 	default:
-		return nil, [sha256.Size]byte{}, fmt.Errorf("unsupported Meteora DLMM event %T", event)
+		return nil, [sha256.Size]byte{}, fmt.Errorf("unsupported meteora DLMM event %T", event)
 	}
 	if err := next.validate(); err != nil {
 		return nil, [sha256.Size]byte{}, err
@@ -157,7 +157,7 @@ func (Reducer) Reduce(ctx context.Context, previous market.SnapshotData, event m
 func require(previous market.SnapshotData) (Snapshot, error) {
 	state, ok := previous.(Snapshot)
 	if !ok || state.schemaVersion != snapshotSchemaVersion {
-		return Snapshot{}, fmt.Errorf("Meteora update requires a compatible snapshot")
+		return Snapshot{}, fmt.Errorf("meteora update requires a compatible snapshot")
 	}
 	state.bins = cloneBins(state.bins)
 	return state, nil
