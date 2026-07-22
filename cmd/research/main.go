@@ -98,7 +98,11 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 			logger.Info("network ready", "chain", id)
 			continue
 		}
-		network, dialErr := evm.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, profile.ChainID, endpoints[id], endpoints[id])
+		wsEndpoint := endpoints[id+".websocket"]
+		if wsEndpoint == "" {
+			wsEndpoint = endpoints[id]
+		}
+		network, dialErr := evm.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, profile.ChainID, endpoints[id], wsEndpoint)
 		if dialErr != nil {
 			for _, opened := range networks {
 				if closer, ok := opened.(interface{ Close() }); ok {
