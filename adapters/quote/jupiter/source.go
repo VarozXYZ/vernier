@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VarozXYZ/vernier/domain/market"
@@ -52,6 +53,15 @@ type Source struct {
 	local        quoteport.Source
 	client       Client
 	clock        Clock
+	mu           sync.RWMutex
+	cache        map[referenceKey]quoteport.ReferenceResult
+}
+
+type referenceKey struct {
+	version uint64
+	hash    [32]byte
+	in, out market.TokenID
+	amount  string
 }
 
 func New(config Config) (*Source, error) {
@@ -80,7 +90,7 @@ func New(config Config) (*Source, error) {
 		}
 		mints[token] = mint
 	}
-	return &Source{id: config.ID, baseURL: strings.TrimRight(config.BaseURL, "/"), taker: config.Taker, slippageBPS: config.SlippageBPS, maxAccounts: config.MaxAccounts, apiKey: config.APIKey, apiKeyHeader: config.APIKeyHeader, mints: mints, local: config.Local, client: config.Client, clock: config.Clock}, nil
+	return &Source{id: config.ID, baseURL: strings.TrimRight(config.BaseURL, "/"), taker: config.Taker, slippageBPS: config.SlippageBPS, maxAccounts: config.MaxAccounts, apiKey: config.APIKey, apiKeyHeader: config.APIKeyHeader, mints: mints, local: config.Local, client: config.Client, clock: config.Clock, cache: make(map[referenceKey]quoteport.ReferenceResult)}, nil
 }
 
 func (s *Source) ID() market.SourceID { return s.id }
@@ -92,6 +102,13 @@ func (s *Source) QuoteWithReference(ctx context.Context, input quoteport.Input) 
 	local, err := s.local.Quote(ctx, input)
 	if err != nil {
 		return quoteport.ReferenceResult{}, err
+	}
+	key := referenceKey{version: input.Snapshot.Metadata().Version, hash: input.Snapshot.Metadata().StateHash, in: input.TokenIn, out: input.TokenOut, amount: input.AmountIn.String()}
+	s.mu.RLock()
+	cached, found := s.cache[key]
+	s.mu.RUnlock()
+	if found {
+		return cached, nil
 	}
 	started := s.clock().UTC()
 	evidence := quoteport.ReferenceEvidence{Provider: s.id, Status: quoteport.ReferenceUnavailable, Latency: 0}
@@ -164,7 +181,11 @@ func (s *Source) QuoteWithReference(ctx context.Context, input quoteport.Input) 
 	for _, hop := range payload.RoutePlan {
 		evidence.Route = append(evidence.Route, quoteport.ReferenceHop{AMM: hop.SwapInfo.AMMKey, Label: hop.SwapInfo.Label, InputMint: hop.SwapInfo.InputMint, OutputMint: hop.SwapInfo.OutputMint, InAmount: hop.SwapInfo.InAmount, OutAmount: hop.SwapInfo.OutAmount})
 	}
-	return quoteport.ReferenceResult{Local: local, Evidence: evidence}, nil
+	result := quoteport.ReferenceResult{Local: local, Evidence: evidence}
+	s.mu.Lock()
+	s.cache[key] = result
+	s.mu.Unlock()
+	return result, nil
 }
 
 type buildResponse struct {
