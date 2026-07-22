@@ -21,7 +21,7 @@ func TestPublicKeyAndPDAEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if address == [32]byte{} {
-		t.Fatalf("invalid PDA result")
+	if got := solana.EncodePublicKey(address); got != "HWCxM6cEBrV6ZDQGCMMSREMm4WxPVRAvtn3XsHdcZGBT" {
+		t.Fatalf("unexpected canonical PDA %q", got)
 	}
 }

@@ -34,7 +34,6 @@ func EncodePublicKey(value [32]byte) string { return encodeBase58(value[:]) }
 func FindProgramAddress(seeds [][]byte, programID [32]byte) ([32]byte, byte, error) {
 	for bump := 255; bump >= 0; bump-- {
 		input := make([]byte, 0, len(pdaMarker)+32+1)
-		input = append(input, pdaMarker...)
 		for _, seed := range seeds {
 			if len(seed) > 32 {
 				return [32]byte{}, 0, fmt.Errorf("PDA seed exceeds 32 bytes")
@@ -43,6 +42,8 @@ func FindProgramAddress(seeds [][]byte, programID [32]byte) ([32]byte, byte, err
 		}
 		input = append(input, byte(bump))
 		input = append(input, programID[:]...)
+		// Solana's create_program_address domain separator is the final input.
+		input = append(input, pdaMarker...)
 		hash := sha256.Sum256(input)
 		if _, err := new(edwards25519.Point).SetBytes(hash[:]); err == nil {
 			continue
