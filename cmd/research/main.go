@@ -51,7 +51,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 	configPath := flags.String("config", "examples/setups/virtual/vernier.yaml", "path to YAML configuration manifest")
 	envPath := flags.String("env-file", ".env", "path to local environment file")
 	format := flags.String("format", "text", "output format: text or json (jsonl in stream mode)")
-	stream := flags.Bool("stream", false, "continuously evaluate both pools from WebSocket log feeds")
+	stream := flags.Bool("stream", true, "continuously evaluate both pools from WebSocket log feeds (use --stream=false for one snapshot)")
 	updates := flags.Int("updates", 0, "reports to emit in stream mode; zero runs until canceled")
 	logLevel := flags.String("log-level", "info", "diagnostic log level: debug, info, warn, or error")
 	calculations := flags.String("calculations", "summary", "calculation output: summary or full")
