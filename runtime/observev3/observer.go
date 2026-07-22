@@ -154,7 +154,6 @@ func (o *Observer) Run(ctx context.Context) error {
 type observerSink struct {
 	observer      *Observer
 	cancel        context.CancelFunc
-	publishes     int
 	activeUpdates int
 }
 
@@ -178,12 +177,9 @@ func (s *observerSink) Publish(ctx context.Context, event market.MarketEvent) er
 	if err != nil {
 		return err
 	}
-	s.publishes++
-	if s.publishes > 1 {
-		s.activeUpdates++
-		if s.observer.options.Updates > 0 && s.activeUpdates >= s.observer.options.Updates {
-			s.cancel()
-		}
+	s.activeUpdates++
+	if s.observer.options.Updates > 0 && s.activeUpdates >= s.observer.options.Updates {
+		s.cancel()
 	}
 	return nil
 }
