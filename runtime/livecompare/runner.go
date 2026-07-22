@@ -452,6 +452,7 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 	markets := make([]market.Market, 0, 2)
 	seenChains := map[market.ChainID]bool{}
 	seenAssets := map[market.AssetID]bool{}
+	seenTokens := map[market.TokenID]bool{}
 	pairID := market.PairID(r.config.SetupID + "/pair")
 	for _, configured := range r.config.Markets {
 		chainID := market.ChainID(configured.Venue.Chain)
@@ -460,26 +461,38 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 			seenChains[chainID] = true
 		}
 		for _, token := range []market.Token{configured.Base.Token, configured.Quote.Token} {
+			if seenTokens[token.ID] {
+				continue
+			}
 			tokens = append(tokens, token)
+			seenTokens[token.ID] = true
 			if !seenAssets[token.Asset] {
 				assets = append(assets, r.config.Assets[token.Asset])
 				seenAssets[token.Asset] = true
 			}
 		}
-		venueID := market.VenueID(configured.Venue.ID)
-		poolID := market.PoolID(configured.Venue.ID + "/pool")
 		pathID := market.PathID(string(configured.ID) + "/path")
-		adapterID := uniswapv2.ID
-		if configured.Venue.Kind == "uniswap_v3" {
-			adapterID = uniswapv3.ID
-		} else if configured.Venue.Kind == "aerodrome_slipstream" {
-			adapterID = aerodromeslipstream.ID
-		} else if configured.Venue.Kind == "aerodrome_volatile" {
-			adapterID = aerodrome.ID
+		hops := make([]market.Hop, 0, len(configured.Path))
+		for index, configuredHop := range configured.Path {
+			for _, token := range []market.Token{configuredHop.In.Token, configuredHop.Out.Token} {
+				if seenTokens[token.ID] {
+					continue
+				}
+				tokens = append(tokens, token)
+				seenTokens[token.ID] = true
+				if !seenAssets[token.Asset] {
+					assets = append(assets, r.config.Assets[token.Asset])
+					seenAssets[token.Asset] = true
+				}
+			}
+			venueID := market.VenueID(fmt.Sprintf("%s/%s/%d", configured.ID, configuredHop.Venue.ID, index))
+			poolID := market.PoolID(fmt.Sprintf("%s/%s", configured.ID, configuredHop.Pool))
+			adapterID := adapterIDFor(configuredHop.Venue.Kind)
+			venues = append(venues, market.Venue{ID: venueID})
+			pools = append(pools, market.Pool{ID: poolID, Venue: venueID, Chain: chainID, Tokens: []market.TokenID{configuredHop.In.Token.ID, configuredHop.Out.Token.ID}, Adapter: adapterID})
+			hops = append(hops, market.Hop{Pool: poolID, TokenIn: configuredHop.In.Token.ID, TokenOut: configuredHop.Out.Token.ID})
 		}
-		venues = append(venues, market.Venue{ID: venueID})
-		pools = append(pools, market.Pool{ID: poolID, Venue: venueID, Chain: chainID, Tokens: []market.TokenID{configured.Base.Token.ID, configured.Quote.Token.ID}, Adapter: adapterID})
-		paths = append(paths, market.Path{ID: pathID, Chain: chainID, Hops: []market.Hop{{Pool: poolID, TokenIn: configured.Base.Token.ID, TokenOut: configured.Quote.Token.ID}}})
+		paths = append(paths, market.Path{ID: pathID, Chain: chainID, Hops: hops})
 		markets = append(markets, market.Market{ID: configured.ID, Pair: pairID, Chain: chainID, Path: pathID, BaseToken: configured.Base.Token.ID, QuoteToken: configured.Quote.Token.ID})
 	}
 	registry, err := market.NewRegistry(market.Catalog{
@@ -492,6 +505,23 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 	}
 	setup, err := arbitrage.NewArbitrageSetup(arbitrage.SetupID(r.config.SetupID), pairID, []market.MarketID{r.config.Markets[0].ID, r.config.Markets[1].ID}, registry)
 	return registry, setup, err
+}
+
+func adapterIDFor(kind string) string {
+	switch kind {
+	case "uniswap_v3":
+		return uniswapv3.ID
+	case "aerodrome_slipstream":
+		return aerodromeslipstream.ID
+	case "aerodrome_volatile":
+		return aerodrome.ID
+	case "meteora_dlmm":
+		return "meteora-dlmm"
+	case "orca_whirlpool":
+		return "orca-whirlpool"
+	default:
+		return uniswapv2.ID
+	}
 }
 
 func (r *Runner) cost(ctx context.Context, blocks map[string]evm.BlockReference, at time.Time) (CostEvidence, arbitrage.CostSnapshot, error) {
