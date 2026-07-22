@@ -22,6 +22,9 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 	if options.OnReport == nil {
 		options.OnReport = func(Report) error { return nil }
 	}
+	if options.OnReference == nil {
+		options.OnReference = func(ReferenceReport) error { return nil }
+	}
 	blocks, err := r.currentBlocks(ctx)
 	if err != nil {
 		return err
@@ -47,7 +50,17 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 			return err
 		}
 		routes[configured.ID] = route
-		sources[configured.ID] = route.route.Source
+		source := quoteport.Source(route.route.Source)
+		if configured.ReferenceQuote != "" {
+			reference, err := r.externalSource(configured, source)
+			if err != nil {
+				return err
+			}
+			if reference != nil {
+				source = reference
+			}
+		}
+		sources[configured.ID] = source
 	}
 	costEvidence, cost, err := r.cost(ctx, blocks, now)
 	if err != nil {
@@ -92,6 +105,8 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 		}
 	}
 	defer feeds.Wait()
+	var references sync.WaitGroup
+	defer references.Wait()
 	evaluations := 0
 	for {
 		select {
@@ -131,6 +146,20 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 			}
 			if err := options.OnReport(report); err != nil {
 				return err
+			}
+			if len(r.config.QuoteSources) > 0 || len(r.referenceSources) > 0 {
+				referenceEvaluation := evaluations + 1
+				referenceSnapshots := append([]market.MarketSnapshot(nil), snapshots...)
+				referenceOpportunities := append([]arbitrage.Opportunity(nil), research.Opportunities...)
+				available := r.referenceSourcesFor(sources)
+				references.Add(1)
+				go func() {
+					defer references.Done()
+					comparisons := validateReferences(ctx, referenceOpportunities, referenceSnapshots, available, research, r.clock)
+					if options.OnReference != nil {
+						_ = options.OnReference(ReferenceReport{Evaluation: referenceEvaluation, Comparisons: comparisons})
+					}
+				}()
 			}
 			evaluations++
 			if options.Updates > 0 && evaluations >= options.Updates {
