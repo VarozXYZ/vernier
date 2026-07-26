@@ -239,7 +239,10 @@ Pools are independent from venues, and a `path` lists ordered hops. Solana
 pool adapters may use filtered `logsSubscribe`, account-level
 `accountSubscribe`, or program-level `programSubscribe` streams; the local
 decoder must be pure for every notification, so the decision hot path never
-falls back to RPC. Whirlpool bootstraps all fixed and dynamic tick arrays
+falls back to RPC. Every subscription sends a WebSocket ping every 30 seconds
+and requires a pong within 90 seconds. A missed pong or failed ping closes the
+session so the feed can degrade and reconnect normally. Whirlpool bootstraps
+all fixed and dynamic tick arrays
 associated with the pool and then discovers new arrays through filtered
 program notifications. A healthy subscription has no TTL or slot-gap rule;
 only a confirmed WebSocket disconnect degrades it, and reconnect bootstraps
