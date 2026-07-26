@@ -19,6 +19,42 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	DefaultWebSocketPingInterval = 30 * time.Second
+	DefaultWebSocketPongTimeout  = 90 * time.Second
+	DefaultWebSocketWriteTimeout = 10 * time.Second
+)
+
+// WebSocketKeepalive configures transport-level ping/pong health checks for
+// every Solana subscription connection. PongTimeout must exceed PingInterval
+// so a healthy peer has time to acknowledge a ping before the read fails.
+type WebSocketKeepalive struct {
+	PingInterval time.Duration
+	PongTimeout  time.Duration
+	WriteTimeout time.Duration
+}
+
+func DefaultWebSocketKeepalive() WebSocketKeepalive {
+	return WebSocketKeepalive{
+		PingInterval: DefaultWebSocketPingInterval,
+		PongTimeout:  DefaultWebSocketPongTimeout,
+		WriteTimeout: DefaultWebSocketWriteTimeout,
+	}
+}
+
+func (c WebSocketKeepalive) validate() error {
+	if c.PingInterval <= 0 {
+		return fmt.Errorf("WebSocket ping interval must be positive")
+	}
+	if c.PongTimeout <= c.PingInterval {
+		return fmt.Errorf("WebSocket pong timeout must exceed ping interval")
+	}
+	if c.WriteTimeout <= 0 {
+		return fmt.Errorf("WebSocket write timeout must be positive")
+	}
+	return nil
+}
+
 type ReadOnlyNetwork struct {
 	id           string
 	label        string
@@ -26,6 +62,7 @@ type ReadOnlyNetwork struct {
 	websocketURL string
 	httpClient   *http.Client
 	dialer       *websocket.Dialer
+	keepalive    WebSocketKeepalive
 	requestID    atomic.Uint64
 }
 
@@ -41,6 +78,26 @@ func DialReadOnlyNetwork(ctx context.Context, id, label, httpURL, websocketURL s
 }
 
 func NewReadOnlyNetwork(id, label, httpURL, websocketURL string, httpClient *http.Client, dialer *websocket.Dialer) (*ReadOnlyNetwork, error) {
+	return NewReadOnlyNetworkWithKeepalive(
+		id,
+		label,
+		httpURL,
+		websocketURL,
+		httpClient,
+		dialer,
+		DefaultWebSocketKeepalive(),
+	)
+}
+
+// NewReadOnlyNetworkWithKeepalive constructs a network with an explicit
+// transport keepalive policy. Production callers normally use
+// NewReadOnlyNetwork and its Helius-compatible defaults.
+func NewReadOnlyNetworkWithKeepalive(
+	id, label, httpURL, websocketURL string,
+	httpClient *http.Client,
+	dialer *websocket.Dialer,
+	keepalive WebSocketKeepalive,
+) (*ReadOnlyNetwork, error) {
 	if id == "" || label == "" {
 		return nil, fmt.Errorf("network id and label are required")
 	}
@@ -50,13 +107,19 @@ func NewReadOnlyNetwork(id, label, httpURL, websocketURL string, httpClient *htt
 	if err := validateEndpoint(websocketURL, "WebSocket"); err != nil {
 		return nil, err
 	}
+	if err := keepalive.validate(); err != nil {
+		return nil, err
+	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}
 	}
 	if dialer == nil {
 		dialer = websocket.DefaultDialer
 	}
-	return &ReadOnlyNetwork{id: id, label: label, httpURL: httpURL, websocketURL: websocketURL, httpClient: httpClient, dialer: dialer}, nil
+	return &ReadOnlyNetwork{
+		id: id, label: label, httpURL: httpURL, websocketURL: websocketURL,
+		httpClient: httpClient, dialer: dialer, keepalive: keepalive,
+	}, nil
 }
 
 func validateEndpoint(raw, kind string) error {
@@ -354,6 +417,34 @@ type ProgramSubscription interface {
 	Unsubscribe()
 }
 
+func startWebSocketKeepalive(conn *websocket.Conn, done <-chan struct{}, config WebSocketKeepalive) {
+	_ = conn.SetReadDeadline(time.Now().Add(config.PongTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(config.PongTimeout))
+	})
+	go func() {
+		ticker := time.NewTicker(config.PingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case tick := <-ticker.C:
+				if err := conn.WriteControl(
+					websocket.PingMessage,
+					nil,
+					tick.Add(config.WriteTimeout),
+				); err != nil {
+					// Closing the connection unblocks the sole reader, which
+					// publishes the terminal error through the subscription.
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+}
+
 func (n *ReadOnlyNetwork) SubscribeLogs(ctx context.Context, pool string) (LogsSubscription, error) {
 	if strings.TrimSpace(pool) == "" {
 		return nil, fmt.Errorf("pool account is required")
@@ -386,6 +477,7 @@ func (n *ReadOnlyNetwork) SubscribeLogs(ctx context.Context, pool string) (LogsS
 		return nil, fmt.Errorf("invalid logsSubscribe response")
 	}
 	subscription := &logsSubscription{conn: conn, id: response.Result, errors: make(chan error, 1), notifications: make(chan LogNotification, 128), done: make(chan struct{})}
+	startWebSocketKeepalive(conn, subscription.done, n.keepalive)
 	go subscription.readLoop()
 	return subscription, nil
 }
@@ -422,6 +514,7 @@ func (n *ReadOnlyNetwork) SubscribeAccount(ctx context.Context, account string) 
 		return nil, fmt.Errorf("invalid accountSubscribe response")
 	}
 	subscription := &accountSubscription{conn: conn, account: account, id: response.Result, errors: make(chan error, 1), notifications: make(chan AccountNotification, 128), done: make(chan struct{})}
+	startWebSocketKeepalive(conn, subscription.done, n.keepalive)
 	go subscription.readLoop()
 	return subscription, nil
 }
@@ -473,6 +566,7 @@ func (n *ReadOnlyNetwork) SubscribeProgram(ctx context.Context, request ProgramS
 		return nil, fmt.Errorf("invalid programSubscribe response")
 	}
 	subscription := &programSubscription{conn: conn, id: response.Result, errors: make(chan error, 1), notifications: make(chan ProgramNotification, 128), done: make(chan struct{})}
+	startWebSocketKeepalive(conn, subscription.done, n.keepalive)
 	go subscription.readLoop()
 	return subscription, nil
 }
