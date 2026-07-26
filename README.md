@@ -278,6 +278,62 @@ quote_sources:
 The taker and optional API key are environment values; no credentials belong
 in YAML, fixtures, reports, or commits.
 
+## Standalone OKX/Jupiter quote comparison
+
+The repository also contains a read-only command for measuring the default
+quote route of the OKX and Jupiter aggregators on Solana. It is an explicit
+experiment, not a Research integration and not a Go test. Each provider is
+called once per second in parallel; the command prints per-sample output and
+latency, followed by min/mean/p50/p95/p99/max statistics for latency, output,
+and the signed output delta (`OKX - Jupiter`).
+
+Set `JUPITER_API_KEYS` in the local `.env.test` (comma-separated, in rotation
+order) and the public wallet values required to build unsigned transactions,
+then run:
+
+```console
+go run ./cmd/okx-jupiter-quote-compare -samples 20
+```
+
+`JUPITER_SLIPPAGE_BPS` defaults to 50. The command intentionally sends no
+DEX restrictions to either provider and uses integer minimum-token units on
+the wire; displayed amounts use the output-token decimals returned by OKX.
+
+The quote-to-swap construction experiment is:
+
+```console
+go run ./cmd/okx-jupiter-quote-swap -samples 20
+```
+
+It runs one Jupiter pipeline and one OKX pipeline concurrently each second.
+Each pipeline performs quote followed by unsigned transaction construction:
+Jupiter calls `/swap/v1/swap`; OKX calls
+`/api/v6/dex/aggregator/swap-instruction`. It reports quote latency, swap or
+instruction latency, total pipeline latency, human-readable output amounts,
+and `OKX - Jupiter` output deltas. It also reports call, client-side queue,
+HTTP, local-processing, and quote-to-swap handoff timings. This command does
+not add client-side rate-limit pacing; the one-pair-per-second schedule remains
+for experiment consistency. It never signs or broadcasts anything.
+
+Required local variables for this command are `JUPITER_USER_PUBLIC_KEY`,
+`OKX_USER_WALLET_ADDRESS`, and optionally `OKX_SLIPPAGE` (default `0.5`).
+`JUPITER_API_KEYS=key-0,key-1,key-2` rotates one key per Jupiter request,
+including quote and swap calls. `JUPITER_API_KEY` remains a compatibility
+fallback for a single key. Rotation only distributes requests across an
+authorized key pool; it does not guarantee immunity from provider, account,
+or IP-level rate limits.
+
+To compare Jupiter's default route against only Meteora and Orca, run:
+
+```console
+go run ./cmd/jupiter-quote-compare -samples 20
+```
+
+The restricted labels are configured in `JUPITER_RESTRICTED_DEXES`:
+`Meteora`, `Meteora DAMM v2`, `Meteora DLMM`, `Orca V1`, `Orca V2`, and
+`Whirlpool`. The command uses these labels directly and does not call the DEX
+catalog for every sample.
+
 ## Development
 
 Vernier requires Go 1.25 or newer. The repository exposes one verification
