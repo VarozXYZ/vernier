@@ -16,14 +16,18 @@ type BlockReference struct {
 }
 
 type LogFilter struct {
-	Address common.Address
-	Topics  []common.Hash
+	Address       common.Address
+	Topics        []common.Hash
+	IndexedTopics [][]common.Hash
 }
 
 func (f LogFilter) Query(blockHash *common.Hash) geth.FilterQuery {
 	query := geth.FilterQuery{Addresses: []common.Address{f.Address}}
 	if len(f.Topics) > 0 {
 		query.Topics = [][]common.Hash{append([]common.Hash(nil), f.Topics...)}
+	}
+	for _, topics := range f.IndexedTopics {
+		query.Topics = append(query.Topics, append([]common.Hash(nil), topics...))
 	}
 	query.BlockHash = blockHash
 	return query

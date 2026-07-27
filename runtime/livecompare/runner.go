@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"math/big"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -21,6 +23,7 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/market/constantproduct"
 	"github.com/VarozXYZ/vernier/adapters/market/uniswapv2"
 	"github.com/VarozXYZ/vernier/adapters/market/uniswapv3"
+	telegramnotification "github.com/VarozXYZ/vernier/adapters/notification/telegram"
 	"github.com/VarozXYZ/vernier/adapters/price/chainlink"
 	"github.com/VarozXYZ/vernier/adapters/price/coingecko"
 	"github.com/VarozXYZ/vernier/adapters/quote/jupiter"
@@ -30,6 +33,7 @@ import (
 	"github.com/VarozXYZ/vernier/core/strategy"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/market"
+	notificationport "github.com/VarozXYZ/vernier/ports/notification"
 	priceport "github.com/VarozXYZ/vernier/ports/price"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
@@ -53,8 +57,10 @@ type Options struct {
 	ReferenceQuoteOverride string
 	// ReferenceSources are optional providers used only after local sizing has
 	// selected one candidate. They never participate in local evaluation.
-	ReferenceSources map[market.MarketID]quoteport.ExternalReferenceSource
-	Logger           *slog.Logger
+	ReferenceSources    map[market.MarketID]quoteport.ExternalReferenceSource
+	Logger              *slog.Logger
+	OpeningAlerts       notificationport.OpeningSender
+	ConfigurationAlerts notificationport.ConfigurationWarningSender
 }
 
 type Runner struct {
@@ -67,6 +73,11 @@ type Runner struct {
 	referenceQuoteOverride string
 	referenceSources       map[market.MarketID]quoteport.ExternalReferenceSource
 	logger                 *slog.Logger
+	openingAlerts          notificationport.OpeningSender
+	configurationAlerts    notificationport.ConfigurationWarningSender
+	alertFailures          atomic.Uint64
+	warningMu              sync.Mutex
+	deliveredWarnings      map[string]struct{}
 }
 
 type CostEvidence struct {
@@ -107,6 +118,11 @@ type marketRuntime struct {
 
 type referenceQuote func(context.Context, evm.BlockReference, market.MarketSnapshot, market.TokenID, market.TokenID, *big.Int) (*big.Int, error)
 
+type evaluationStrategy interface {
+	ID() arbitrage.StrategyID
+	EvaluateWithTiming(context.Context, arbitrage.Evaluation) ([]arbitrage.Opportunity, strategy.EvaluationTiming, error)
+}
+
 func New(config configuration.ParsedConfig, networks Networks, options Options) (*Runner, error) {
 	if options.Clock == nil {
 		options.Clock = time.Now
@@ -116,6 +132,27 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 	}
 	if options.Logger == nil {
 		options.Logger = observability.DiscardLogger()
+	}
+	if options.ConfigurationAlerts == nil && options.OpeningAlerts != nil {
+		options.ConfigurationAlerts, _ = options.OpeningAlerts.(notificationport.ConfigurationWarningSender)
+	}
+	if config.TelegramEnabled && (options.OpeningAlerts == nil || options.ConfigurationAlerts == nil) {
+		token, tokenOK := options.LookupEnv(config.TelegramBotTokenEnv)
+		chatID, chatOK := options.LookupEnv(config.TelegramChatIDEnv)
+		if !tokenOK || !chatOK || strings.TrimSpace(token) == "" || strings.TrimSpace(chatID) == "" {
+			return nil, fmt.Errorf("telegram alert environment is unset")
+		}
+		var err error
+		sender, err := telegramnotification.New(telegramnotification.Config{BotToken: token, ChatID: chatID})
+		if err != nil {
+			return nil, err
+		}
+		if options.OpeningAlerts == nil {
+			options.OpeningAlerts = sender
+		}
+		if options.ConfigurationAlerts == nil {
+			options.ConfigurationAlerts = sender
+		}
 	}
 	if options.ReferenceQuoteOverride != "" && options.ReferenceQuoteOverride != "off" {
 		if _, ok := config.QuoteSources[options.ReferenceQuoteOverride]; !ok {
@@ -140,7 +177,13 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		}
 		limited[id] = wrapped
 	}
-	return &Runner{config: config, networks: limited, solanaNetworks: options.SolanaNetworks, referenceSources: options.ReferenceSources, referenceQuoteOverride: options.ReferenceQuoteOverride, clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger}, nil
+	return &Runner{
+		config: config, networks: limited, solanaNetworks: options.SolanaNetworks,
+		referenceSources: options.ReferenceSources, referenceQuoteOverride: options.ReferenceQuoteOverride,
+		clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger,
+		openingAlerts: options.OpeningAlerts, configurationAlerts: options.ConfigurationAlerts,
+		deliveredWarnings: make(map[string]struct{}),
+	}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
@@ -196,6 +239,7 @@ func (r *Runner) Run(ctx context.Context) (Report, error) {
 		return Report{}, err
 	}
 	researchReport, err := r.evaluate(ctx, candidate, snapshots, cost, "live-evaluation/"+r.config.ResearchID, startedAt, nil)
+	r.dispatchQuoteWarnings(sources)
 	if err != nil {
 		return Report{}, err
 	}
@@ -259,20 +303,35 @@ func blockSummary(blocks map[string]evm.BlockReference) map[string]uint64 {
 	return result
 }
 
-func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.ArbitrageSetup, sources map[market.MarketID]quoteport.Source) (*strategy.TwoMarketCrossChainArbitrage, error) {
+func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.ArbitrageSetup, sources map[market.MarketID]quoteport.Source) (evaluationStrategy, error) {
 	minimum, _ := market.NewAssetQuantity(r.sizingAsset(), r.config.MinimumSize)
+	threshold, err := market.NewAssetQuantity(r.config.Markets[0].Quote.Token.Asset, r.config.MinimumNet)
+	if err != nil {
+		return nil, err
+	}
+	if r.config.EvaluationMode == "best_buy_opposite_sell" {
+		return strategy.NewBestBuyOppositeSell(strategy.BestBuyOppositeSellConfig{
+			ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
+			Sources: sources, Notional: minimum, Threshold: threshold, Clock: r.clock,
+			Retries: r.config.RetryAttempts, RetryDelay: r.config.RetryDelay,
+		})
+	}
 	maximum, _ := market.NewAssetQuantity(r.sizingAsset(), r.config.MaximumSize)
-	grid, err := sizing.NewLinearRange(minimum, maximum, r.config.SizeSamples)
+	var grid sizing.Grid
+	switch r.config.SizingKind {
+	case "fixed":
+		grid, err = sizing.NewGrid([]market.AssetQuantity{minimum})
+	case "linear_range":
+		grid, err = sizing.NewLinearRange(minimum, maximum, r.config.SizeSamples)
+	default:
+		return nil, fmt.Errorf("unsupported sizing kind %q", r.config.SizingKind)
+	}
 	if err != nil {
 		return nil, err
 	}
 	discoverySamples := 0
-	if r.config.SizeSamples >= 3 {
+	if r.config.SizingKind == "linear_range" && r.config.SizeSamples >= 3 {
 		discoverySamples = 3
-	}
-	threshold, err := market.NewAssetQuantity(r.config.Markets[0].Quote.Token.Asset, r.config.MinimumNet)
-	if err != nil {
-		return nil, err
 	}
 	return strategy.NewTwoMarket(strategy.TwoMarketConfig{
 		ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
@@ -288,7 +347,15 @@ func (r *Runner) sizingAsset() market.AssetID {
 	return r.config.Markets[0].Quote.Token.Asset
 }
 
-func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCrossChainArbitrage, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time, trigger *arbitrage.TriggerMetadata) (runtimeresearch.Report, error) {
+func (r *Runner) evaluate(ctx context.Context, candidate evaluationStrategy, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time, trigger *arbitrage.TriggerMetadata) (runtimeresearch.Report, error) {
+	return r.evaluateWithQuoteMode(ctx, candidate, snapshots, cost, id, triggeredAt, trigger, false)
+}
+
+func (r *Runner) evaluateFresh(ctx context.Context, candidate evaluationStrategy, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time, trigger *arbitrage.TriggerMetadata) (runtimeresearch.Report, error) {
+	return r.evaluateWithQuoteMode(ctx, candidate, snapshots, cost, id, triggeredAt, trigger, true)
+}
+
+func (r *Runner) evaluateWithQuoteMode(ctx context.Context, candidate evaluationStrategy, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time, trigger *arbitrage.TriggerMetadata, refresh bool) (runtimeresearch.Report, error) {
 	startedAt := r.clock().UTC()
 	evaluation, err := arbitrage.NewEvaluation(
 		arbitrage.EvaluationID(id), arbitrage.ResearchRunID(r.config.RunID), candidate.ID(),
@@ -300,7 +367,22 @@ func (r *Runner) evaluate(ctx context.Context, candidate *strategy.TwoMarketCros
 	if trigger != nil {
 		evaluation = evaluation.WithTrigger(*trigger)
 	}
-	opportunities, localTiming, err := candidate.EvaluateWithTiming(ctx, evaluation)
+	var (
+		opportunities []arbitrage.Opportunity
+		localTiming   strategy.EvaluationTiming
+	)
+	if refresh {
+		fresh, ok := candidate.(interface {
+			EvaluateFreshWithTiming(context.Context, arbitrage.Evaluation) ([]arbitrage.Opportunity, strategy.EvaluationTiming, error)
+		})
+		if !ok {
+			opportunities, localTiming, err = candidate.EvaluateWithTiming(ctx, evaluation)
+		} else {
+			opportunities, localTiming, err = fresh.EvaluateFreshWithTiming(ctx, evaluation)
+		}
+	} else {
+		opportunities, localTiming, err = candidate.EvaluateWithTiming(ctx, evaluation)
+	}
 	if err != nil {
 		return runtimeresearch.Report{}, err
 	}
@@ -535,9 +617,16 @@ func v3Inputs(configured configuration.ResolvedMarket, maximum market.AssetQuant
 		if err != nil {
 			return nil, nil, false, err
 		}
-		// The opposite-direction probe uses the same raw upper bound. It is a
-		// conservative coverage hint; exact sizing remains quote-driven.
-		baseProbe, err = market.NewTokenAmount(configured.Base.Token.ID, quoteProbe.Units())
+		// Raw units are not transferable between tokens with different
+		// decimals. Use one whole base token for the opposite-direction
+		// coverage guard; otherwise a quote-sized budget can become a
+		// sub-minimum-unit economic amount and fail bootstrap before feeds
+		// start.
+		oneBase, quantityErr := market.NewAssetQuantity(configured.Base.Token.Asset, big.NewRat(1, 1))
+		if quantityErr != nil {
+			return nil, nil, false, quantityErr
+		}
+		baseProbe, err = oneBase.ToTokenAmount(configured.Base.Token)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -560,7 +649,11 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 	seenTokens := map[market.TokenID]bool{}
 	pairID := market.PairID(r.config.SetupID + "/pair")
 	for _, configured := range r.config.Markets {
-		chainID := market.ChainID(configured.Venue.Chain)
+		chainName := configured.Chain
+		if chainName == "" {
+			chainName = configured.Venue.Chain
+		}
+		chainID := market.ChainID(chainName)
 		if !seenChains[chainID] {
 			chains = append(chains, market.Chain{ID: chainID})
 			seenChains[chainID] = true
@@ -578,6 +671,17 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 		}
 		pathID := market.PathID(string(configured.ID) + "/path")
 		hops := make([]market.Hop, 0, len(configured.Path))
+		if len(configured.Path) == 0 && configured.QuoteSource != "" {
+			venueID := market.VenueID(string(configured.ID) + "/" + configured.QuoteSource)
+			poolID := market.PoolID(string(configured.ID) + "/remote")
+			venues = append(venues, market.Venue{ID: venueID})
+			pools = append(pools, market.Pool{
+				ID: poolID, Venue: venueID, Chain: chainID,
+				Tokens:  []market.TokenID{configured.Base.Token.ID, configured.Quote.Token.ID},
+				Adapter: "remote-aggregator",
+			})
+			hops = append(hops, market.Hop{Pool: poolID, TokenIn: configured.Base.Token.ID, TokenOut: configured.Quote.Token.ID})
+		}
 		for index, configuredHop := range configured.Path {
 			for _, token := range []market.Token{configuredHop.In.Token, configuredHop.Out.Token} {
 				if seenTokens[token.ID] {
@@ -630,6 +734,26 @@ func adapterIDFor(kind string) string {
 }
 
 func (r *Runner) cost(ctx context.Context, blocks map[string]evm.BlockReference, at time.Time) (CostEvidence, arbitrage.CostSnapshot, error) {
+	if r.config.PriceSource.Base == r.config.PriceSource.Quote {
+		costAmount, err := market.NewAssetQuantity(r.config.PriceSource.Base, r.config.FixedCost)
+		if err != nil {
+			return CostEvidence{}, arbitrage.CostSnapshot{}, err
+		}
+		cost := arbitrage.CostSnapshot{ID: "fixed/parity", Amount: costAmount, CapturedAt: at}
+		return CostEvidence{
+			FixedAmount: new(big.Rat).Set(r.config.FixedCost), FixedAsset: r.config.PriceSource.Quote, Cost: costAmount,
+		}, cost, nil
+	}
+	if r.config.FixedCost.Sign() == 0 {
+		costAmount, err := market.NewAssetQuantity(r.config.PriceSource.Base, new(big.Rat))
+		if err != nil {
+			return CostEvidence{}, arbitrage.CostSnapshot{}, err
+		}
+		cost := arbitrage.CostSnapshot{ID: "fixed/zero", Amount: costAmount, CapturedAt: at}
+		return CostEvidence{
+			FixedAmount: new(big.Rat), FixedAsset: r.config.PriceSource.Quote, Cost: costAmount,
+		}, cost, nil
+	}
 	primaryConfig := r.config.PriceSource.Primary
 	apiKey := ""
 	apiHeader := ""

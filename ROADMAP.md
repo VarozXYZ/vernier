@@ -61,10 +61,21 @@ order-book shape remains future work.
 Model inventory, execution plans, latency, fills, and partial failures without
 signing or broadcasting transactions.
 
+Status: the prefunded parallel SagaPlan/Operation model, executable route
+allocations, idempotent reservations, simulated TxManagers, transition tests,
+and crash recovery contract are implemented.
+
 ## 6. Live and Shadow modes
 
 Introduce durable execution and recovery using test wallets first, then compare
 live decisions against Research without allowing Shadow mode to intervene.
+
+Status: the generic Live vertical now includes executable validation, in-memory
+signing, pre-broadcast SQLite WAL durability, EVM fanout, Helius Sender,
+WebSocket-first economic confirmation, RPC reconciliation, and a manual
+circuit breaker. The public command remains disarmed without an explicitly
+installed private setup composition. Private contract deployment, fork tests,
+test-wallet canary execution, and Shadow mode remain outstanding.
 
 No release is considered production-ready until its documented safety and
 recovery guarantees are implemented and tested.

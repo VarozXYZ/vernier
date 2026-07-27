@@ -24,6 +24,7 @@ type Source struct {
 	id         market.SourceID
 	market     market.Market
 	hops       []Hop
+	cache      bool
 	mu         sync.RWMutex
 	hopCache   map[hopKey]market.Quote
 	routeCache map[routeKey]routeCacheEntry
@@ -52,6 +53,17 @@ type routeCacheEntry struct {
 }
 
 func New(id market.SourceID, candidate market.Market, hops []Hop) (*Source, error) {
+	return newSource(id, candidate, hops, true)
+}
+
+// NewUncached creates a route source that recomputes every hop on every call.
+// It is intended for standalone measurement commands that need calculation
+// latency rather than the normal cached hot-path latency.
+func NewUncached(id market.SourceID, candidate market.Market, hops []Hop) (*Source, error) {
+	return newSource(id, candidate, hops, false)
+}
+
+func newSource(id market.SourceID, candidate market.Market, hops []Hop, cache bool) (*Source, error) {
 	if id == "" || candidate.ID == "" || len(hops) == 0 {
 		return nil, fmt.Errorf("route source, market, and hops are required")
 	}
@@ -71,7 +83,7 @@ func New(id market.SourceID, candidate market.Market, hops []Hop) (*Source, erro
 	if previous != candidate.QuoteToken {
 		return nil, fmt.Errorf("route final hop output does not match market quote token")
 	}
-	return &Source{id: id, market: candidate, hops: append([]Hop(nil), hops...), hopCache: make(map[hopKey]market.Quote), routeCache: make(map[routeKey]routeCacheEntry)}, nil
+	return &Source{id: id, market: candidate, hops: append([]Hop(nil), hops...), cache: cache, hopCache: make(map[hopKey]market.Quote), routeCache: make(map[routeKey]routeCacheEntry)}, nil
 }
 
 func (s *Source) ID() market.SourceID { return s.id }
@@ -112,9 +124,13 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 		return market.Quote{}, fmt.Errorf("route quote requires a snapshot bundle")
 	}
 	routeKey := routeKey{version: input.Snapshot.Metadata().Version, hash: input.Snapshot.Metadata().StateHash, in: input.TokenIn, out: input.TokenOut, amount: input.AmountIn.String(), mode: market.QuoteModeExactInput}
-	s.mu.RLock()
-	cached, found := s.routeCache[routeKey]
-	s.mu.RUnlock()
+	var cached routeCacheEntry
+	var found bool
+	if s.cache {
+		s.mu.RLock()
+		cached, found = s.routeCache[routeKey]
+		s.mu.RUnlock()
+	}
 	if found {
 		timing.Cached = true
 		timing.Hops = append([]quoteport.HopTiming(nil), cached.hops...)
@@ -136,14 +152,18 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 			return market.Quote{}, fmt.Errorf("route amount token mismatch at hop %d", index)
 		}
 		hopKey := hopKey{market: hop.Market, version: snapshot.Metadata().Version, hash: snapshot.Metadata().StateHash, in: hop.In, out: hop.Out, amount: current.String()}
-		s.mu.RLock()
-		result, cachedHop := s.hopCache[hopKey]
-		s.mu.RUnlock()
+		var result market.Quote
+		var cachedHop bool
+		if s.cache {
+			s.mu.RLock()
+			result, cachedHop = s.hopCache[hopKey]
+			s.mu.RUnlock()
+		}
 		var err error
 		hopStarted := time.Now()
 		if !cachedHop {
 			result, err = hop.Source.Quote(ctx, quoteport.Input{Snapshot: snapshot, TokenIn: hop.In, TokenOut: hop.Out, AmountIn: current, Purpose: input.Purpose, QuotedAt: input.QuotedAt})
-			if err == nil {
+			if err == nil && s.cache {
 				s.mu.Lock()
 				s.hopCache[hopKey] = result
 				s.mu.Unlock()
@@ -159,7 +179,7 @@ func (s *Source) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 		current = result.AmountOut
 	}
 	result, err := market.NewQuote(market.Quote{Source: s.id, Market: s.market.ID, SnapshotVersion: input.Snapshot.Metadata().Version, SnapshotHash: input.Snapshot.Metadata().StateHash, Purpose: input.Purpose, Mode: market.QuoteModeExactInput, AmountIn: input.AmountIn, AmountOut: current, QuotedAt: input.QuotedAt}, first.Fees()...)
-	if err == nil {
+	if err == nil && s.cache {
 		s.mu.Lock()
 		s.routeCache[routeKey] = routeCacheEntry{quote: result, hops: append([]quoteport.HopTiming(nil), timing.Hops...)}
 		s.mu.Unlock()
@@ -186,9 +206,13 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 		return market.Quote{}, fmt.Errorf("route quote requires a snapshot bundle")
 	}
 	routeKey := routeKey{version: input.Snapshot.Metadata().Version, hash: input.Snapshot.Metadata().StateHash, in: input.TokenIn, out: input.TokenOut, amount: input.AmountOut.String(), mode: market.QuoteModeExactOutput}
-	s.mu.RLock()
-	cached, found := s.routeCache[routeKey]
-	s.mu.RUnlock()
+	var cached routeCacheEntry
+	var found bool
+	if s.cache {
+		s.mu.RLock()
+		cached, found = s.routeCache[routeKey]
+		s.mu.RUnlock()
+	}
 	if found {
 		timing.Cached = true
 		timing.Hops = append([]quoteport.HopTiming(nil), cached.hops...)
@@ -211,14 +235,18 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 			return market.Quote{}, fmt.Errorf("route snapshot is missing hop %q", hop.Market)
 		}
 		hopKey := hopKey{market: hop.Market, version: snapshot.Metadata().Version, hash: snapshot.Metadata().StateHash, in: hop.In, out: hop.Out, amount: current.String()}
-		s.mu.RLock()
-		result, cachedHop := s.hopCache[hopKey]
-		s.mu.RUnlock()
+		var result market.Quote
+		var cachedHop bool
+		if s.cache {
+			s.mu.RLock()
+			result, cachedHop = s.hopCache[hopKey]
+			s.mu.RUnlock()
+		}
 		var err error
 		hopStarted := time.Now()
 		if !cachedHop {
 			result, err = source.QuoteExactOutput(ctx, quoteport.ExactOutputInput{Snapshot: snapshot, TokenIn: hop.In, TokenOut: hop.Out, AmountOut: current, Purpose: input.Purpose, QuotedAt: input.QuotedAt})
-			if err == nil {
+			if err == nil && s.cache {
 				s.mu.Lock()
 				s.hopCache[hopKey] = result
 				s.mu.Unlock()
@@ -234,7 +262,7 @@ func (s *Source) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 		current = result.AmountIn
 	}
 	result, err := market.NewQuote(market.Quote{Source: s.id, Market: s.market.ID, SnapshotVersion: input.Snapshot.Metadata().Version, SnapshotHash: input.Snapshot.Metadata().StateHash, Purpose: input.Purpose, Mode: market.QuoteModeExactOutput, AmountIn: current, AmountOut: input.AmountOut, QuotedAt: input.QuotedAt}, final.Fees()...)
-	if err == nil {
+	if err == nil && s.cache {
 		s.mu.Lock()
 		s.routeCache[routeKey] = routeCacheEntry{quote: result, hops: append([]quoteport.HopTiming(nil), timing.Hops...)}
 		s.mu.Unlock()

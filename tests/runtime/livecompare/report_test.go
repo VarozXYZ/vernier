@@ -33,10 +33,12 @@ func TestSummaryOutputOmitsRunMetadataAndCalculationCurve(t *testing.T) {
 	if strings.Contains(text.String(), "private-run") || strings.Contains(text.String(), "private-config") || strings.Contains(text.String(), "curve ") {
 		t.Fatalf("summary output leaked repeated/full fields: %s", text.String())
 	}
-	if !strings.Contains(text.String(), "evaluation: 4") {
-		t.Fatalf("summary output omitted evaluation number: %s", text.String())
+	for _, removed := range []string{"evaluation:", "status:", "external_reference_checks:", "parity_checks:"} {
+		if strings.Contains(text.String(), removed) {
+			t.Fatalf("summary output retained noisy field %q: %s", removed, text.String())
+		}
 	}
-	if !strings.Contains(text.String(), "direction_discovery samples=3") {
+	if !strings.Contains(text.String(), "Discovery    2.00 ms (3 samples, majority)") {
 		t.Fatalf("summary output omitted direction discovery: %s", text.String())
 	}
 
@@ -65,6 +67,197 @@ func TestFullOutputRemainsAvailableExplicitly(t *testing.T) {
 		if !strings.Contains(jsonl.String(), expected) {
 			t.Fatalf("full JSONL omitted %s: %s", expected, jsonl.String())
 		}
+	}
+}
+
+func TestSummaryOutputUsesReadableQuoteAmountsAndKeepsRawValuesInJSON(t *testing.T) {
+	input, err := market.ParseAssetQuantity("quote", "750")
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := market.ParseAssetQuantity("base", "14550")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputRaw := mustTokenAmount(t, "quote-token", "750000000")
+	outputRaw := mustTokenAmount(t, "base-token", "14550000000000")
+	report := livecompare.Report{Research: runtimeresearch.Report{
+		Status: runtimeresearch.StatusHealthy, Evaluations: 1,
+		LocalTiming: strategy.EvaluationTiming{
+			Duration: 20 * time.Millisecond,
+			Directions: []strategy.DirectionTiming{{
+				Direction: marketDirection("market-a", "market-b"),
+				Duration:  12 * time.Millisecond,
+				Quotes: []strategy.QuoteTiming{{
+					Market: "market-a", Source: "provider-a", Leg: "buy", Mode: market.QuoteModeExactInput,
+					Duration: 12 * time.Millisecond, AmountIn: inputRaw, AmountOut: outputRaw,
+					Input: input, Output: output,
+				}},
+			}},
+		},
+	}}
+	var text bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&text, report, livecompare.OutputOptions{Calculations: livecompare.CalculationSummary}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"ROUND TRIPS (parallel; buy -> sell within each route)",
+		"ROUTE 1: market-a -> market-b",
+		"BUY   provider-a  market-a  750 QUOTE  ->  14,550 BASE  [12.00 ms]",
+		"Route time  12.00 ms",
+		"TOTAL          20.00 ms",
+	} {
+		if !strings.Contains(text.String(), expected) {
+			t.Fatalf("summary output omitted %q: %s", expected, text.String())
+		}
+	}
+	for _, raw := range []string{"750000000", "14550000000000"} {
+		if strings.Contains(text.String(), raw) {
+			t.Fatalf("summary output exposed raw amount %q: %s", raw, text.String())
+		}
+	}
+	var jsonl bytes.Buffer
+	if err := livecompare.WriteJSONLineWithOptions(&jsonl, report, livecompare.OutputOptions{Calculations: livecompare.CalculationSummary}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`"provider":"provider-a"`, `"input":"750"`, `"input_raw":"750000000"`,
+		`"output":"14550"`, `"output_raw":"14550000000000"`, `"latency":"12ms"`,
+	} {
+		if !strings.Contains(jsonl.String(), expected) {
+			t.Fatalf("summary JSON omitted %s: %s", expected, jsonl.String())
+		}
+	}
+}
+
+func TestSummaryOutputLinksTransactionTriggerAndOmitsUncalculatedDirection(t *testing.T) {
+	report := livecompare.Report{Research: runtimeresearch.Report{
+		LocalTiming: strategy.EvaluationTiming{Duration: 25 * time.Millisecond},
+		Opportunities: []arbitrage.Opportunity{{
+			Direction:     marketDirection("not-calculated", "other"),
+			SelectedIndex: -1,
+			HasTrigger:    true,
+			Trigger: arbitrage.TriggerMetadata{
+				Market: "market-polygon", Source: "polygon/pool-activity/0",
+				Reference: market.SourceReference{Kind: "evm_transaction_hash", Value: "0xabc123"},
+				At:        time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+			},
+		}},
+	}}
+	var text bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&text, report, livecompare.OutputOptions{
+		Calculations: livecompare.CalculationSummary, OmitCost: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"TRIGGER: EVM TRANSACTION | 2026-07-27 12:00:00.000 UTC",
+		"Market       Polygon",
+		"Watcher      polygon/pool-activity/0",
+		"Transaction  0xabc123",
+		"Explorer     https://polygonscan.com/tx/0xabc123",
+		"TOTAL          25.00 ms",
+	} {
+		if !strings.Contains(text.String(), expected) {
+			t.Fatalf("summary output omitted %q: %s", expected, text.String())
+		}
+	}
+	if strings.Contains(text.String(), "not-calculated->other") || strings.Contains(text.String(), "opportunity:") {
+		t.Fatalf("summary output retained the uncalculated leg: %s", text.String())
+	}
+}
+
+func TestSummaryCostCanBeEmittedOncePerStream(t *testing.T) {
+	report := fullReport(t)
+	var first bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&first, report, livecompare.OutputOptions{
+		Calculations: livecompare.CalculationSummary,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(first.String(), "Fixed cost   1 USD") || strings.Contains(first.String(), "not_required") {
+		t.Fatalf("first report has unexpected cost output: %s", first.String())
+	}
+	var repeated bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&repeated, report, livecompare.OutputOptions{
+		Calculations: livecompare.CalculationSummary, OmitCost: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(repeated.String(), "Fixed cost") {
+		t.Fatalf("repeated report included invariant cost: %s", repeated.String())
+	}
+}
+
+func TestSummaryOutputDoesNotPresentBootstrapAsTransaction(t *testing.T) {
+	report := livecompare.Report{Research: runtimeresearch.Report{
+		LocalTiming: strategy.EvaluationTiming{Duration: 10 * time.Millisecond},
+		Opportunities: []arbitrage.Opportunity{{
+			SelectedIndex: -1,
+			HasTrigger:    true,
+			Trigger: arbitrage.TriggerMetadata{
+				Market: "synthetic_solana", Source: "jupiter_solana/events",
+				Reference: market.SourceReference{Kind: "solana_signature", Value: "bootstrap"},
+				At:        time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+			},
+		}},
+	}}
+	var text bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&text, report, livecompare.OutputOptions{
+		Calculations: livecompare.CalculationSummary, OmitCost: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"TRIGGER: BOOTSTRAP | 2026-07-27 12:00:00.000 UTC",
+		"Market       Solana",
+		"Watcher      jupiter_solana/events",
+	} {
+		if !strings.Contains(text.String(), expected) {
+			t.Fatalf("bootstrap summary omitted %q: %s", expected, text.String())
+		}
+	}
+	if strings.Contains(text.String(), "Transaction") || strings.Contains(text.String(), "Explorer") {
+		t.Fatalf("bootstrap summary was presented as a transaction: %s", text.String())
+	}
+}
+
+func TestSummaryOutputMarksTheSelectedRoundTripRatherThanTheLargestBuy(t *testing.T) {
+	gross, err := market.ParseAssetQuantity("quote", "3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	net, err := market.ParseAssetQuantity("quote", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := livecompare.Report{Research: runtimeresearch.Report{
+		LocalTiming: strategy.EvaluationTiming{
+			Duration: 30 * time.Millisecond,
+			Directions: []strategy.DirectionTiming{
+				{Direction: marketDirection("market-a", "market-b"), Duration: 20 * time.Millisecond},
+				{Direction: marketDirection("market-b", "market-a"), Duration: 25 * time.Millisecond},
+			},
+		},
+		Opportunities: []arbitrage.Opportunity{
+			{Direction: marketDirection("market-a", "market-b"), SelectedIndex: -1},
+			{
+				Direction: marketDirection("market-b", "market-a"), SelectedIndex: 0,
+				Classification: arbitrage.ClassificationPolicyQualified,
+				Candidates:     []arbitrage.Candidate{{GrossPnL: gross, NetPnL: net}},
+			},
+		},
+	}}
+	var text bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&text, report, livecompare.OutputOptions{
+		Calculations: livecompare.CalculationSummary, OmitCost: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "ROUTE 2: market-b -> market-a  [SELECTED]") ||
+		strings.Count(text.String(), "[SELECTED]") != 1 ||
+		!strings.Contains(text.String(), "RESULT (market-b -> market-a)") {
+		t.Fatalf("summary did not identify the selected complete route: %s", text.String())
 	}
 }
 
@@ -100,6 +293,33 @@ func TestFullOutputIncludesQuoteErrors(t *testing.T) {
 	}
 	if !strings.Contains(jsonl.String(), `"error":"route quote hop 0: incompatible snapshot"`) {
 		t.Fatalf("full JSON omitted quote error: %s", jsonl.String())
+	}
+}
+
+func TestZeroCostOutputDoesNotRequirePriceEvidence(t *testing.T) {
+	zero, err := market.NewAssetQuantity("quote", new(big.Rat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := livecompare.Report{
+		Research: runtimeresearch.Report{Status: runtimeresearch.StatusHealthy, Evaluations: 1},
+		Cost: livecompare.CostEvidence{
+			FixedAmount: new(big.Rat), FixedAsset: "usd", Cost: zero,
+		},
+	}
+	var text bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&text, report, livecompare.OutputOptions{Calculations: livecompare.CalculationFull}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "price: not_required") || strings.Contains(text.String(), "price_source:") {
+		t.Fatalf("zero-cost report implied a price lookup: %s", text.String())
+	}
+	var jsonl bytes.Buffer
+	if err := livecompare.WriteJSONLineWithOptions(&jsonl, report, livecompare.OutputOptions{Calculations: livecompare.CalculationFull}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jsonl.String(), `"price_required":false`) || !strings.Contains(jsonl.String(), `"price_source":"not_required"`) {
+		t.Fatalf("zero-cost JSON did not describe skipped conversion: %s", jsonl.String())
 	}
 }
 

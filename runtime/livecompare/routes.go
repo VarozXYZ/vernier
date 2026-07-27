@@ -42,7 +42,7 @@ type routeRuntime struct {
 
 func (r *Runner) requiresRouteRuntime() bool {
 	for _, configured := range r.config.Markets {
-		if len(configured.Path) != 1 || r.config.Chains[configured.Venue.Chain].Kind == "solana" {
+		if configured.QuoteSource != "" || len(configured.Path) != 1 || r.config.Chains[configured.Venue.Chain].Kind == "solana" {
 			return true
 		}
 	}
@@ -50,6 +50,9 @@ func (r *Runner) requiresRouteRuntime() bool {
 }
 
 func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
+	if r.hasEventRefreshedMarket() {
+		return Report{}, fmt.Errorf("event-refreshed quote markets require continuous stream mode")
+	}
 	startedAt := r.clock().UTC()
 	r.logger.Info("route research started", "run", r.config.RunID, "markets", len(r.config.Markets))
 	blocks, err := r.currentBlocks(ctx)

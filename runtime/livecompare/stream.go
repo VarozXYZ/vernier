@@ -54,6 +54,9 @@ type streamSignal struct {
 // It never asks a venue for a quote in the event loop and it does not infer
 // gaps from block numbers. Feed reconnects own the full bootstrap lifecycle.
 func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
+	if r.allRemoteMarkets() {
+		return r.runRemoteAggregatorStream(ctx, options)
+	}
 	if r.requiresRouteRuntime() {
 		return r.runRouteStream(ctx, options)
 	}
@@ -208,7 +211,7 @@ func (r *Runner) RunStream(ctx context.Context, options StreamOptions) error {
 			report := Report{Research: research, Cost: costEvidence}
 			if tracker != nil {
 				for _, opportunity := range research.Opportunities {
-					if err := tracker.Observe(runCtx, opportunity); err != nil {
+					if _, err := tracker.Observe(runCtx, opportunity); err != nil {
 						return fmt.Errorf("persist opportunity window: %w", err)
 					}
 				}

@@ -99,7 +99,7 @@ func (q *Quoter) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	denominator := new(big.Int).Add(new(big.Int).Mul(reserveIn, big.NewInt(basisPoints)), amountInWithFee)
 	amountOutUnits := new(big.Int).Quo(numerator, denominator)
 	if amountOutUnits.Sign() <= 0 {
-		return market.Quote{}, fmt.Errorf("quote output rounds to zero")
+		return market.Quote{}, market.ErrQuoteOutputRoundsToZero
 	}
 	amountOut, err := market.NewTokenAmount(input.TokenOut, amountOutUnits)
 	if err != nil {

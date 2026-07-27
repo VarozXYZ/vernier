@@ -298,6 +298,75 @@ func TestLogsSubscriptionUsesMentionFilterAndPublishesSlot(t *testing.T) {
 	}
 }
 
+func TestTransactionSubscriptionUsesConfirmedFullDetails(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var request map[string]any
+		if err := conn.ReadJSON(&request); err != nil {
+			return
+		}
+		if request["method"] != "transactionSubscribe" {
+			t.Errorf("method = %#v", request["method"])
+			return
+		}
+		params, ok := request["params"].([]any)
+		if !ok || len(params) != 2 {
+			t.Errorf("params = %#v", request["params"])
+			return
+		}
+		filter := params[0].(map[string]any)
+		options := params[1].(map[string]any)
+		if filter["accountInclude"].([]any)[0] != "wallet" ||
+			options["commitment"] != "confirmed" ||
+			options["transactionDetails"] != "full" {
+			t.Errorf("unexpected transaction subscription: %#v", params)
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": request["id"], "result": 9})
+		_ = conn.WriteJSON(map[string]any{
+			"jsonrpc": "2.0", "method": "transactionNotification",
+			"params": map[string]any{"result": map[string]any{
+				"signature": "signature", "slot": 55,
+				"transaction": map[string]any{
+					"transaction": map[string]any{"signatures": []string{"signature"}},
+					"meta":        map[string]any{"err": nil},
+				},
+			}},
+		})
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	network, err := solana.NewReadOnlyNetwork(
+		"solana", "test", "http://127.0.0.1:1", websocketURL(server.URL), server.Client(), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription, err := network.SubscribeTransactions(context.Background(), "wallet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Unsubscribe()
+	select {
+	case notification := <-subscription.Notifications():
+		if notification.Signature != "signature" || notification.Slot != 55 ||
+			len(notification.Meta) == 0 {
+			t.Fatalf("notification = %+v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for transaction notification")
+	}
+}
+
 func TestAccountSubscriptionPublishesAccountDataAndSlot(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

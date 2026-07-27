@@ -52,13 +52,23 @@ func TestConfiguredNetworkValidatesIdentityAndUsesNarrowLogQueries(t *testing.T)
 		t.Fatal(err)
 	}
 	address := common.HexToAddress("0x1000000000000000000000000000000000000001")
-	filter := evm.LogFilter{Address: address, Topics: []common.Hash{common.HexToHash("0x01"), common.HexToHash("0x02")}}
+	poolID := common.HexToHash("0x03")
+	filter := evm.LogFilter{
+		Address:       address,
+		Topics:        []common.Hash{common.HexToHash("0x01"), common.HexToHash("0x02")},
+		IndexedTopics: [][]common.Hash{{poolID}},
+	}
 	subscription, err := network.SubscribeLogs(context.Background(), filter, make(chan types.Log))
 	if err != nil {
 		t.Fatal(err)
 	}
 	subscription.Unsubscribe()
-	if len(wsClient.query.Addresses) != 1 || wsClient.query.Addresses[0] != address || len(wsClient.query.Topics[0]) != 2 {
+	if len(wsClient.query.Addresses) != 1 ||
+		wsClient.query.Addresses[0] != address ||
+		len(wsClient.query.Topics) != 2 ||
+		len(wsClient.query.Topics[0]) != 2 ||
+		len(wsClient.query.Topics[1]) != 1 ||
+		wsClient.query.Topics[1][0] != poolID {
 		t.Fatalf("unexpected subscription query: %+v", wsClient.query)
 	}
 	block := evm.BlockReference{Number: 42, Hash: common.HexToHash("0x42")}

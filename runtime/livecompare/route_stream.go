@@ -16,6 +16,9 @@ import (
 )
 
 func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) error {
+	if r.hasEventRefreshedMarket() {
+		return r.runEventRefreshedStream(ctx, options)
+	}
 	if options.Updates < 0 {
 		return fmt.Errorf("stream updates cannot be negative")
 	}
@@ -142,7 +145,7 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 			report := Report{Research: research, Cost: costEvidence}
 			if tracker != nil {
 				for _, opportunity := range research.Opportunities {
-					if err := tracker.Observe(runCtx, opportunity); err != nil {
+					if _, err := tracker.Observe(runCtx, opportunity); err != nil {
 						return err
 					}
 				}

@@ -54,14 +54,14 @@ func TestWindowTrackerOpensImprovesAndClosesWithoutPersistingNonProfitableEvalua
 		t.Fatalf("finalize calls: got %d", store.finalized)
 	}
 	base := opportunity(t, arbitrage.ClassificationEconomic, 10, time.Second)
-	if err := tracker.Observe(context.Background(), base); err != nil {
+	if _, err := tracker.Observe(context.Background(), base); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.opened) != 1 || len(tracker.ActiveWindows()) != 1 {
 		t.Fatalf("window was not opened: opened=%d active=%d", len(store.opened), len(tracker.ActiveWindows()))
 	}
 	qualified := opportunity(t, arbitrage.ClassificationPolicyQualified, 20, 2*time.Second)
-	if err := tracker.Observe(context.Background(), qualified); err != nil {
+	if _, err := tracker.Observe(context.Background(), qualified); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.observations) != 1 || !store.observations[0].Best {
@@ -74,7 +74,7 @@ func TestWindowTrackerOpensImprovesAndClosesWithoutPersistingNonProfitableEvalua
 		t.Fatalf("improved best not retained: %s", tracker.ActiveWindows()[0].Best.NetPnL.String())
 	}
 	nonProfitable := opportunity(t, arbitrage.ClassificationObservedSpread, 0, 3*time.Second)
-	if err := tracker.Observe(context.Background(), nonProfitable); err != nil {
+	if _, err := tracker.Observe(context.Background(), nonProfitable); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.closed) != 1 || store.closed[0].Reason != "profitability_lost" || len(tracker.ActiveWindows()) != 0 {
@@ -89,16 +89,46 @@ func TestWindowTrackerMarksWebSocketDegradationAsFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tracker.Observe(context.Background(), opportunity(t, arbitrage.ClassificationEconomic, 10, time.Second)); err != nil {
+	if _, err := tracker.Observe(context.Background(), opportunity(t, arbitrage.ClassificationEconomic, 10, time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	degraded := opportunity(t, arbitrage.ClassificationUnclassifiable, 0, 2*time.Second)
 	degraded.Reasons = []string{"degraded_market_snapshot"}
-	if err := tracker.Observe(context.Background(), degraded); err != nil {
+	if _, err := tracker.Observe(context.Background(), degraded); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.failed) != 1 || store.failed[0].Reason != "websocket_disconnected" || len(store.closed) != 0 {
 		t.Fatalf("degraded window was not failed: failed=%+v closed=%+v", store.failed, store.closed)
+	}
+}
+
+func TestWindowTrackerPolicyQualificationReturnsDurableTransitions(t *testing.T) {
+	clock := func() time.Time { return time.Date(2026, 7, 27, 10, 0, 10, 0, time.UTC) }
+	store := &windowStore{}
+	tracker, err := coreresearch.NewWindowTrackerWithQualification(store, clock, "policy_qualified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, err := tracker.Observe(context.Background(), opportunity(t, arbitrage.ClassificationEconomic, 10, time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transition.Kind != coreresearch.WindowTransitionNone || len(store.opened) != 0 {
+		t.Fatalf("below-policy opportunity opened a window: %+v", transition)
+	}
+	transition, err = tracker.Observe(context.Background(), opportunity(t, arbitrage.ClassificationPolicyQualified, 20, 2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transition.Kind != coreresearch.WindowTransitionOpened || transition.Window.ID == "" || len(store.opened) != 1 {
+		t.Fatalf("qualified opening transition was not returned after persistence: %+v", transition)
+	}
+	transition, err = tracker.Observe(context.Background(), opportunity(t, arbitrage.ClassificationEconomic, 10, 3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transition.Kind != coreresearch.WindowTransitionClosed || len(store.closed) != 1 {
+		t.Fatalf("falling below policy did not close the window: %+v", transition)
 	}
 }
 
@@ -119,6 +149,7 @@ func opportunity(t *testing.T, classification arbitrage.Classification, net int,
 		Evaluation: arbitrage.EvaluationID("evaluation-" + classificationSuffix(classification)), Run: "run-1", Strategy: "strategy-1", ConfigHash: "hash-1",
 		Direction: arbitrage.Direction{BuyMarket: "robinhood", SellMarket: "base"}, Classification: classification, SelectedIndex: 0,
 		Candidates:  []arbitrage.Candidate{{Size: amount, GrossPnL: gross, NetPnL: netQuantity, Cost: arbitrage.CostSnapshot{ID: "cost", Amount: marketQuantity(t, "WETH", "0.1"), CapturedAt: base}}},
+		Threshold:   marketQuantity(t, "WETH", "0.1"),
 		TriggeredAt: base, StartedAt: base, FinishedAt: base,
 	}
 }

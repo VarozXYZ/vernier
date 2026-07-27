@@ -32,6 +32,41 @@ type Source interface {
 	Quote(context.Context, Input) (market.Quote, error)
 }
 
+// OperationalWarning reports a non-fatal provider anomaly observed while
+// producing an otherwise usable quote. It never changes quote economics.
+type OperationalWarning struct {
+	Code       string
+	Provider   market.SourceID
+	Market     market.MarketID
+	Expected   string
+	Observed   string
+	Details    map[string]string
+	ObservedAt time.Time
+}
+
+// WarningSource exposes and clears provider anomalies accumulated by a quote
+// source. Implementations must be safe when Quote is called concurrently.
+type WarningSource interface {
+	Source
+	TakeOperationalWarnings() []OperationalWarning
+}
+
+// FreshSource is implemented by remote sources that can bypass their normal
+// event-generation cache. Research uses it only to confirm an apparently
+// profitable result before accepting it.
+type FreshSource interface {
+	Source
+	QuoteFresh(context.Context, Input) (market.Quote, error)
+}
+
+// CachePolicy lets a source opt out of the strategy quote cache. Remote
+// providers whose contract requires a real request for every invocation use
+// this capability; local deterministic sources remain cacheable by default.
+type CachePolicy interface {
+	Source
+	CacheQuotes() bool
+}
+
 // HopTiming is optional observability for composed sources. It is not part of
 // the economic quote and is therefore safe to omit for single-pool sources.
 type HopTiming struct {

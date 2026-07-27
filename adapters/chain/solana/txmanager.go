@@ -1,0 +1,461 @@
+package solana
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	solanago "github.com/gagliardetto/solana-go"
+
+	"github.com/VarozXYZ/vernier/domain/execution"
+	"github.com/VarozXYZ/vernier/domain/market"
+	chainport "github.com/VarozXYZ/vernier/ports/chain"
+	executionport "github.com/VarozXYZ/vernier/ports/execution"
+)
+
+type ReconciliationRPC interface {
+	ReadSignatureStatus(context.Context, string) (SignatureStatus, error)
+	ReadTransaction(context.Context, string) (Transaction, error)
+	CurrentBlockHeight(context.Context) (uint64, error)
+	IsBlockhashValid(context.Context, string) (bool, error)
+}
+
+type TxManagerConfig struct {
+	Chain             market.ChainID
+	Account           execution.AccountID
+	PrivateKey        solanago.PrivateKey
+	SenderEndpoint    string
+	PingEndpoint      string
+	ComputeUnitLimit  uint32
+	Client            *http.Client
+	Reconciliation    ReconciliationRPC
+	Clock             func() time.Time
+	WarmInterval      time.Duration
+	SettlementDecoder TransactionSettlementDecoder
+}
+
+type TxManager struct {
+	chain             market.ChainID
+	account           execution.AccountID
+	privateKey        solanago.PrivateKey
+	senderEndpoint    string
+	pingEndpoint      string
+	computeLimit      uint32
+	client            *http.Client
+	reconciliation    ReconciliationRPC
+	clock             func() time.Time
+	warmInterval      time.Duration
+	settlementDecoder TransactionSettlementDecoder
+	requestID         atomic.Uint64
+	warmOnce          sync.Once
+}
+
+func NewTxManager(config TxManagerConfig) (*TxManager, error) {
+	if config.Chain == "" || config.Account == "" || len(config.PrivateKey) == 0 ||
+		strings.TrimSpace(config.SenderEndpoint) == "" || config.Reconciliation == nil || config.Clock == nil {
+		return nil, fmt.Errorf("solana TxManager requires chain, account, signer, Sender, reconciliation, and clock")
+	}
+	endpoint, err := url.Parse(config.SenderEndpoint)
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+		return nil, fmt.Errorf("invalid Helius Sender endpoint")
+	}
+	if config.PingEndpoint == "" {
+		ping := *endpoint
+		ping.Path = "/ping"
+		ping.RawQuery = endpoint.RawQuery
+		config.PingEndpoint = ping.String()
+	}
+	ping, err := url.Parse(config.PingEndpoint)
+	if err != nil || ping.Scheme == "" || ping.Host == "" {
+		return nil, fmt.Errorf("invalid Helius Sender ping endpoint")
+	}
+	if config.ComputeUnitLimit == 0 {
+		config.ComputeUnitLimit = 1_400_000
+	}
+	if config.Client == nil {
+		config.Client = &http.Client{Timeout: 5 * time.Second}
+	}
+	if config.WarmInterval == 0 {
+		config.WarmInterval = 5 * time.Second
+	}
+	if config.WarmInterval < time.Second {
+		return nil, fmt.Errorf("helius Sender warm interval must be at least one second")
+	}
+	return &TxManager{
+		chain: config.Chain, account: config.Account, privateKey: append(solanago.PrivateKey(nil), config.PrivateKey...),
+		senderEndpoint: endpoint.String(), pingEndpoint: ping.String(), computeLimit: config.ComputeUnitLimit,
+		client: config.Client, reconciliation: config.Reconciliation, clock: config.Clock,
+		warmInterval: config.WarmInterval, settlementDecoder: config.SettlementDecoder,
+	}, nil
+}
+
+func (m *TxManager) Account() execution.AccountID { return m.account }
+
+func (m *TxManager) Warm(ctx context.Context) error {
+	if err := m.ping(ctx); err != nil {
+		return err
+	}
+	m.warmOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(m.warmInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					pingCtx, cancel := context.WithTimeout(ctx, time.Second)
+					_ = m.ping(pingCtx)
+					cancel()
+				}
+			}
+		}()
+	})
+	return nil
+}
+
+func (m *TxManager) ping(ctx context.Context) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.pingEndpoint, nil)
+	if err != nil {
+		return err
+	}
+	response, err := m.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("warm Helius Sender connection: %w", err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("warm Helius Sender connection: HTTP %s", response.Status)
+	}
+	return nil
+}
+
+func (m *TxManager) Prepare(_ context.Context, artifact executionport.Artifact) (chainport.PreparedTransaction, error) {
+	if artifact.Leg.Account != m.account || artifact.Leg.Chain != m.chain ||
+		artifact.Metadata["kind"] != "jupiter_build_v2" {
+		return chainport.PreparedTransaction{}, fmt.Errorf("solana artifact targets another TxManager or is not Jupiter build v2")
+	}
+	raw, signature, blockhash, err := assembleJupiterBuild(artifact.Payload, m.privateKey, m.computeLimit)
+	if err != nil {
+		return chainport.PreparedTransaction{}, err
+	}
+	if artifact.Blockhash != "" && artifact.Blockhash != blockhash {
+		// BuildSource may retain a hexadecimal representation for byte-array
+		// responses. The assembler's base58 value is canonical for RPC.
+		artifact.Blockhash = blockhash
+	}
+	return chainport.PreparedTransaction{
+		Leg: artifact.Leg,
+		Identity: execution.TransactionIdentity{
+			Chain: m.chain, Account: m.account, Hash: signature, Blockhash: blockhash,
+			LastValidBlockHeight: artifact.LastValidBlockHeight,
+		},
+		SignedPayload: raw, PreparedAt: m.clock().UTC(),
+	}, nil
+}
+
+func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTransaction) (chainport.BroadcastResult, error) {
+	if prepared.Leg.Account != m.account || len(prepared.SignedPayload) == 0 {
+		return chainport.BroadcastResult{}, fmt.Errorf("solana prepared transaction is invalid")
+	}
+	payload := struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      uint64 `json:"id"`
+		Method  string `json:"method"`
+		Params  []any  `json:"params"`
+	}{
+		JSONRPC: "2.0", ID: m.requestID.Add(1), Method: "sendTransaction",
+		Params: []any{
+			base64.StdEncoding.EncodeToString(prepared.SignedPayload),
+			map[string]any{"encoding": "base64", "skipPreflight": true, "maxRetries": 0},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return chainport.BroadcastResult{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, m.senderEndpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return chainport.BroadcastResult{}, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := m.client.Do(request)
+	if err != nil {
+		return chainport.BroadcastResult{
+			Identity: prepared.Identity, Disposition: chainport.BroadcastPossible, Attempts: 1,
+		}, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return chainport.BroadcastResult{
+			Identity: prepared.Identity, Disposition: chainport.BroadcastPossible, Attempts: 1,
+		}, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		disposition := chainport.BroadcastRejected
+		if response.StatusCode >= 500 {
+			disposition = chainport.BroadcastPossible
+		}
+		return chainport.BroadcastResult{
+			Identity: prepared.Identity, Disposition: disposition, Attempts: 1,
+		}, fmt.Errorf("helius Sender HTTP %s", response.Status)
+	}
+	var envelope struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(responseBody, &envelope); err != nil {
+		return chainport.BroadcastResult{
+			Identity: prepared.Identity, Disposition: chainport.BroadcastPossible, Attempts: 1,
+		}, err
+	}
+	if envelope.Error != nil {
+		return chainport.BroadcastResult{
+				Identity: prepared.Identity, Disposition: chainport.BroadcastRejected, Attempts: 1,
+			},
+			fmt.Errorf("helius Sender RPC %d: %s", envelope.Error.Code, envelope.Error.Message)
+	}
+	if envelope.Result == "" || envelope.Result != prepared.Identity.Hash {
+		return chainport.BroadcastResult{
+			Identity: prepared.Identity, Disposition: chainport.BroadcastPossible, Attempts: 1,
+		}, fmt.Errorf("helius Sender returned an unexpected signature")
+	}
+	endpoint, _ := url.Parse(m.senderEndpoint)
+	return chainport.BroadcastResult{
+		Identity: prepared.Identity, Disposition: chainport.BroadcastAccepted,
+		Accepted: true, Endpoint: endpoint.Host,
+		Attempts: 1, AcceptedAt: m.clock().UTC(),
+	}, nil
+}
+
+func (m *TxManager) Reconcile(ctx context.Context, step execution.OperationStep) (execution.Settlement, error) {
+	identity := step.Identity
+	if identity.Chain != m.chain || identity.Account != m.account || identity.Hash == "" {
+		return execution.Settlement{}, fmt.Errorf("solana reconciliation identity is invalid")
+	}
+	status, err := m.reconciliation.ReadSignatureStatus(ctx, identity.Hash)
+	if err != nil {
+		return execution.Settlement{}, err
+	}
+	if status.Found {
+		state := execution.StateConfirmedSuccess
+		if hasSolanaError(status.Err) {
+			state = execution.StateConfirmedRevert
+		} else if status.ConfirmationStatus != "confirmed" && status.ConfirmationStatus != "finalized" {
+			state = execution.StateOutcomeUnknown
+		}
+		if state == execution.StateConfirmedSuccess && m.settlementDecoder != nil {
+			transaction, transactionErr := m.reconciliation.ReadTransaction(ctx, identity.Hash)
+			if transactionErr != nil {
+				return execution.Settlement{}, transactionErr
+			}
+			settlement, decodeErr := m.settlementDecoder.DecodeTransaction(step, transaction)
+			if decodeErr != nil {
+				return execution.Settlement{}, decodeErr
+			}
+			settlement.Identity = identity
+			if settlement.ObservedAt.IsZero() {
+				settlement.ObservedAt = m.clock().UTC()
+			}
+			return settlement, nil
+		}
+		return execution.Settlement{
+			Identity: identity, Technical: state, Economic: execution.EconomicReserved,
+			ObservedAt: m.clock().UTC(), Evidence: "solana_signature_status",
+		}, nil
+	}
+	if identity.Blockhash != "" {
+		valid, validErr := m.reconciliation.IsBlockhashValid(ctx, identity.Blockhash)
+		if validErr != nil {
+			return execution.Settlement{}, validErr
+		}
+		height, heightErr := m.reconciliation.CurrentBlockHeight(ctx)
+		if heightErr != nil {
+			return execution.Settlement{}, heightErr
+		}
+		if !valid && identity.LastValidBlockHeight > 0 && height > identity.LastValidBlockHeight {
+			return execution.Settlement{
+				Identity: identity, Technical: execution.StateBroadcastRejected,
+				Economic: execution.EconomicReserved, ObservedAt: m.clock().UTC(),
+				Evidence: "blockhash_expired_without_signature",
+			}, nil
+		}
+	}
+	return execution.Settlement{
+		Identity: identity, Technical: execution.StateOutcomeUnknown,
+		Economic: execution.EconomicReserved, ObservedAt: m.clock().UTC(), Evidence: "signature_not_found",
+	}, nil
+}
+
+func hasSolanaError(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null"
+}
+
+type buildTransactionResponse struct {
+	ComputeBudgetInstructions []wireInstruction   `json:"computeBudgetInstructions"`
+	SetupInstructions         []wireInstruction   `json:"setupInstructions"`
+	SwapInstruction           wireInstruction     `json:"swapInstruction"`
+	CleanupInstruction        *wireInstruction    `json:"cleanupInstruction"`
+	OtherInstructions         []wireInstruction   `json:"otherInstructions"`
+	TipInstruction            *wireInstruction    `json:"tipInstruction"`
+	Addresses                 map[string][]string `json:"addressesByLookupTableAddress"`
+	Blockhash                 struct {
+		Value                []byte `json:"blockhash"`
+		LastValidBlockHeight uint64 `json:"lastValidBlockHeight"`
+	} `json:"blockhashWithMetadata"`
+}
+
+type wireInstruction struct {
+	ProgramID string `json:"programId"`
+	Accounts  []struct {
+		Pubkey     string `json:"pubkey"`
+		IsWritable bool   `json:"isWritable"`
+		IsSigner   bool   `json:"isSigner"`
+	} `json:"accounts"`
+	Data string `json:"data"`
+}
+
+func assembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, computeLimit uint32) ([]byte, string, string, error) {
+	var build buildTransactionResponse
+	if err := json.Unmarshal(payload, &build); err != nil {
+		return nil, "", "", fmt.Errorf("decode Jupiter build artifact: %w", err)
+	}
+	if len(build.Blockhash.Value) != 32 || build.SwapInstruction.ProgramID == "" {
+		return nil, "", "", fmt.Errorf("jupiter build artifact has invalid blockhash or swap instruction")
+	}
+	instructions := make([]solanago.Instruction, 0,
+		2+len(build.ComputeBudgetInstructions)+len(build.SetupInstructions)+len(build.OtherInstructions))
+	limitData := make([]byte, 5)
+	limitData[0] = 2
+	binary.LittleEndian.PutUint32(limitData[1:], computeLimit)
+	instructions = append(instructions, solanago.NewInstruction(
+		solanago.MustPublicKeyFromBase58("ComputeBudget111111111111111111111111111111"),
+		nil, limitData,
+	))
+	appendWire := func(candidate wireInstruction) error {
+		instruction, err := decodeWireInstruction(candidate)
+		if err != nil {
+			return err
+		}
+		instructions = append(instructions, instruction)
+		return nil
+	}
+	for _, instruction := range build.ComputeBudgetInstructions {
+		if isSetComputeUnitLimit(instruction) {
+			continue
+		}
+		if err := appendWire(instruction); err != nil {
+			return nil, "", "", err
+		}
+	}
+	for _, instruction := range build.SetupInstructions {
+		if err := appendWire(instruction); err != nil {
+			return nil, "", "", err
+		}
+	}
+	if err := appendWire(build.SwapInstruction); err != nil {
+		return nil, "", "", err
+	}
+	if build.CleanupInstruction != nil {
+		if err := appendWire(*build.CleanupInstruction); err != nil {
+			return nil, "", "", err
+		}
+	}
+	for _, instruction := range build.OtherInstructions {
+		if err := appendWire(instruction); err != nil {
+			return nil, "", "", err
+		}
+	}
+	if build.TipInstruction == nil {
+		return nil, "", "", errors.New("jupiter build artifact has no Sender tip instruction")
+	}
+	if err := appendWire(*build.TipInstruction); err != nil {
+		return nil, "", "", err
+	}
+	tables := make(map[solanago.PublicKey]solanago.PublicKeySlice, len(build.Addresses))
+	for tableText, addressTexts := range build.Addresses {
+		table, err := solanago.PublicKeyFromBase58(tableText)
+		if err != nil {
+			return nil, "", "", err
+		}
+		addresses := make(solanago.PublicKeySlice, len(addressTexts))
+		for index, addressText := range addressTexts {
+			addresses[index], err = solanago.PublicKeyFromBase58(addressText)
+			if err != nil {
+				return nil, "", "", err
+			}
+		}
+		tables[table] = addresses
+	}
+	hash := solanago.HashFromBytes(build.Blockhash.Value)
+	transaction, err := solanago.NewTransaction(
+		instructions, hash, solanago.TransactionPayer(privateKey.PublicKey()),
+		solanago.TransactionAddressTables(tables),
+	)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("compile Jupiter v0 transaction: %w", err)
+	}
+	if _, err := transaction.Sign(func(key solanago.PublicKey) *solanago.PrivateKey {
+		if key.Equals(privateKey.PublicKey()) {
+			return &privateKey
+		}
+		return nil
+	}); err != nil {
+		return nil, "", "", err
+	}
+	if len(transaction.Signatures) == 0 {
+		return nil, "", "", fmt.Errorf("signed Solana transaction has no signature")
+	}
+	raw, err := transaction.MarshalBinary()
+	if err != nil {
+		return nil, "", "", err
+	}
+	return raw, transaction.Signatures[0].String(), hash.String(), nil
+}
+
+func isSetComputeUnitLimit(candidate wireInstruction) bool {
+	if candidate.ProgramID != "ComputeBudget111111111111111111111111111111" {
+		return false
+	}
+	data, err := base64.StdEncoding.DecodeString(candidate.Data)
+	return err == nil && len(data) == 5 && data[0] == 2
+}
+
+func decodeWireInstruction(candidate wireInstruction) (solanago.Instruction, error) {
+	program, err := solanago.PublicKeyFromBase58(candidate.ProgramID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := base64.StdEncoding.DecodeString(candidate.Data)
+	if err != nil {
+		return nil, err
+	}
+	accounts := make(solanago.AccountMetaSlice, len(candidate.Accounts))
+	for index, account := range candidate.Accounts {
+		key, keyErr := solanago.PublicKeyFromBase58(account.Pubkey)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		accounts[index] = solanago.NewAccountMeta(key, account.IsWritable, account.IsSigner)
+	}
+	return solanago.NewInstruction(program, accounts, data), nil
+}
+
+var _ chainport.TxManager = (*TxManager)(nil)
+var _ ReconciliationRPC = (*ReadOnlyNetwork)(nil)

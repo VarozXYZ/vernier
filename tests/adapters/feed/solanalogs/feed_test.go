@@ -2,6 +2,7 @@ package solanalogs_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -15,6 +16,36 @@ import (
 type eventData struct{ value int }
 
 func (eventData) EventKind() string { return "test/event" }
+
+func TestTriggerDecoderCarriesActivityWithoutReadingPoolState(t *testing.T) {
+	decoder := solanalogs.TriggerDecoder{}
+	bootstrap, err := decoder.Bootstrap(context.Background(), (*fakeNetwork)(nil), 10)
+	if err != nil || bootstrap.EventKind() != "solana_pool_activity/v1" {
+		t.Fatalf("unexpected trigger bootstrap: kind=%q err=%v", bootstrap.EventKind(), err)
+	}
+	events, err := decoder.Decode(context.Background(), (*fakeNetwork)(nil), solana.LogNotification{
+		Slot: 11, Signature: "synthetic-signature",
+	})
+	if err != nil || len(events) != 1 || events[0].EventKind() != "solana_pool_activity/v1" {
+		t.Fatalf("unexpected trigger decode: events=%v err=%v", events, err)
+	}
+}
+
+func TestTriggerDecoderFiltersForEconomicCLMMActivity(t *testing.T) {
+	decoder := solanalogs.TriggerDecoder{Kind: "raydium_clmm"}
+	ignored, err := decoder.Decode(context.Background(), nil, solana.LogNotification{
+		Logs: []string{"Program log: collect_protocol_fee"},
+	})
+	if err != nil || len(ignored) != 0 {
+		t.Fatalf("fee collection should be ignored: events=%v err=%v", ignored, err)
+	}
+	events, err := decoder.Decode(context.Background(), nil, solana.LogNotification{
+		Logs: []string{"Program log: Instruction: IncreaseLiquidityV2"},
+	})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("liquidity change should trigger: events=%v err=%v", events, err)
+	}
+}
 
 type decoder struct{}
 
@@ -56,7 +87,6 @@ func (accountNetwork) SubscribeLogs(context.Context, string) (solana.LogsSubscri
 func (accountNetwork) SubscribeAccount(context.Context, string) (solana.AccountSubscription, error) {
 	subscription := &accountSubscription{notifications: make(chan solana.AccountNotification, 1), errors: make(chan error, 1)}
 	subscription.notifications <- solana.AccountNotification{Slot: 10, Account: "pool-account", Value: solana.Account{Data: []byte{1}}}
-	close(subscription.notifications)
 	return subscription, nil
 }
 
@@ -103,7 +133,6 @@ func (programNetwork) SubscribeAccount(context.Context, string) (solana.AccountS
 func (programNetwork) SubscribeProgram(context.Context, solana.ProgramSubscriptionRequest) (solana.ProgramSubscription, error) {
 	subscription := &programSubscription{notifications: make(chan solana.ProgramNotification, 1), errors: make(chan error, 1)}
 	subscription.notifications <- solana.ProgramNotification{Slot: 10, Account: "tick-account", Value: solana.Account{Data: []byte{1}}}
-	close(subscription.notifications)
 	return subscription, nil
 }
 
@@ -126,6 +155,7 @@ func (n *fakeNetwork) SubscribeLogs(context.Context, string) (solana.LogsSubscri
 	if n.subscriptions == 1 {
 		go func() {
 			subscription.notifications <- solana.LogNotification{Slot: 10, Signature: "same"}
+			subscription.notifications <- solana.LogNotification{Slot: 10, Signature: "failed", Err: json.RawMessage(`{"InstructionError":[0,"Custom"]}`)}
 			subscription.notifications <- solana.LogNotification{Slot: 9, Signature: "old"}
 			subscription.notifications <- solana.LogNotification{Slot: 10, Signature: "same-2"}
 			close(subscription.notifications)
@@ -151,12 +181,19 @@ type sink struct {
 	resets         []market.MarketEvent
 	events         []market.MarketEvent
 	health         []feedport.HealthUpdate
+	cancelEvents   int
 	cancelHealthy  int
 	cancelDegraded bool
 }
 
 func (s *sink) Publish(_ context.Context, event market.MarketEvent) error {
 	s.events = append(s.events, event)
+	if s.cancelEvents > 0 {
+		s.cancelEvents--
+		if s.cancelEvents == 0 {
+			s.cancel()
+		}
+	}
 	return nil
 }
 func (s *sink) Reset(_ context.Context, event market.MarketEvent) error {
@@ -219,7 +256,7 @@ func TestFeedReconnectBootstrapsWithReset(t *testing.T) {
 func TestFeedUsesAccountWebSocketWithoutLogOrRPCDecode(t *testing.T) {
 	decoder := &accountDecoder{}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &sink{cancel: cancel, cancelDegraded: true}
+	s := &sink{cancel: cancel, cancelEvents: 1}
 	feed, err := solanalogs.New(solanalogs.Config{Market: "pool", Source: "solana", Pool: "pool-account", Network: accountNetwork{}, Decoder: decoder, Retry: solanalogs.RetryPolicy{Initial: time.Millisecond, Maximum: time.Millisecond}})
 	if err != nil {
 		t.Fatal(err)
@@ -235,7 +272,7 @@ func TestFeedUsesAccountWebSocketWithoutLogOrRPCDecode(t *testing.T) {
 func TestFeedUsesProgramWebSocketForDiscoveredAccounts(t *testing.T) {
 	decoder := &programDecoder{}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &sink{cancel: cancel, cancelDegraded: true}
+	s := &sink{cancel: cancel, cancelEvents: 1}
 	feed, err := solanalogs.New(solanalogs.Config{Market: "pool", Source: "solana", Pool: "pool-account", Network: programNetwork{}, Decoder: decoder, Retry: solanalogs.RetryPolicy{Initial: time.Millisecond, Maximum: time.Millisecond}})
 	if err != nil {
 		t.Fatal(err)

@@ -99,11 +99,15 @@ func applyLiquidity(state Snapshot, update LiquidityUpdate) (Snapshot, error) {
 	for _, initialized := range state.ticks {
 		ticks[initialized.index] = initialized
 	}
-	if err := updateBoundary(ticks, update.lower, update.delta, update.delta); err != nil {
-		return Snapshot{}, err
+	if boundaryCovered(state, update.lower) {
+		if err := updateBoundary(ticks, update.lower, update.delta, update.delta); err != nil {
+			return Snapshot{}, err
+		}
 	}
-	if err := updateBoundary(ticks, update.upper, update.delta, new(big.Int).Neg(update.delta)); err != nil {
-		return Snapshot{}, err
+	if boundaryCovered(state, update.upper) {
+		if err := updateBoundary(ticks, update.upper, update.delta, new(big.Int).Neg(update.delta)); err != nil {
+			return Snapshot{}, err
+		}
 	}
 	state.ticks = make([]Tick, 0, len(ticks))
 	for _, initialized := range ticks {
@@ -117,6 +121,14 @@ func applyLiquidity(state Snapshot, update LiquidityUpdate) (Snapshot, error) {
 		}
 	}
 	return state, nil
+}
+
+func boundaryCovered(state Snapshot, tick int32) bool {
+	if state.coverage.Full() {
+		return true
+	}
+	word := int32(floorDiv(floorDiv(int64(tick), int64(state.tickSpacing)), 256))
+	return state.coverage.Contains(word)
 }
 
 func updateBoundary(ticks map[int32]Tick, index int32, grossDelta, netDelta *big.Int) error {

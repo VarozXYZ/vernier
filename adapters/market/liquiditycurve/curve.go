@@ -6,6 +6,8 @@ package liquiditycurve
 import (
 	"fmt"
 	"math/big"
+
+	"github.com/VarozXYZ/vernier/domain/market"
 )
 
 const BasisPoints uint64 = 10_000
@@ -68,7 +70,7 @@ func ExactInputRate(segments []Segment, amount *big.Int, feeRate uint64) (output
 		segmentOutput := new(big.Int).Mul(available, segment.Out)
 		segmentOutput.Quo(segmentOutput, segment.In)
 		if segmentOutput.Sign() == 0 {
-			return nil, nil, fmt.Errorf("quote output rounds to zero")
+			return nil, nil, market.ErrQuoteOutputRoundsToZero
 		}
 		output.Add(output, segmentOutput)
 		segmentFee := new(big.Int).Sub(new(big.Int).Set(gross), afterFee)

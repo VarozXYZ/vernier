@@ -197,6 +197,91 @@ research: {route: {run_id: route, setup: route_setup, inventory_mode: prepositio
 	}
 }
 
+func TestLoadConfigResolvesTwoRemoteMarketsAndTriggerOnlyPools(t *testing.T) {
+	manifest := `schema_version: 1
+topology: topology.yaml
+policy: policy.yaml
+active_research: remote
+`
+	topology := `schema_version: 1
+chains:
+  synthetic_sol: {kind: solana, label: Synthetic Solana, http_url_env: SYNTH_SOL_HTTP, websocket_url_env: SYNTH_SOL_WS}
+  synthetic_evm: {kind: evm, label: Synthetic EVM, chain_id: "137", http_url_env: SYNTH_EVM_HTTP, websocket_url_env: SYNTH_EVM_WS}
+assets:
+  base: {symbol: BASE}
+  quote: {symbol: QUOTE}
+tokens:
+  base_sol: {asset: base, chain: synthetic_sol, address: BaseSynthetic111111111111111111111111111, decimals: 9, symbol: BASE}
+  quote_sol: {asset: quote, chain: synthetic_sol, address: QuoteSynthetic11111111111111111111111111, decimals: 6, symbol: QUOTE}
+  base_evm: {asset: base, chain: synthetic_evm, address: "0x0000000000000000000000000000000000000001", decimals: 18, symbol: BASE}
+  quote_evm: {asset: quote, chain: synthetic_evm, address: "0x0000000000000000000000000000000000000002", decimals: 6, symbol: QUOTE}
+pools:
+  sol_a: {chain: synthetic_sol, kind: raydium_clmm, address: PoolSynthetic111111111111111111111111111}
+  sol_b: {chain: synthetic_sol, kind: orca_whirlpool, address: PoolSynthetic222222222222222222222222222}
+  evm_a: {chain: synthetic_evm, kind: uniswap_v3, address: "0x0000000000000000000000000000000000000003"}
+quote_sources:
+  synthetic_jupiter: {kind: jupiter, quote_path: /swap/v2/order, expected_mode: manual, taker_env: SYNTH_TAKER, api_key_env: SYNTH_JUP_KEYS, slippage_bps: 5, swap_mode: ExactIn, priority_fee_lamports: 1000000, broadcast_fee_type: maxCap, use_wsol: false, client_platform: synthetic.web}
+  synthetic_kyber: {kind: kyberswap, chain_slug: polygon, client_id_env: SYNTH_KYBER_ID}
+markets:
+  sol: {chain: synthetic_sol, base_token: base_sol, quote_token: quote_sol, quote_source: synthetic_jupiter, trigger_pools: [sol_a, sol_b]}
+  evm: {chain: synthetic_evm, base_token: base_evm, quote_token: quote_evm, quote_source: synthetic_kyber, trigger_pools: [evm_a]}
+`
+	policy := `schema_version: 1
+setups: {remote_pair: {markets: [sol, evm]}}
+research:
+  remote:
+    run_id: synthetic-remote
+    setup: remote_pair
+    inventory_mode: prepositioned
+    fixed_cost: {asset: quote, amount: "1"}
+    min_net_profit: "1"
+    sizing: {kind: fixed, asset: quote, amount: "750"}
+    evaluation_mode: best_buy_opposite_sell
+    idle_evaluation_interval_ms: 15000
+    window_qualification: policy_qualified
+    retry: {attempts: 1, delay_ms: 100}
+    telegram: {enabled: true, bot_token_env: SYNTH_TELEGRAM_TOKEN, chat_id_env: SYNTH_TELEGRAM_CHAT}
+`
+	config, err := configuration.LoadConfig(writeConfig(t, manifest, topology, policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.EvaluationMode != "best_buy_opposite_sell" || config.SizingKind != "fixed" ||
+		config.MinimumSize.RatString() != "750" || config.MaximumSize.RatString() != "750" ||
+		config.FixedCost.RatString() != "1" || config.MinimumNet.RatString() != "1" ||
+		config.IdleEvaluationInterval.Milliseconds() != 15000 || config.WindowQualification != "policy_qualified" ||
+		len(config.Markets[0].TriggerPools)+len(config.Markets[1].TriggerPools) != 3 ||
+		config.Markets[0].Base.Token.Decimals != 9 || config.Markets[1].Base.Token.Decimals != 18 ||
+		config.QuoteSources["synthetic_kyber"].ChainSlug != "polygon" ||
+		config.QuoteSources["synthetic_jupiter"].QuotePath != "/swap/v2/order" ||
+		config.QuoteSources["synthetic_jupiter"].ExpectedMode != "manual" ||
+		config.QuoteSources["synthetic_jupiter"].TakerEnv != "SYNTH_TAKER" ||
+		config.QuoteSources["synthetic_jupiter"].SlippageBPS != 5 ||
+		config.QuoteSources["synthetic_jupiter"].SwapMode != "ExactIn" ||
+		config.QuoteSources["synthetic_jupiter"].PriorityFeeLamports != 1_000_000 ||
+		config.QuoteSources["synthetic_jupiter"].BroadcastFeeType != "maxCap" ||
+		config.QuoteSources["synthetic_jupiter"].UseWSOL == nil ||
+		*config.QuoteSources["synthetic_jupiter"].UseWSOL ||
+		config.QuoteSources["synthetic_jupiter"].ClientPlatform != "synthetic.web" {
+		t.Fatalf("unexpected remote configuration: %+v", config)
+	}
+	if config.PriceSource.Base != "quote" || config.PriceSource.Quote != "quote" {
+		t.Fatalf("same-asset fixed cost should use parity: %+v", config.PriceSource)
+	}
+}
+
+func TestLoadConfigRejectsPrimaryAndReferenceQuoteTogether(t *testing.T) {
+	topology := strings.Replace(
+		topologyYAML,
+		"market_b: {venue: venue_b, base_token: virtual_b, quote_token: weth_b, reference_quote: external}",
+		"market_b: {venue: venue_b, base_token: virtual_b, quote_token: weth_b, quote_source: external, reference_quote: external}",
+		1,
+	)
+	if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topology, policyYAML)); err == nil {
+		t.Fatal("market with primary and reference quote sources was accepted")
+	}
+}
+
 func writeConfig(t *testing.T, manifest, topology, policy string) string {
 	t.Helper()
 	directory := t.TempDir()
