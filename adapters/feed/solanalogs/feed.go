@@ -197,7 +197,10 @@ func (f *Feed) runSession(ctx context.Context, sink feedport.Sink) (established,
 				return true, true, fmt.Errorf("solana log stream closed")
 			}
 			if notification.Err != nil && string(notification.Err) != "null" {
-				return true, false, fmt.Errorf("solana transaction %s failed: %s", notification.Signature, notification.Err)
+				// Failed transactions cannot mutate account state. They are
+				// neither market events nor feed-health failures.
+				f.logger.Debug("failed Solana transaction ignored", "market", f.market, "slot", notification.Slot, "signature", notification.Signature)
+				continue
 			}
 			if notification.Slot < highest {
 				// Slot is explicit evidence that this notification predates the

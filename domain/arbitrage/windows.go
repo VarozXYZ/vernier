@@ -94,6 +94,7 @@ type OpportunityWindow struct {
 	ClosedAt          time.Time
 	Best              WindowCandidate
 	HasBest           bool
+	Threshold         market.AssetQuantity
 	Classification    Classification
 	Status            WindowStatus
 	CloseReason       string
@@ -139,6 +140,9 @@ func (w OpportunityWindow) Validate() error {
 		}
 	} else {
 		return fmt.Errorf("window best candidate is required")
+	}
+	if w.Threshold.Asset() == "" || w.Threshold.Asset() != w.Best.NetPnL.Asset() || w.Threshold.Sign() < 0 {
+		return fmt.Errorf("window threshold must be non-negative and use the PnL asset")
 	}
 	if w.Classification != ClassificationEconomic && w.Classification != ClassificationPolicyQualified {
 		return fmt.Errorf("window classification must be economic or policy_qualified")
@@ -235,7 +239,7 @@ func WindowFingerprint(w OpportunityWindow) string {
 		w.LastProfitableAt.UTC().Format(time.RFC3339Nano), string(w.Classification), string(w.Status), w.CloseReason,
 		strconv.FormatBool(w.Degraded), strconv.FormatBool(w.HasBest), string(w.Best.Size.Asset()), w.Best.Size.String(),
 		string(w.Best.GrossPnL.Asset()), w.Best.GrossPnL.String(), string(w.Best.NetPnL.Asset()), w.Best.NetPnL.String(),
-		string(w.Best.Cost.Asset()), w.Best.Cost.String(),
+		string(w.Best.Cost.Asset()), w.Best.Cost.String(), string(w.Threshold.Asset()), w.Threshold.String(),
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:])

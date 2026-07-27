@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,6 +155,127 @@ func TestTwoMarketTimingSeparatesSequentialLocalQuotesAndCacheHits(t *testing.T)
 	}
 }
 
+func TestTwoMarketStartsIndependentDirectionsConcurrently(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	registry := strategyRegistry(t)
+	setup, err := arbitrage.NewArbitrageSetup("setup", "pair", []market.MarketID{"market-a", "market-b"}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "100")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marketA, _ := registry.Market("market-a")
+	marketB, _ := registry.Market("market-b")
+	quoterA, _ := constantproduct.NewQuoter("source-a", marketA)
+	quoterB, _ := constantproduct.NewQuoter("source-b", marketB)
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	sourceA := &firstCallBarrierSource{delegate: quoterA, arrived: arrived, release: release}
+	sourceB := &firstCallBarrierSource{delegate: quoterB, arrived: arrived, release: release}
+	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: "strategy", Setup: setup, Registry: registry,
+		Sources: map[market.MarketID]quoteport.Source{"market-a": sourceA, "market-b": sourceB},
+		Grid:    grid, Threshold: quantity(t, "0"), Clock: time.Now, SizingAsset: strategy.SizingAssetQuote,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := []market.MarketSnapshot{
+		strategySnapshot(t, "market-a", "1000000000", "1800000000", now),
+		strategySnapshot(t, "market-b", "100000000000", "2200000000", now),
+	}
+	evaluation, err := arbitrage.NewEvaluation(
+		"evaluation", "run", "strategy", "config-hash", snapshots,
+		arbitrage.CostSnapshot{ID: "zero", Amount: quantity(t, "0"), CapturedAt: now},
+		now, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, evaluateErr := candidate.EvaluateWithTiming(context.Background(), evaluation)
+		done <- evaluateErr
+	}()
+	for count := 0; count < 2; count++ {
+		select {
+		case <-arrived:
+		case <-time.After(time.Second):
+			t.Fatal("both direction goroutines did not reach their independent buy quotes")
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTwoMarketFreshEvaluationBypassesOnlyRefreshableSourceCache(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	registry := strategyRegistry(t)
+	setup, err := arbitrage.NewArbitrageSetup("setup", "pair", []market.MarketID{"market-a", "market-b"}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "100")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marketA, _ := registry.Market("market-a")
+	marketB, _ := registry.Market("market-b")
+	quoterA, _ := constantproduct.NewQuoter("source-a", marketA)
+	quoterB, _ := constantproduct.NewQuoter("source-b", marketB)
+	sourceA := &refreshableCachedSource{delegate: quoterA}
+	sourceB := &refreshableCachedSource{delegate: quoterB}
+	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: "strategy", Setup: setup, Registry: registry,
+		Sources: map[market.MarketID]quoteport.Source{"market-a": sourceA, "market-b": sourceB},
+		Grid:    grid, Threshold: quantity(t, "0"), Clock: time.Now, SizingAsset: strategy.SizingAssetQuote,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := []market.MarketSnapshot{
+		strategySnapshot(t, "market-a", "1000000000", "1800000000", now),
+		strategySnapshot(t, "market-b", "100000000000", "2200000000", now),
+	}
+	evaluation, err := arbitrage.NewEvaluation(
+		"evaluation", "run", "strategy", "config-hash", snapshots,
+		arbitrage.CostSnapshot{ID: "zero", Amount: quantity(t, "0"), CapturedAt: now},
+		now, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisional, _, err := candidate.EvaluateWithTiming(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opportunity := range provisional {
+		for _, sized := range opportunity.Candidates {
+			if !sized.BuyQuote.Quality.RequiresRefresh() || !sized.SellQuote.Quality.RequiresRefresh() {
+				t.Fatalf("provisional evaluation lost cached quality: %+v", sized)
+			}
+		}
+	}
+	confirmed, _, err := candidate.EvaluateFreshWithTiming(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opportunity := range confirmed {
+		for _, sized := range opportunity.Candidates {
+			if sized.BuyQuote.Quality != market.QuoteQualityExact || sized.SellQuote.Quality != market.QuoteQualityExact {
+				t.Fatalf("fresh evaluation retained interim quality: %+v", sized)
+			}
+		}
+	}
+	if sourceA.freshCount() == 0 || sourceB.freshCount() == 0 {
+		t.Fatalf("fresh evaluation did not bypass sources: A=%d B=%d", sourceA.freshCount(), sourceB.freshCount())
+	}
+}
+
 func TestTwoMarketDiscoversDirectionBeforeExhaustiveSizing(t *testing.T) {
 	fixture := newQuoteDiscoveryFixture(t)
 	opportunities, timing, err := fixture.strategy.EvaluateWithTiming(context.Background(), fixture.evaluation(t, fixture.snapshots, fixture.now))
@@ -284,6 +406,73 @@ func TestTwoMarketDoesNotSelectDirectionFromFailedProbe(t *testing.T) {
 type failingQuoteSource struct {
 	id  market.SourceID
 	err error
+}
+
+type firstCallBarrierSource struct {
+	delegate quoteport.Source
+	arrived  chan<- struct{}
+	release  <-chan struct{}
+	once     sync.Once
+}
+
+func (s *firstCallBarrierSource) ID() market.SourceID { return s.delegate.ID() }
+
+func (s *firstCallBarrierSource) Quote(ctx context.Context, input quoteport.Input) (market.Quote, error) {
+	var wait bool
+	s.once.Do(func() {
+		wait = true
+		s.arrived <- struct{}{}
+	})
+	if wait {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return market.Quote{}, ctx.Err()
+		}
+	}
+	return s.delegate.Quote(ctx, input)
+}
+
+func (*firstCallBarrierSource) CacheQuotes() bool { return false }
+
+type refreshableCachedSource struct {
+	delegate quoteport.Source
+	mu       sync.Mutex
+	fresh    int
+}
+
+func (s *refreshableCachedSource) ID() market.SourceID { return s.delegate.ID() }
+
+func (s *refreshableCachedSource) Quote(ctx context.Context, input quoteport.Input) (market.Quote, error) {
+	result, err := s.delegate.Quote(ctx, input)
+	if err != nil {
+		return market.Quote{}, err
+	}
+	return quoteWithQuality(result, market.QuoteQualityCachedExact)
+}
+
+func (s *refreshableCachedSource) QuoteFresh(ctx context.Context, input quoteport.Input) (market.Quote, error) {
+	s.mu.Lock()
+	s.fresh++
+	s.mu.Unlock()
+	return s.delegate.Quote(ctx, input)
+}
+
+func (*refreshableCachedSource) CacheQuotes() bool { return false }
+
+func (s *refreshableCachedSource) freshCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fresh
+}
+
+func quoteWithQuality(value market.Quote, quality market.QuoteQuality) (market.Quote, error) {
+	return market.NewQuote(market.Quote{
+		Source: value.Source, Market: value.Market, SnapshotVersion: value.SnapshotVersion,
+		SnapshotHash: value.SnapshotHash, SourcePosition: value.SourcePosition, ResponseHash: value.ResponseHash,
+		Purpose: value.Purpose, Mode: value.Mode, Quality: quality,
+		AmountIn: value.AmountIn, AmountOut: value.AmountOut, QuotedAt: value.QuotedAt,
+	}, value.Fees()...)
 }
 
 func (s failingQuoteSource) ID() market.SourceID { return s.id }

@@ -284,21 +284,83 @@ func (n *ReadOnlyNetwork) ReadProgramAccounts(ctx context.Context, program strin
 }
 
 type Transaction struct {
+	Signature   string
 	Slot        uint64
 	BlockTime   *int64
 	Transaction json.RawMessage
 	Meta        json.RawMessage
 }
 
+type SignatureStatus struct {
+	Found              bool
+	Slot               uint64
+	ConfirmationStatus string
+	Err                json.RawMessage
+}
+
+// ReadSignatureStatus is a reconciliation-only RPC fallback. It is never
+// called while preparing or broadcasting a Live transaction.
+func (n *ReadOnlyNetwork) ReadSignatureStatus(ctx context.Context, signature string) (SignatureStatus, error) {
+	if strings.TrimSpace(signature) == "" {
+		return SignatureStatus{}, fmt.Errorf("transaction signature is required")
+	}
+	var result struct {
+		Value []*struct {
+			Slot               uint64          `json:"slot"`
+			Err                json.RawMessage `json:"err"`
+			ConfirmationStatus string          `json:"confirmationStatus"`
+		} `json:"value"`
+	}
+	if err := n.callHTTP(ctx, "getSignatureStatuses", []any{
+		[]string{signature}, map[string]bool{"searchTransactionHistory": true},
+	}, &result); err != nil {
+		return SignatureStatus{}, fmt.Errorf("read %s signature status: %w", n.label, err)
+	}
+	if len(result.Value) != 1 || result.Value[0] == nil {
+		return SignatureStatus{}, nil
+	}
+	value := result.Value[0]
+	return SignatureStatus{
+		Found: true, Slot: value.Slot, ConfirmationStatus: value.ConfirmationStatus,
+		Err: append(json.RawMessage(nil), value.Err...),
+	}, nil
+}
+
+func (n *ReadOnlyNetwork) CurrentBlockHeight(ctx context.Context) (uint64, error) {
+	var height uint64
+	if err := n.callHTTP(ctx, "getBlockHeight", []any{map[string]string{"commitment": "confirmed"}}, &height); err != nil {
+		return 0, fmt.Errorf("read %s current block height: %w", n.label, err)
+	}
+	return height, nil
+}
+
+func (n *ReadOnlyNetwork) IsBlockhashValid(ctx context.Context, blockhash string) (bool, error) {
+	if strings.TrimSpace(blockhash) == "" {
+		return false, fmt.Errorf("blockhash is required")
+	}
+	var result struct {
+		Value bool `json:"value"`
+	}
+	if err := n.callHTTP(ctx, "isBlockhashValid", []any{
+		blockhash, map[string]string{"commitment": "confirmed"},
+	}, &result); err != nil {
+		return false, fmt.Errorf("read %s blockhash validity: %w", n.label, err)
+	}
+	return result.Value, nil
+}
+
 func (n *ReadOnlyNetwork) ReadTransaction(ctx context.Context, signature string) (Transaction, error) {
 	var result *jsonTransaction
-	if err := n.callHTTP(ctx, "getTransaction", []any{signature, map[string]any{"encoding": "json", "commitment": "processed", "maxSupportedTransactionVersion": 0}}, &result); err != nil {
+	if err := n.callHTTP(ctx, "getTransaction", []any{signature, map[string]any{"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}}, &result); err != nil {
 		return Transaction{}, fmt.Errorf("read %s transaction: %w", n.label, err)
 	}
 	if result == nil {
 		return Transaction{}, fmt.Errorf("transaction %s was not found", signature)
 	}
-	return Transaction{Slot: result.Slot, BlockTime: result.BlockTime, Transaction: result.Transaction, Meta: result.Meta}, nil
+	return Transaction{
+		Signature: signature, Slot: result.Slot, BlockTime: result.BlockTime,
+		Transaction: result.Transaction, Meta: result.Meta,
+	}, nil
 }
 
 type jsonAccountValue struct {
@@ -414,6 +476,19 @@ type AccountSubscription interface {
 type ProgramSubscription interface {
 	Err() <-chan error
 	Notifications() <-chan ProgramNotification
+	Unsubscribe()
+}
+
+type TransactionNotification struct {
+	Signature   string
+	Slot        uint64
+	Transaction json.RawMessage
+	Meta        json.RawMessage
+}
+
+type TransactionSubscription interface {
+	Err() <-chan error
+	Notifications() <-chan TransactionNotification
 	Unsubscribe()
 }
 
@@ -566,6 +641,64 @@ func (n *ReadOnlyNetwork) SubscribeProgram(ctx context.Context, request ProgramS
 		return nil, fmt.Errorf("invalid programSubscribe response")
 	}
 	subscription := &programSubscription{conn: conn, id: response.Result, errors: make(chan error, 1), notifications: make(chan ProgramNotification, 128), done: make(chan struct{})}
+	startWebSocketKeepalive(conn, subscription.done, n.keepalive)
+	go subscription.readLoop()
+	return subscription, nil
+}
+
+// SubscribeTransactions establishes the Helius transactionSubscribe stream
+// at confirmed commitment before Live broadcast. Filtering by the signer
+// account keeps one persistent subscription sufficient for all operations.
+func (n *ReadOnlyNetwork) SubscribeTransactions(ctx context.Context, account string) (TransactionSubscription, error) {
+	if strings.TrimSpace(account) == "" {
+		return nil, fmt.Errorf("transaction subscription account is required")
+	}
+	conn, _, err := n.dialer.DialContext(ctx, n.websocketURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s WebSocket endpoint: %w", n.label, err)
+	}
+	id := n.requestID.Add(1)
+	request := rpcRequest{
+		JSONRPC: "2.0", ID: id, Method: "transactionSubscribe",
+		Params: []any{
+			map[string]any{
+				"accountInclude": []string{account},
+				"vote":           false,
+			},
+			map[string]any{
+				"commitment":                     "confirmed",
+				"encoding":                       "jsonParsed",
+				"transactionDetails":             "full",
+				"showRewards":                    false,
+				"maxSupportedTransactionVersion": 0,
+			},
+		},
+	}
+	if err := conn.WriteJSON(request); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	var response struct {
+		ID     uint64    `json:"id"`
+		Result uint64    `json:"result"`
+		Error  *RPCError `json:"error"`
+	}
+	if err := conn.ReadJSON(&response); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if response.Error != nil {
+		_ = conn.Close()
+		return nil, response.Error
+	}
+	if response.ID != id || response.Result == 0 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("invalid transactionSubscribe response")
+	}
+	subscription := &transactionSubscription{
+		conn: conn, id: response.Result, errors: make(chan error, 1),
+		notifications: make(chan TransactionNotification, 16), done: make(chan struct{}),
+	}
 	startWebSocketKeepalive(conn, subscription.done, n.keepalive)
 	go subscription.readLoop()
 	return subscription, nil
@@ -774,3 +907,76 @@ func (s *programSubscription) readLoop() {
 }
 
 var _ ProgramSubscription = (*programSubscription)(nil)
+
+type transactionSubscription struct {
+	mu            sync.Mutex
+	conn          *websocket.Conn
+	id            uint64
+	errors        chan error
+	notifications chan TransactionNotification
+	done          chan struct{}
+	once          sync.Once
+}
+
+func (s *transactionSubscription) Err() <-chan error { return s.errors }
+func (s *transactionSubscription) Notifications() <-chan TransactionNotification {
+	return s.notifications
+}
+func (s *transactionSubscription) Unsubscribe() {
+	s.once.Do(func() {
+		close(s.done)
+		s.mu.Lock()
+		_ = s.conn.WriteJSON(rpcRequest{
+			JSONRPC: "2.0", ID: s.id + 1, Method: "transactionUnsubscribe", Params: []any{s.id},
+		})
+		_ = s.conn.Close()
+		s.mu.Unlock()
+	})
+}
+
+func (s *transactionSubscription) readLoop() {
+	defer close(s.notifications)
+	defer close(s.errors)
+	for {
+		var message struct {
+			Method string `json:"method"`
+			Params struct {
+				Result struct {
+					Signature   string `json:"signature"`
+					Slot        uint64 `json:"slot"`
+					Transaction struct {
+						Transaction json.RawMessage `json:"transaction"`
+						Meta        json.RawMessage `json:"meta"`
+					} `json:"transaction"`
+				} `json:"result"`
+			} `json:"params"`
+		}
+		if err := s.conn.ReadJSON(&message); err != nil {
+			select {
+			case <-s.done:
+				return
+			case s.errors <- err:
+			}
+			return
+		}
+		if message.Method != "transactionNotification" ||
+			strings.TrimSpace(message.Params.Result.Signature) == "" {
+			continue
+		}
+		notification := TransactionNotification{
+			Signature: message.Params.Result.Signature,
+			Slot:      message.Params.Result.Slot,
+			Transaction: append(
+				json.RawMessage(nil), message.Params.Result.Transaction.Transaction...,
+			),
+			Meta: append(json.RawMessage(nil), message.Params.Result.Transaction.Meta...),
+		}
+		select {
+		case <-s.done:
+			return
+		case s.notifications <- notification:
+		}
+	}
+}
+
+var _ TransactionSubscription = (*transactionSubscription)(nil)

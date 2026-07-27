@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Store struct {
 	db   *sql.DB
@@ -115,6 +115,8 @@ func (s *Store) migrate() error {
 			best_net_value TEXT NOT NULL,
 			best_cost_asset TEXT NOT NULL,
 			best_cost_value TEXT NOT NULL,
+			threshold_asset TEXT NOT NULL,
+			threshold_value TEXT NOT NULL,
 			classification TEXT NOT NULL,
 			status TEXT NOT NULL,
 			close_reason TEXT NOT NULL DEFAULT '',
@@ -150,7 +152,18 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("apply SQLite migration: %w", err)
 		}
 	}
-	if _, err := tx.Exec("PRAGMA user_version = 1"); err != nil {
+	if version == 1 {
+		for _, statement := range []string{
+			`ALTER TABLE opportunity_windows ADD COLUMN threshold_asset TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE opportunity_windows ADD COLUMN threshold_value TEXT NOT NULL DEFAULT '0'`,
+			`UPDATE opportunity_windows SET threshold_asset = best_net_asset WHERE threshold_asset = ''`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("apply SQLite threshold migration: %w", err)
+			}
+		}
+	}
+	if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
 		return fmt.Errorf("set SQLite schema version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -181,9 +194,9 @@ func (s *Store) OpenWindow(ctx context.Context, opening arbitrage.WindowOpening)
 			opened_at, first_profitable_at, last_profitable_at, closed_at,
 			best_size_asset, best_size_value, best_gross_asset, best_gross_value,
 			best_net_asset, best_net_value, best_cost_asset, best_cost_value,
-			classification, status, close_reason, degraded, duration_nanos, identity_hash,
+			threshold_asset, threshold_value, classification, status, close_reason, degraded, duration_nanos, identity_hash,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			string(window.ID), string(window.Run), string(window.Strategy), window.ConfigHash,
 			string(window.Direction.BuyMarket), string(window.Direction.SellMarket),
 			triggerMarket(window), triggerSource(window), triggerPositionKind(window), triggerPositionValue(window),
@@ -191,7 +204,8 @@ func (s *Store) OpenWindow(ctx context.Context, opening arbitrage.WindowOpening)
 			formatTime(window.OpenedAt), formatTime(window.FirstProfitableAt), formatTime(window.LastProfitableAt), "",
 			string(window.Best.Size.Asset()), window.Best.Size.String(), string(window.Best.GrossPnL.Asset()), window.Best.GrossPnL.String(),
 			string(window.Best.NetPnL.Asset()), window.Best.NetPnL.String(), string(window.Best.Cost.Asset()), window.Best.Cost.String(),
-			string(window.Classification), string(window.Status), "", 0, 0, arbitrage.WindowFingerprint(window), formatTime(now), formatTime(now),
+			string(window.Threshold.Asset()), window.Threshold.String(), string(window.Classification), string(window.Status), "", 0, 0,
+			arbitrage.WindowFingerprint(window), formatTime(now), formatTime(now),
 		)
 	case err == nil:
 		if existingHash != arbitrage.WindowFingerprint(window) {
@@ -471,7 +485,7 @@ const windowSelect = `SELECT window_id, run_id, strategy_id, config_hash, buy_ma
 	opened_at, first_profitable_at, last_profitable_at, closed_at,
 	best_size_asset, best_size_value, best_gross_asset, best_gross_value,
 	best_net_asset, best_net_value, best_cost_asset, best_cost_value,
-	classification, status, close_reason, degraded`
+	threshold_asset, threshold_value, classification, status, close_reason, degraded`
 
 type scanner interface{ Scan(...any) error }
 
@@ -482,11 +496,13 @@ func scanWindow(row scanner) (arbitrage.OpportunityWindow, error) {
 	var hasTrigger int64
 	var openedAt, firstAt, lastAt, closedAt string
 	var sizeAsset, sizeValue, grossAsset, grossValue, netAsset, netValue, costAsset, costValue string
+	var thresholdAsset, thresholdValue string
 	var classification, status, closeReason string
 	var degraded int64
 	if err := row.Scan(&id, &run, &strategy, &configHash, &buyMarket, &sellMarket,
 		&triggerMarket, &triggerSource, &positionKind, &positionValue, &referenceKind, &referenceValue, &triggerAt, &hasTrigger,
 		&openedAt, &firstAt, &lastAt, &closedAt, &sizeAsset, &sizeValue, &grossAsset, &grossValue, &netAsset, &netValue, &costAsset, &costValue,
+		&thresholdAsset, &thresholdValue,
 		&classification, &status, &closeReason, &degraded); err != nil {
 		return arbitrage.OpportunityWindow{}, fmt.Errorf("scan opportunity window: %w", err)
 	}
@@ -516,6 +532,10 @@ func scanWindow(row scanner) (arbitrage.OpportunityWindow, error) {
 		return arbitrage.OpportunityWindow{}, err
 	}
 	window.HasBest = true
+	window.Threshold, err = market.ParseAssetQuantity(market.AssetID(thresholdAsset), thresholdValue)
+	if err != nil {
+		return arbitrage.OpportunityWindow{}, err
+	}
 	window.Classification, window.Status, window.CloseReason, window.Degraded = arbitrage.Classification(classification), arbitrage.WindowStatus(status), closeReason, degraded == 1
 	window.HasTrigger = hasTrigger == 1
 	if window.HasTrigger {

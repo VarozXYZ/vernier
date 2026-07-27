@@ -59,6 +59,76 @@ func TestDirectQuoteUsesDefaultRouteAndParsesOutput(t *testing.T) {
 	}
 }
 
+func TestDirectQuoteSupportsSwapV2ManualOrder(t *testing.T) {
+	useWSOL := false
+	client := quoteClientFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != jupiter.DefaultOrderPath {
+			t.Fatalf("path = %q, want %q", request.URL.Path, jupiter.DefaultOrderPath)
+		}
+		query := request.URL.Query()
+		if query.Get("inputMint") != "mint-in" || query.Get("outputMint") != "mint-out" ||
+			query.Get("amount") != "1000000" || query.Get("slippageBps") != "5" ||
+			query.Get("taker") != "synthetic-taker" || query.Get("swapMode") != "ExactIn" ||
+			query.Get("priorityFeeLamports") != "1000000" ||
+			query.Get("broadcastFeeType") != "maxCap" ||
+			query.Get("useWsol") != "false" ||
+			query.Get("clientPlatform") != "synthetic.web" {
+			t.Fatalf("unexpected manual order query: %s", request.URL.RawQuery)
+		}
+		body := `{"mode":"manual","router":"metis","feeBps":10,"inputMint":"mint-in","inAmount":"1000000","outputMint":"mint-out","outAmount":"25500000","otherAmountThreshold":"25372500","priceImpactPct":"0.12","routePlan":[{"percent":52.2,"bps":5220,"swapInfo":{"ammKey":"pool","label":"Raydium CLMM","inputMint":"mint-in","outputMint":"mint-out","inAmount":"1000000","outAmount":"25500000"}}]}`
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	source, err := jupiter.NewQuoteSource(jupiter.QuoteConfig{
+		ID: "jupiter-order", BaseURL: "https://jupiter.test",
+		QuotePath: jupiter.DefaultOrderPath, ExpectedMode: "manual",
+		APIKey: "test-key", SlippageBPS: 5, Taker: "synthetic-taker",
+		SwapMode: "ExactIn", PriorityFeeLamports: 1_000_000,
+		BroadcastFeeType: "maxCap", UseWSOL: &useWSOL, ClientPlatform: "synthetic.web",
+		Limiter: jupiter.ImmediateLimiter{}, Client: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := source.Quote(context.Background(), jupiter.QuoteRequest{
+		InputMint: "mint-in", OutputMint: "mint-out", Amount: "1000000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ToTokenAmount != "25500000" || result.Mode != "manual" ||
+		result.ExpectedMode != "manual" || result.ModeMismatch ||
+		result.Router != "metis" || result.FeeBPS != 10 ||
+		len(result.RoutePlan) != 1 || result.RoutePlan[0].Percent != 52.2 ||
+		result.RoutePlan[0].BPS != 5220 {
+		t.Fatalf("unexpected manual order result: %+v", result)
+	}
+}
+
+func TestDirectQuoteAcceptsUnexpectedSwapV2OrderModeAndMarksMismatch(t *testing.T) {
+	source, err := jupiter.NewQuoteSource(jupiter.QuoteConfig{
+		ID: "jupiter-order", BaseURL: "https://jupiter.test",
+		QuotePath: jupiter.DefaultOrderPath, ExpectedMode: "manual",
+		Limiter: jupiter.ImmediateLimiter{},
+		Client: quoteClientFunc(func(*http.Request) (*http.Response, error) {
+			body := `{"mode":"ultra","router":"metis","inputMint":"mint-in","inAmount":"1","outputMint":"mint-out","outAmount":"2"}`
+			return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(body))}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := source.Quote(context.Background(), jupiter.QuoteRequest{
+		InputMint: "mint-in", OutputMint: "mint-out", Amount: "1",
+	})
+	if err != nil {
+		t.Fatalf("Ultra quote was rejected: %v", err)
+	}
+	if result.ToTokenAmount != "2" || result.Mode != "ultra" ||
+		result.ExpectedMode != "manual" || !result.ModeMismatch {
+		t.Fatalf("unexpected non-fatal mode mismatch result: %+v", result)
+	}
+}
+
 func TestDirectQuotePassesDexFilter(t *testing.T) {
 	limiter, err := jupiter.NewQuoteSpacingLimiter(0)
 	if err != nil {

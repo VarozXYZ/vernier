@@ -2,6 +2,7 @@ package strategy_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestTwoMarketCachesUnchangedPoolQuotesAndInvalidatesChangedPool(t *testing.
 	}
 
 	evaluate("first", []market.MarketSnapshot{snapshotA, snapshotB})
-	firstA, firstB := sourceA.inputCalls+sourceA.outputCalls, sourceB.inputCalls+sourceB.outputCalls
+	firstA, firstB := sourceA.totalCalls(), sourceB.totalCalls()
 	if firstA == 0 || firstB == 0 {
 		t.Fatal("initial evaluation did not quote both markets")
 	}
@@ -70,13 +71,13 @@ func TestTwoMarketCachesUnchangedPoolQuotesAndInvalidatesChangedPool(t *testing.
 		}
 	}
 	evaluate("same", []market.MarketSnapshot{snapshotA, snapshotB})
-	if sourceA.inputCalls+sourceA.outputCalls != firstA || sourceB.inputCalls+sourceB.outputCalls != firstB {
+	if sourceA.totalCalls() != firstA || sourceB.totalCalls() != firstB {
 		t.Fatal("unchanged snapshots caused quote recomputation")
 	}
 
 	nextVersion := sameStateNextVersion(t, snapshotA, now)
 	results := evaluate("same-state-new-version", []market.MarketSnapshot{nextVersion, snapshotB})
-	if sourceA.inputCalls+sourceA.outputCalls != firstA || sourceB.inputCalls+sourceB.outputCalls != firstB {
+	if sourceA.totalCalls() != firstA || sourceB.totalCalls() != firstB {
 		t.Fatal("same economic state caused quote recomputation")
 	}
 	for _, opportunity := range results {
@@ -89,31 +90,93 @@ func TestTwoMarketCachesUnchangedPoolQuotesAndInvalidatesChangedPool(t *testing.
 
 	changed := strategySnapshot(t, "market-a", "1100000000", "1800000000", now)
 	evaluate("changed", []market.MarketSnapshot{changed, snapshotB})
-	currentA := sourceA.inputCalls + sourceA.outputCalls
-	currentB := sourceB.inputCalls + sourceB.outputCalls
+	currentA := sourceA.totalCalls()
+	currentB := sourceB.totalCalls()
 	if currentA <= firstA || currentB <= firstB || currentB >= firstB*2 {
 		t.Fatalf("cache did not reuse the unchanged market's fixed-budget leg: A=%d B=%d firstA=%d firstB=%d", currentA, currentB, firstA, firstB)
+	}
+}
+
+func TestTwoMarketDoesNotCacheOptedOutRemoteQuotes(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	registry := strategyRegistry(t)
+	setup, err := arbitrage.NewArbitrageSetup("setup", "pair", []market.MarketID{"market-a", "market-b"}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "100")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marketA, _ := registry.Market("market-a")
+	marketB, _ := registry.Market("market-b")
+	quoterA, _ := constantproduct.NewQuoter("local-a", marketA)
+	quoterB, _ := constantproduct.NewQuoter("remote-b", marketB)
+	local := &countingSource{delegate: quoterA, exact: quoterA}
+	remoteCounter := &countingSource{delegate: quoterB, exact: quoterB}
+	remote := &uncachedCountingSource{countingSource: remoteCounter}
+	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: "strategy", Setup: setup, Registry: registry,
+		Sources: map[market.MarketID]quoteport.Source{"market-a": local, "market-b": remote},
+		Grid:    grid, Threshold: quantity(t, "0"), Clock: func() time.Time { return now },
+		SizingAsset: strategy.SizingAssetQuote,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := []market.MarketSnapshot{
+		strategySnapshot(t, "market-a", "1000000000", "1800000000", now),
+		strategySnapshot(t, "market-b", "100000000000", "2200000000", now),
+	}
+	evaluate := func(id arbitrage.EvaluationID) {
+		evaluation, evalErr := arbitrage.NewEvaluation(id, "run", "strategy", "config-hash", snapshots,
+			arbitrage.CostSnapshot{ID: "zero", Amount: quantity(t, "0"), CapturedAt: now}, now, now)
+		if evalErr != nil {
+			t.Fatal(evalErr)
+		}
+		if _, evalErr = candidate.Evaluate(context.Background(), evaluation); evalErr != nil {
+			t.Fatal(evalErr)
+		}
+	}
+	evaluate("first")
+	firstRemoteCalls := remoteCounter.totalCalls()
+	if firstRemoteCalls == 0 {
+		t.Fatal("initial evaluation did not invoke remote source")
+	}
+	evaluate("second")
+	if calls := remoteCounter.totalCalls(); calls != firstRemoteCalls*2 {
+		t.Fatalf("unchanged evaluation reused opted-out remote quotes: first=%d total=%d", firstRemoteCalls, calls)
 	}
 }
 
 type countingSource struct {
 	delegate    quoteport.Source
 	exact       quoteport.ExactOutputSource
-	inputCalls  int
-	outputCalls int
+	inputCalls  atomic.Int64
+	outputCalls atomic.Int64
 }
 
 func (s *countingSource) ID() market.SourceID { return s.delegate.ID() }
 
 func (s *countingSource) Quote(ctx context.Context, input quoteport.Input) (market.Quote, error) {
-	s.inputCalls++
+	s.inputCalls.Add(1)
 	return s.delegate.Quote(ctx, input)
 }
 
 func (s *countingSource) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutputInput) (market.Quote, error) {
-	s.outputCalls++
+	s.outputCalls.Add(1)
 	return s.exact.QuoteExactOutput(ctx, input)
 }
+
+func (s *countingSource) totalCalls() int64 {
+	return s.inputCalls.Load() + s.outputCalls.Load()
+}
+
+type uncachedCountingSource struct {
+	*countingSource
+}
+
+func (*uncachedCountingSource) CacheQuotes() bool { return false }
 
 func sameStateNextVersion(t *testing.T, current market.MarketSnapshot, now time.Time) market.MarketSnapshot {
 	t.Helper()
@@ -147,3 +210,4 @@ func sameStateNextVersion(t *testing.T, current market.MarketSnapshot, now time.
 }
 
 var _ quoteport.ExactOutputSource = (*countingSource)(nil)
+var _ quoteport.CachePolicy = (*uncachedCountingSource)(nil)

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+
+	"github.com/VarozXYZ/vernier/domain/market"
 )
 
 const (
@@ -147,7 +149,7 @@ func quoteExactInput(state Snapshot, zeroForOne bool, amountIn *big.Int) (swapRe
 		return swapResult{}, fmt.Errorf("price limit reached before consuming exact input")
 	}
 	if output.Sign() <= 0 {
-		return swapResult{}, fmt.Errorf("quote output rounds to zero")
+		return swapResult{}, market.ErrQuoteOutputRoundsToZero
 	}
 	return swapResult{amountOut: output, fee: fees, ticksCrossed: ticksCrossed}, nil
 }

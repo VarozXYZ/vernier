@@ -126,18 +126,21 @@ type quantityDTO struct {
 }
 
 type quoteDTO struct {
-	Source          string        `json:"source"`
-	Market          string        `json:"market"`
-	SnapshotVersion uint64        `json:"snapshot_version"`
-	SnapshotHash    string        `json:"snapshot_hash"`
-	Purpose         string        `json:"purpose"`
-	Mode            string        `json:"mode"`
-	TokenIn         string        `json:"token_in"`
-	AmountIn        string        `json:"amount_in"`
-	TokenOut        string        `json:"token_out"`
-	AmountOut       string        `json:"amount_out"`
-	Fees            []quoteFeeDTO `json:"fees"`
-	QuotedAt        string        `json:"quoted_at"`
+	Source          string             `json:"source"`
+	Market          string             `json:"market"`
+	SnapshotVersion uint64             `json:"snapshot_version"`
+	SnapshotHash    string             `json:"snapshot_hash"`
+	SourcePosition  *sourcePositionDTO `json:"source_position,omitempty"`
+	ResponseHash    string             `json:"response_hash,omitempty"`
+	Purpose         string             `json:"purpose"`
+	Mode            string             `json:"mode"`
+	Quality         string             `json:"quality"`
+	TokenIn         string             `json:"token_in"`
+	AmountIn        string             `json:"amount_in"`
+	TokenOut        string             `json:"token_out"`
+	AmountOut       string             `json:"amount_out"`
+	Fees            []quoteFeeDTO      `json:"fees"`
+	QuotedAt        string             `json:"quoted_at"`
 }
 
 type quoteFeeDTO struct {
@@ -202,13 +205,20 @@ type directionTiming struct {
 }
 
 type quoteTiming struct {
-	Market   string      `json:"market"`
-	Leg      string      `json:"leg"`
-	Mode     string      `json:"mode"`
-	Duration string      `json:"duration"`
-	Cached   bool        `json:"cached"`
-	Error    string      `json:"error,omitempty"`
-	Hops     []hopTiming `json:"hops,omitempty"`
+	Market      string       `json:"market"`
+	Source      string       `json:"source"`
+	Leg         string       `json:"leg"`
+	Mode        string       `json:"mode"`
+	Duration    string       `json:"duration"`
+	Cached      bool         `json:"cached"`
+	InputToken  string       `json:"input_token,omitempty"`
+	InputRaw    string       `json:"input_raw,omitempty"`
+	Input       *quantityDTO `json:"input,omitempty"`
+	OutputToken string       `json:"output_token,omitempty"`
+	OutputRaw   string       `json:"output_raw,omitempty"`
+	Output      *quantityDTO `json:"output,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	Hops        []hopTiming  `json:"hops,omitempty"`
 }
 
 type hopTiming struct {
@@ -263,7 +273,26 @@ func timing(value strategy.EvaluationTiming) timingDTO {
 	for _, direction := range value.Directions {
 		item := directionTiming{BuyMarket: string(direction.Direction.BuyMarket), SellMarket: string(direction.Direction.SellMarket), Duration: direction.Duration.String(), Quotes: make([]quoteTiming, 0, len(direction.Quotes))}
 		for _, quote := range direction.Quotes {
-			item.Quotes = append(item.Quotes, quoteTiming{Market: string(quote.Market), Leg: quote.Leg, Mode: string(quote.Mode), Duration: quote.Duration.String(), Cached: quote.Cached, Error: quote.Error, Hops: hopTimings(quote.Hops)})
+			trace := quoteTiming{
+				Market: string(quote.Market), Source: string(quote.Source), Leg: quote.Leg,
+				Mode: string(quote.Mode), Duration: quote.Duration.String(), Cached: quote.Cached,
+				Error: quote.Error, Hops: hopTimings(quote.Hops),
+			}
+			if quote.AmountIn.Token() != "" {
+				trace.InputToken, trace.InputRaw = string(quote.AmountIn.Token()), quote.AmountIn.String()
+			}
+			if quote.Input.Asset() != "" {
+				value := quantity(quote.Input)
+				trace.Input = &value
+			}
+			if quote.AmountOut.Token() != "" {
+				trace.OutputToken, trace.OutputRaw = string(quote.AmountOut.Token()), quote.AmountOut.String()
+			}
+			if quote.Output.Asset() != "" {
+				value := quantity(quote.Output)
+				trace.Output = &value
+			}
+			item.Quotes = append(item.Quotes, trace)
 		}
 		dto.Directions = append(dto.Directions, item)
 	}
@@ -342,10 +371,14 @@ func quantity(value market.AssetQuantity) quantityDTO {
 func quote(value market.Quote) quoteDTO {
 	dto := quoteDTO{
 		Source: string(value.Source), Market: string(value.Market), SnapshotVersion: value.SnapshotVersion,
-		SnapshotHash: hex.EncodeToString(value.SnapshotHash[:]), Purpose: string(value.Purpose), Mode: string(value.Mode),
+		SnapshotHash: hex.EncodeToString(value.SnapshotHash[:]), Purpose: string(value.Purpose), Mode: string(value.Mode), Quality: string(value.Quality),
 		TokenIn: string(value.AmountIn.Token()), AmountIn: value.AmountIn.String(),
 		TokenOut: string(value.AmountOut.Token()), AmountOut: value.AmountOut.String(),
 		Fees: make([]quoteFeeDTO, 0, len(value.Fees())), QuotedAt: formatTime(value.QuotedAt),
+	}
+	dto.SourcePosition = sourcePosition(value.SourcePosition)
+	if value.ResponseHash != ([32]byte{}) {
+		dto.ResponseHash = hex.EncodeToString(value.ResponseHash[:])
 	}
 	for _, fee := range value.Fees() {
 		dto.Fees = append(dto.Fees, quoteFeeDTO{

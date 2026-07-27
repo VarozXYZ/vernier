@@ -59,6 +59,10 @@ func (c *quoteCache) getOrCompute(
 		source: source.ID(), market: metadata.Market, mode: mode,
 		tokenIn: tokenIn, tokenOut: tokenOut, amount: amount.String(), purpose: purpose,
 	}
+	if policy, ok := source.(quoteport.CachePolicy); ok && !policy.CacheQuotes() {
+		quote, err := compute()
+		return quote, false, err
+	}
 
 	// The strategy evaluates a stream serially. Holding this small lock during
 	// a miss also prevents concurrent evaluations from duplicating expensive
@@ -86,7 +90,8 @@ func rebind(cached market.Quote, snapshot market.MarketSnapshot, quotedAt time.T
 	metadata := snapshot.Metadata()
 	return market.NewQuote(market.Quote{
 		Source: cached.Source, Market: cached.Market, SnapshotVersion: metadata.Version,
-		SnapshotHash: metadata.StateHash, Purpose: cached.Purpose, Mode: cached.Mode,
+		SnapshotHash: metadata.StateHash, SourcePosition: cached.SourcePosition, ResponseHash: cached.ResponseHash,
+		Purpose: cached.Purpose, Mode: cached.Mode, Quality: cached.Quality,
 		AmountIn: cached.AmountIn, AmountOut: cached.AmountOut, QuotedAt: quotedAt,
 	}, cached.Fees()...)
 }

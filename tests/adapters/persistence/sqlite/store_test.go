@@ -86,6 +86,51 @@ func TestStorePersistsWindowLifecycleIdempotently(t *testing.T) {
 	}
 }
 
+func TestStoreMigratesV1WindowsToPersistAppliedThreshold(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE opportunity_windows (
+			window_id TEXT PRIMARY KEY,
+			status TEXT NOT NULL,
+			opened_at TEXT NOT NULL,
+			best_net_asset TEXT NOT NULL
+		);
+		INSERT INTO opportunity_windows(window_id, status, opened_at, best_net_asset)
+		VALUES ('legacy', 'closed', '2026-01-01T00:00:00Z', 'QUOTE');
+		PRAGMA user_version = 1;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	var asset, value string
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT threshold_asset, threshold_value FROM opportunity_windows").Scan(&asset, &value); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 || asset != "QUOTE" || value != "0" {
+		t.Fatalf("migration result: version=%d threshold=%s/%s", version, asset, value)
+	}
+}
+
 func TestStoreFinalizesDanglingWindowsWithoutRecoveryTables(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "opportunities.sqlite")
 	store, err := sqlite.Open(storePath)
@@ -152,7 +197,8 @@ func testWindow(t *testing.T, id string, openedAt time.Time) arbitrage.Opportuni
 		Best: arbitrage.WindowCandidate{
 			Size: quantity(t, "WETH", "1"), GrossPnL: quantity(t, "WETH", "0.2"),
 			NetPnL: quantity(t, "WETH", "0.1"), Cost: quantity(t, "WETH", "0.1"),
-		}, HasBest: true, Classification: arbitrage.ClassificationEconomic, Status: arbitrage.WindowStatusOpen,
+		}, HasBest: true, Threshold: quantity(t, "WETH", "0.05"),
+		Classification: arbitrage.ClassificationEconomic, Status: arbitrage.WindowStatusOpen,
 	}
 	if err := window.Validate(); err != nil {
 		t.Fatal(err)

@@ -18,8 +18,12 @@ import (
 )
 
 const (
-	// DefaultQuotePath is Jupiter's current Metis Swap v1 quote endpoint.
+	// DefaultQuotePath is Jupiter's legacy Metis Swap v1 quote endpoint. It is
+	// retained for standalone comparison commands and backwards compatibility.
 	DefaultQuotePath = "/swap/v1/quote"
+	// DefaultOrderPath is Swap V2's quote-only Meta-Aggregator endpoint when
+	// called without a taker. Supplying slippageBps makes the response manual.
+	DefaultOrderPath = "/swap/v2/order"
 
 	// DefaultSlippageBPS is sent explicitly so both runners use a reproducible
 	// quote configuration.
@@ -36,18 +40,27 @@ const (
 // client. It is deliberately separate from Source, which is the Research
 // reference wrapper around a local quote source.
 type QuoteConfig struct {
-	ID              market.SourceID
-	BaseURL         string
-	QuotePath       string
-	APIKey          string
-	APIKeys         []string
-	APIKeyPool      *APIKeyPool
-	APIKeyHeader    string
-	SlippageBPS     uint16
-	RequestInterval time.Duration
-	Limiter         QuoteLimiter
-	Client          Client
-	Clock           Clock
+	ID                  market.SourceID
+	BaseURL             string
+	QuotePath           string
+	APIKey              string
+	APIKeys             []string
+	APIKeyPool          *APIKeyPool
+	APIKeyHeader        string
+	SlippageBPS         uint16
+	ExpectedMode        string
+	Taker               string
+	SwapMode            string
+	PriorityFeeLamports uint64
+	BroadcastFeeType    string
+	UseWSOL             *bool
+	ExcludeDexes        string
+	ExcludeRouters      string
+	ClientPlatform      string
+	RequestInterval     time.Duration
+	Limiter             QuoteLimiter
+	Client              Client
+	Clock               Clock
 }
 
 // QuoteRequest is the provider-facing Jupiter input. Amount is the integer
@@ -63,7 +76,8 @@ type QuoteRequest struct {
 
 // RoutePlan is one Jupiter route leg returned by the quote endpoint.
 type RoutePlan struct {
-	Percent    int
+	Percent    float64
+	BPS        int
 	AMMKey     string
 	Label      string
 	InputMint  string
@@ -84,6 +98,11 @@ type QuoteResult struct {
 	OtherAmountThreshold  string
 	PriceImpactPercentage string
 	ContextSlot           uint64
+	Mode                  string
+	ExpectedMode          string
+	ModeMismatch          bool
+	Router                string
+	FeeBPS                uint16
 	RoutePlan             []RoutePlan
 	RawResponse           []byte
 	HTTPStatus            int
@@ -98,6 +117,7 @@ type APIError struct {
 	HTTPStatus int
 	Message    string
 	Code       string
+	retryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -119,18 +139,42 @@ func (e *APIError) RateLimited() bool {
 	return e != nil && e.HTTPStatus == http.StatusTooManyRequests
 }
 
-// QuoteSource is a direct Jupiter quote adapter for standalone experiments.
-// It never builds, signs, or broadcasts a swap transaction.
+func (e *APIError) HTTPStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.HTTPStatus
+}
+
+func (e *APIError) RetryAfter() time.Duration {
+	if e == nil {
+		return 0
+	}
+	return e.retryAfter
+}
+
+// QuoteSource is a direct, read-only Jupiter price adapter. It supports both
+// legacy Metis quotes and quote-only Swap V2 orders, and never signs or
+// broadcasts a transaction.
 type QuoteSource struct {
-	id         market.SourceID
-	baseURL    string
-	quotePath  string
-	keyPool    *APIKeyPool
-	apiKeyHead string
-	slippage   uint16
-	client     Client
-	limiter    QuoteLimiter
-	clock      Clock
+	id                  market.SourceID
+	baseURL             string
+	quotePath           string
+	keyPool             *APIKeyPool
+	apiKeyHead          string
+	slippage            uint16
+	expectedMode        string
+	taker               string
+	swapMode            string
+	priorityFeeLamports uint64
+	broadcastFeeType    string
+	useWSOL             *bool
+	excludeDexes        string
+	excludeRouters      string
+	clientPlatform      string
+	client              Client
+	limiter             QuoteLimiter
+	clock               Clock
 }
 
 // NewQuoteSource constructs a direct Jupiter quote client.
@@ -161,6 +205,23 @@ func NewQuoteSource(config QuoteConfig) (*QuoteSource, error) {
 	if config.SlippageBPS == 0 {
 		config.SlippageBPS = DefaultSlippageBPS
 	}
+	config.ExpectedMode = strings.ToLower(strings.TrimSpace(config.ExpectedMode))
+	if config.ExpectedMode != "" && config.ExpectedMode != "manual" && config.ExpectedMode != "ultra" {
+		return nil, fmt.Errorf("invalid Jupiter expected order mode %q", config.ExpectedMode)
+	}
+	config.Taker = strings.TrimSpace(config.Taker)
+	config.SwapMode = strings.TrimSpace(config.SwapMode)
+	if config.SwapMode != "" && config.SwapMode != "ExactIn" {
+		return nil, fmt.Errorf("invalid Jupiter swap mode %q", config.SwapMode)
+	}
+	config.BroadcastFeeType = strings.TrimSpace(config.BroadcastFeeType)
+	if config.BroadcastFeeType != "" && config.BroadcastFeeType != "maxCap" &&
+		config.BroadcastFeeType != "exactFee" {
+		return nil, fmt.Errorf("invalid Jupiter broadcast fee type %q", config.BroadcastFeeType)
+	}
+	config.ExcludeDexes = strings.TrimSpace(config.ExcludeDexes)
+	config.ExcludeRouters = strings.TrimSpace(config.ExcludeRouters)
+	config.ClientPlatform = strings.TrimSpace(config.ClientPlatform)
 	if config.Client == nil {
 		config.Client = &http.Client{Timeout: 8 * time.Second}
 	}
@@ -191,15 +252,24 @@ func NewQuoteSource(config QuoteConfig) (*QuoteSource, error) {
 		}
 	}
 	return &QuoteSource{
-		id:         config.ID,
-		baseURL:    strings.TrimRight(baseURL.String(), "/"),
-		quotePath:  config.QuotePath,
-		keyPool:    keyPool,
-		apiKeyHead: config.APIKeyHeader,
-		slippage:   config.SlippageBPS,
-		client:     config.Client,
-		limiter:    config.Limiter,
-		clock:      config.Clock,
+		id:                  config.ID,
+		baseURL:             strings.TrimRight(baseURL.String(), "/"),
+		quotePath:           config.QuotePath,
+		keyPool:             keyPool,
+		apiKeyHead:          config.APIKeyHeader,
+		slippage:            config.SlippageBPS,
+		expectedMode:        config.ExpectedMode,
+		taker:               config.Taker,
+		swapMode:            config.SwapMode,
+		priorityFeeLamports: config.PriorityFeeLamports,
+		broadcastFeeType:    config.BroadcastFeeType,
+		useWSOL:             config.UseWSOL,
+		excludeDexes:        config.ExcludeDexes,
+		excludeRouters:      config.ExcludeRouters,
+		clientPlatform:      config.ClientPlatform,
+		client:              config.Client,
+		limiter:             config.Limiter,
+		clock:               config.Clock,
 	}, nil
 }
 
@@ -224,6 +294,30 @@ func (s *QuoteSource) Quote(ctx context.Context, input QuoteRequest) (QuoteResul
 	query.Set("outputMint", resolved.OutputMint)
 	query.Set("amount", resolved.Amount)
 	query.Set("slippageBps", strconv.FormatUint(uint64(resolved.SlippageBPS), 10))
+	if s.taker != "" {
+		query.Set("taker", s.taker)
+	}
+	if s.swapMode != "" {
+		query.Set("swapMode", s.swapMode)
+	}
+	if s.priorityFeeLamports > 0 {
+		query.Set("priorityFeeLamports", strconv.FormatUint(s.priorityFeeLamports, 10))
+	}
+	if s.broadcastFeeType != "" {
+		query.Set("broadcastFeeType", s.broadcastFeeType)
+	}
+	if s.useWSOL != nil {
+		query.Set("useWsol", strconv.FormatBool(*s.useWSOL))
+	}
+	if s.excludeDexes != "" {
+		query.Set("excludeDexes", s.excludeDexes)
+	}
+	if s.excludeRouters != "" {
+		query.Set("excludeRouters", s.excludeRouters)
+	}
+	if s.clientPlatform != "" {
+		query.Set("clientPlatform", s.clientPlatform)
+	}
 	if resolved.Dexes != "" {
 		query.Set("dexes", resolved.Dexes)
 	}
@@ -266,12 +360,18 @@ func (s *QuoteSource) Quote(ctx context.Context, input QuoteRequest) (QuoteResul
 		return result, fmt.Errorf("jupiter response exceeds %d bytes", maxQuoteResponseBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return result, parseAPIErrorFor("quote", response.StatusCode, body)
+		apiErr := parseAPIErrorFor("quote", response.StatusCode, body)
+		apiErr.retryAfter = retryAfter(response.Header.Get("Retry-After"), time.Now())
+		return result, apiErr
 	}
 	var payload quoteResponse
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return result, fmt.Errorf("decode jupiter quote response: %w", err)
 	}
+	result.Mode = payload.Mode
+	result.ExpectedMode = s.expectedMode
+	result.ModeMismatch = s.expectedMode != "" &&
+		strings.ToLower(strings.TrimSpace(payload.Mode)) != s.expectedMode
 	if strings.TrimSpace(payload.OutAmount) == "" {
 		return result, &APIError{Operation: "quote", HTTPStatus: response.StatusCode, Message: "jupiter response has no outAmount"}
 	}
@@ -286,9 +386,12 @@ func (s *QuoteSource) Quote(ctx context.Context, input QuoteRequest) (QuoteResul
 	result.OtherAmountThreshold = payload.OtherAmountThreshold
 	result.PriceImpactPercentage = payload.PriceImpactPct
 	result.ContextSlot = payload.ContextSlot
+	result.Router = payload.Router
+	result.FeeBPS = payload.FeeBPS
 	for _, leg := range payload.RoutePlan {
 		result.RoutePlan = append(result.RoutePlan, RoutePlan{
 			Percent:    leg.Percent,
+			BPS:        leg.BPS,
 			AMMKey:     leg.SwapInfo.AMMKey,
 			Label:      leg.SwapInfo.Label,
 			InputMint:  leg.SwapInfo.InputMint,
@@ -331,8 +434,12 @@ type quoteResponse struct {
 	OtherAmountThreshold string `json:"otherAmountThreshold"`
 	PriceImpactPct       string `json:"priceImpactPct"`
 	ContextSlot          uint64 `json:"contextSlot"`
+	Mode                 string `json:"mode"`
+	Router               string `json:"router"`
+	FeeBPS               uint16 `json:"feeBps"`
 	RoutePlan            []struct {
-		Percent  int `json:"percent"`
+		Percent  float64 `json:"percent"`
+		BPS      int     `json:"bps"`
 		SwapInfo struct {
 			AMMKey     string `json:"ammKey"`
 			Label      string `json:"label"`
@@ -371,6 +478,20 @@ func responseStatus(response *http.Response) int {
 		return 0
 	}
 	return response.StatusCode
+}
+
+func retryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
 }
 
 // QuoteLimiter spaces requests made by one QuoteSource.

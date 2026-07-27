@@ -29,6 +29,7 @@ type Manifest struct {
 	Topology       string `yaml:"topology"`
 	Policy         string `yaml:"policy"`
 	ActiveResearch string `yaml:"active_research"`
+	ActiveLive     string `yaml:"active_live"`
 }
 
 type Topology struct {
@@ -48,6 +49,7 @@ type Policy struct {
 	SchemaVersion int                       `yaml:"schema_version"`
 	Setups        map[string]SetupConfig    `yaml:"setups"`
 	Research      map[string]ResearchConfig `yaml:"research"`
+	Live          map[string]LiveConfig     `yaml:"live"`
 }
 
 type ChainConfig struct {
@@ -88,6 +90,7 @@ type VenueConfig struct {
 // on the venue; paths should use this type instead.
 type PoolConfig struct {
 	Venue            string `yaml:"venue"`
+	Kind             string `yaml:"kind"`
 	Chain            string `yaml:"chain"`
 	Address          string `yaml:"address"`
 	ReferenceAddress string `yaml:"reference_address"`
@@ -106,20 +109,34 @@ type PathHopConfig struct {
 }
 
 type MarketConfig struct {
-	Venue          string `yaml:"venue"`
-	Path           string `yaml:"path"`
-	BaseToken      string `yaml:"base_token"`
-	QuoteToken     string `yaml:"quote_token"`
-	ReferenceQuote string `yaml:"reference_quote"`
+	Chain          string   `yaml:"chain"`
+	Venue          string   `yaml:"venue"`
+	Path           string   `yaml:"path"`
+	BaseToken      string   `yaml:"base_token"`
+	QuoteToken     string   `yaml:"quote_token"`
+	QuoteSource    string   `yaml:"quote_source"`
+	TriggerPools   []string `yaml:"trigger_pools"`
+	ReferenceQuote string   `yaml:"reference_quote"`
 }
 
 type QuoteSourceConfig struct {
-	Kind        string `yaml:"kind"`
-	BaseURL     string `yaml:"base_url"`
-	TakerEnv    string `yaml:"taker_env"`
-	APIKeyEnv   string `yaml:"api_key_env"`
-	SlippageBPS uint16 `yaml:"slippage_bps"`
-	MaxAccounts uint16 `yaml:"max_accounts"`
+	Kind                string `yaml:"kind"`
+	BaseURL             string `yaml:"base_url"`
+	QuotePath           string `yaml:"quote_path"`
+	ExpectedMode        string `yaml:"expected_mode"`
+	TakerEnv            string `yaml:"taker_env"`
+	APIKeyEnv           string `yaml:"api_key_env"`
+	ClientIDEnv         string `yaml:"client_id_env"`
+	ChainSlug           string `yaml:"chain_slug"`
+	SlippageBPS         uint16 `yaml:"slippage_bps"`
+	MaxAccounts         uint16 `yaml:"max_accounts"`
+	SwapMode            string `yaml:"swap_mode"`
+	PriorityFeeLamports uint64 `yaml:"priority_fee_lamports"`
+	BroadcastFeeType    string `yaml:"broadcast_fee_type"`
+	UseWSOL             *bool  `yaml:"use_wsol"`
+	ExcludeDexes        string `yaml:"exclude_dexes"`
+	ExcludeRouters      string `yaml:"exclude_routers"`
+	ClientPlatform      string `yaml:"client_platform"`
 }
 
 type PriceSourceConfig struct {
@@ -145,13 +162,72 @@ type SetupConfig struct {
 }
 
 type ResearchConfig struct {
-	RunID         string       `yaml:"run_id"`
-	Setup         string       `yaml:"setup"`
-	InventoryMode string       `yaml:"inventory_mode"`
-	PriceSource   string       `yaml:"price_source"`
-	FixedCost     AmountConfig `yaml:"fixed_cost"`
-	MinNetProfit  string       `yaml:"min_net_profit"`
-	Sizing        SizingConfig `yaml:"sizing"`
+	RunID                    string         `yaml:"run_id"`
+	Setup                    string         `yaml:"setup"`
+	InventoryMode            string         `yaml:"inventory_mode"`
+	PriceSource              string         `yaml:"price_source"`
+	FixedCost                AmountConfig   `yaml:"fixed_cost"`
+	MinNetProfit             string         `yaml:"min_net_profit"`
+	Sizing                   SizingConfig   `yaml:"sizing"`
+	EvaluationMode           string         `yaml:"evaluation_mode"`
+	IdleEvaluationIntervalMS int            `yaml:"idle_evaluation_interval_ms"`
+	WindowQualification      string         `yaml:"window_qualification"`
+	Retry                    RetryConfig    `yaml:"retry"`
+	Telegram                 TelegramConfig `yaml:"telegram"`
+}
+
+type RetryConfig struct {
+	Attempts int `yaml:"attempts"`
+	DelayMS  int `yaml:"delay_ms"`
+}
+
+type TelegramConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	BotTokenEnv string `yaml:"bot_token_env"`
+	ChatIDEnv   string `yaml:"chat_id_env"`
+}
+
+type LiveConfig struct {
+	RunID                      string                       `yaml:"run_id"`
+	Setup                      string                       `yaml:"setup"`
+	InventoryMode              string                       `yaml:"inventory_mode"`
+	Notional                   AmountConfig                 `yaml:"notional"`
+	ExecutionCost              AmountConfig                 `yaml:"execution_cost"`
+	MaxExecutionCost           AmountConfig                 `yaml:"max_execution_cost"`
+	MaxBaseExposure            AmountConfig                 `yaml:"max_base_exposure"`
+	MinNetProfit               AmountConfig                 `yaml:"min_net_profit"`
+	FeeCacheMaxAgeMS           int                          `yaml:"fee_cache_max_age_ms"`
+	SlippageBPS                uint16                       `yaml:"slippage_bps"`
+	TipLamports                string                       `yaml:"tip_lamports"`
+	ComputeUnitPricePercentile string                       `yaml:"compute_unit_price_percentile"`
+	ComputeUnitLimit           uint32                       `yaml:"compute_unit_limit"`
+	BlockhashSlotsToExpiry     uint16                       `yaml:"blockhash_slots_to_expiry"`
+	BuildToBroadcastTimeoutMS  int                          `yaml:"build_to_broadcast_timeout_ms"`
+	EVMDeadlineSeconds         int                          `yaml:"evm_deadline_seconds"`
+	OperationalStore           OperationalStoreConfig       `yaml:"operational_store"`
+	Accounts                   map[string]LiveAccountConfig `yaml:"accounts"`
+	Inventory                  []InventoryBalanceConfig     `yaml:"inventory"`
+}
+
+type OperationalStoreConfig struct {
+	Path        string `yaml:"path"`
+	Synchronous string `yaml:"synchronous"`
+}
+
+type LiveAccountConfig struct {
+	ID                 string `yaml:"id"`
+	PublicAddressEnv   string `yaml:"public_address_env"`
+	SignerEnv          string `yaml:"signer_env"`
+	SenderURLEnv       string `yaml:"sender_url_env"`
+	FanoutRPCURLEnv    string `yaml:"fanout_rpc_urls_env"`
+	ContractAddressEnv string `yaml:"contract_address_env"`
+}
+
+type InventoryBalanceConfig struct {
+	Chain   string `yaml:"chain"`
+	Account string `yaml:"account"`
+	Token   string `yaml:"token"`
+	Amount  string `yaml:"amount"`
 }
 
 type AmountConfig struct {
@@ -162,6 +238,7 @@ type AmountConfig struct {
 type SizingConfig struct {
 	Kind    string `yaml:"kind"`
 	Asset   string `yaml:"asset"`
+	Amount  string `yaml:"amount"`
 	Minimum string `yaml:"min"`
 	Maximum string `yaml:"max"`
 	Samples int    `yaml:"samples"`
@@ -199,10 +276,13 @@ type ResolvedVenue struct {
 
 type ResolvedMarket struct {
 	ID             market.MarketID
+	Chain          string
 	Venue          ResolvedVenue
 	Base           ResolvedToken
 	Quote          ResolvedToken
 	Path           []ResolvedHop
+	QuoteSource    string
+	TriggerPools   []ResolvedTriggerPool
 	ReferenceQuote string
 }
 
@@ -211,6 +291,16 @@ type ResolvedHop struct {
 	Venue ResolvedVenue
 	In    ResolvedToken
 	Out   ResolvedToken
+}
+
+// ResolvedTriggerPool is a configured event source for a remotely quoted
+// market. It intentionally carries no protocol state: activity at the pool
+// only advances the market's causal quote generation.
+type ResolvedTriggerPool struct {
+	ID      string
+	Chain   string
+	Kind    string
+	Address string
 }
 
 type ResolvedPriceSource struct {
@@ -222,78 +312,173 @@ type ResolvedPriceSource struct {
 }
 
 type ResolvedQuoteSource struct {
-	ID          string
-	Kind        string
-	BaseURL     string
-	TakerEnv    string
-	APIKeyEnv   string
-	SlippageBPS uint16
-	MaxAccounts uint16
+	ID                  string
+	Kind                string
+	BaseURL             string
+	QuotePath           string
+	ExpectedMode        string
+	TakerEnv            string
+	APIKeyEnv           string
+	ClientIDEnv         string
+	ChainSlug           string
+	SlippageBPS         uint16
+	MaxAccounts         uint16
+	SwapMode            string
+	PriorityFeeLamports uint64
+	BroadcastFeeType    string
+	UseWSOL             *bool
+	ExcludeDexes        string
+	ExcludeRouters      string
+	ClientPlatform      string
 }
 
 type ParsedConfig struct {
-	Hash          string
-	ResearchID    string
-	RunID         string
-	SetupID       string
-	InventoryMode string
-	Assets        map[market.AssetID]market.Asset
-	Chains        map[string]ResolvedChain
-	Markets       [2]ResolvedMarket
-	PriceSource   ResolvedPriceSource
-	QuoteSources  map[string]ResolvedQuoteSource
-	FixedCost     *big.Rat
-	MinimumSize   *big.Rat
-	MaximumSize   *big.Rat
-	SizeSamples   int
-	SizingAsset   string
-	MinimumNet    *big.Rat
+	Hash                   string
+	ResearchID             string
+	RunID                  string
+	SetupID                string
+	InventoryMode          string
+	Assets                 map[market.AssetID]market.Asset
+	Chains                 map[string]ResolvedChain
+	Markets                [2]ResolvedMarket
+	PriceSource            ResolvedPriceSource
+	QuoteSources           map[string]ResolvedQuoteSource
+	FixedCost              *big.Rat
+	SizingKind             string
+	MinimumSize            *big.Rat
+	MaximumSize            *big.Rat
+	SizeSamples            int
+	SizingAsset            string
+	MinimumNet             *big.Rat
+	EvaluationMode         string
+	IdleEvaluationInterval time.Duration
+	WindowQualification    string
+	RetryAttempts          int
+	RetryDelay             time.Duration
+	TelegramEnabled        bool
+	TelegramBotTokenEnv    string
+	TelegramChatIDEnv      string
+}
+
+type ResolvedLiveAccount struct {
+	ID                 string
+	Chain              string
+	PublicAddressEnv   string
+	SignerEnv          string
+	SenderURLEnv       string
+	FanoutRPCURLEnv    string
+	ContractAddressEnv string
+}
+
+type ResolvedInventoryBalance struct {
+	Chain   string
+	Account string
+	Token   market.Token
+	Amount  *big.Rat
+}
+
+type ParsedLiveConfig struct {
+	Hash                       string
+	LiveID                     string
+	RunID                      string
+	SetupID                    string
+	Assets                     map[market.AssetID]market.Asset
+	Chains                     map[string]ResolvedChain
+	Markets                    [2]ResolvedMarket
+	QuoteSources               map[string]ResolvedQuoteSource
+	Notional                   *big.Rat
+	ExecutionCost              *big.Rat
+	MaximumExecutionCost       *big.Rat
+	MaximumBaseExposure        *big.Rat
+	MinimumNet                 *big.Rat
+	FeeCacheMaxAge             time.Duration
+	SlippageBPS                uint16
+	TipLamports                string
+	ComputeUnitPricePercentile string
+	ComputeUnitLimit           uint32
+	BlockhashSlotsToExpiry     uint16
+	BuildToBroadcastTimeout    time.Duration
+	EVMDeadline                time.Duration
+	OperationalStorePath       string
+	SQLiteSynchronous          string
+	Accounts                   map[string]ResolvedLiveAccount
+	Inventory                  []ResolvedInventoryBalance
 }
 
 type LookupEnv func(string) (string, bool)
 
 func LoadConfig(path string) (ParsedConfig, error) {
-	manifestData, err := os.ReadFile(path)
+	manifest, topology, policy, err := loadDocuments(path)
 	if err != nil {
-		return ParsedConfig{}, fmt.Errorf("read configuration manifest: %w", err)
+		return ParsedConfig{}, err
 	}
-	var manifest Manifest
-	if err := decodeYAML(manifestData, &manifest); err != nil {
-		return ParsedConfig{}, fmt.Errorf("decode configuration manifest: %w", err)
-	}
-	if manifest.SchemaVersion != schemaVersion || strings.TrimSpace(manifest.Topology) == "" ||
-		strings.TrimSpace(manifest.Policy) == "" || strings.TrimSpace(manifest.ActiveResearch) == "" {
-		return ParsedConfig{}, fmt.Errorf("manifest requires schema version, topology, policy, and active research")
-	}
-	directory := filepath.Dir(path)
-	topologyData, err := os.ReadFile(filepath.Join(directory, manifest.Topology))
-	if err != nil {
-		return ParsedConfig{}, fmt.Errorf("read topology: %w", err)
-	}
-	policyData, err := os.ReadFile(filepath.Join(directory, manifest.Policy))
-	if err != nil {
-		return ParsedConfig{}, fmt.Errorf("read policy: %w", err)
-	}
-	var topology Topology
-	if err := decodeYAML(topologyData, &topology); err != nil {
-		return ParsedConfig{}, fmt.Errorf("decode topology: %w", err)
-	}
-	var policy Policy
-	if err := decodeYAML(policyData, &policy); err != nil {
-		return ParsedConfig{}, fmt.Errorf("decode policy: %w", err)
-	}
-	if topology.SchemaVersion != schemaVersion || policy.SchemaVersion != schemaVersion {
-		return ParsedConfig{}, fmt.Errorf("topology and policy schema versions must be %d", schemaVersion)
+	if strings.TrimSpace(manifest.ActiveResearch) == "" {
+		return ParsedConfig{}, fmt.Errorf("manifest requires an active research")
 	}
 	return resolve(manifest, topology, policy)
 }
 
+func LoadLiveConfig(path string) (ParsedLiveConfig, error) {
+	manifest, topology, policy, err := loadDocuments(path)
+	if err != nil {
+		return ParsedLiveConfig{}, err
+	}
+	if strings.TrimSpace(manifest.ActiveLive) == "" {
+		return ParsedLiveConfig{}, fmt.Errorf("manifest requires an active live profile")
+	}
+	return resolveLive(manifest, topology, policy)
+}
+
+func loadDocuments(path string) (Manifest, Topology, Policy, error) {
+	manifestData, err := os.ReadFile(path)
+	if err != nil {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("read configuration manifest: %w", err)
+	}
+	var manifest Manifest
+	if err := decodeYAML(manifestData, &manifest); err != nil {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("decode configuration manifest: %w", err)
+	}
+	if manifest.SchemaVersion != schemaVersion || strings.TrimSpace(manifest.Topology) == "" ||
+		strings.TrimSpace(manifest.Policy) == "" {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("manifest requires schema version, topology, and policy")
+	}
+	directory := filepath.Dir(path)
+	topologyData, err := os.ReadFile(filepath.Join(directory, manifest.Topology))
+	if err != nil {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("read topology: %w", err)
+	}
+	policyData, err := os.ReadFile(filepath.Join(directory, manifest.Policy))
+	if err != nil {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("read policy: %w", err)
+	}
+	var topology Topology
+	if err := decodeYAML(topologyData, &topology); err != nil {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("decode topology: %w", err)
+	}
+	var policy Policy
+	if err := decodeYAML(policyData, &policy); err != nil {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("decode policy: %w", err)
+	}
+	if topology.SchemaVersion != schemaVersion || policy.SchemaVersion != schemaVersion {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("topology and policy schema versions must be %d", schemaVersion)
+	}
+	return manifest, topology, policy, nil
+}
+
 func (c ParsedConfig) ResolveEndpoints(lookup LookupEnv) (map[string]string, error) {
+	return resolveEndpoints(c.Chains, lookup)
+}
+
+func (c ParsedLiveConfig) ResolveEndpoints(lookup LookupEnv) (map[string]string, error) {
+	return resolveEndpoints(c.Chains, lookup)
+}
+
+func resolveEndpoints(chains map[string]ResolvedChain, lookup LookupEnv) (map[string]string, error) {
 	if lookup == nil {
 		return nil, fmt.Errorf("environment lookup is required")
 	}
-	endpoints := make(map[string]string, len(c.Chains)*2)
-	for id, chain := range c.Chains {
+	endpoints := make(map[string]string, len(chains)*2)
+	for id, chain := range chains {
 		name := chain.RPCURLEnv
 		if name == "" {
 			name = chain.HTTPURLEnv
@@ -356,47 +541,73 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 		chains[chain.ID] = chain
 	}
 	for _, resolved := range markets {
+		if resolved.QuoteSource != "" && resolved.ReferenceQuote != "" {
+			return ParsedConfig{}, fmt.Errorf("market %q cannot configure both primary and reference quote sources", resolved.ID)
+		}
 		if resolved.ReferenceQuote != "" {
 			if _, ok := quoteSources[resolved.ReferenceQuote]; !ok {
 				return ParsedConfig{}, fmt.Errorf("market %q references unknown quote source %q", resolved.ID, resolved.ReferenceQuote)
+			}
+		}
+		if resolved.QuoteSource != "" {
+			source, ok := quoteSources[resolved.QuoteSource]
+			if !ok {
+				return ParsedConfig{}, fmt.Errorf("market %q references unknown quote source %q", resolved.ID, resolved.QuoteSource)
+			}
+			chain := chains[resolved.Chain]
+			if source.Kind == "jupiter" && chain.Kind != "solana" {
+				return ParsedConfig{}, fmt.Errorf("jupiter market %q must use a Solana chain", resolved.ID)
+			}
+			if source.Kind == "kyberswap" && chain.Kind != "evm" {
+				return ParsedConfig{}, fmt.Errorf("KyberSwap market %q must use an EVM chain", resolved.ID)
+			}
+			if len(resolved.TriggerPools) == 0 {
+				return ParsedConfig{}, fmt.Errorf("market %q remote quotes require trigger pools", resolved.ID)
 			}
 		}
 	}
 	if markets[0].Base.Token.Asset != markets[1].Base.Token.Asset || markets[0].Quote.Token.Asset != markets[1].Quote.Token.Asset {
 		return ParsedConfig{}, fmt.Errorf("setup markets must share base and quote assets")
 	}
-	priceConfig, ok := topology.PriceSources[research.PriceSource]
-	if !ok || market.AssetID(priceConfig.BaseAsset) != markets[0].Quote.Token.Asset ||
-		market.AssetID(priceConfig.QuoteAsset) != market.AssetID(research.FixedCost.Asset) {
-		return ParsedConfig{}, fmt.Errorf("price source must convert market quote asset into fixed-cost asset")
-	}
-	if err := validateProvider(priceConfig.Primary, topology.Chains); err != nil {
-		return ParsedConfig{}, fmt.Errorf("primary price provider: %w", err)
-	}
-	if err := validateProvider(priceConfig.Fallback, topology.Chains); err != nil {
-		return ParsedConfig{}, fmt.Errorf("fallback price provider: %w", err)
-	}
-	if priceConfig.Primary.Kind != "coingecko" || priceConfig.Fallback.Kind != "chainlink" {
-		return ParsedConfig{}, fmt.Errorf("price source requires CoinGecko primary and Chainlink fallback")
-	}
-	for _, provider := range []ProviderConfig{priceConfig.Primary, priceConfig.Fallback} {
-		if provider.Chain != "" {
-			chain, err := resolveChain(provider.Chain, topology.Chains[provider.Chain])
-			if err != nil {
-				return ParsedConfig{}, err
+	var priceSource ResolvedPriceSource
+	fixedCostAsset := market.AssetID(research.FixedCost.Asset)
+	if fixedCostAsset != markets[0].Quote.Token.Asset {
+		priceConfig, ok := topology.PriceSources[research.PriceSource]
+		if !ok || market.AssetID(priceConfig.BaseAsset) != markets[0].Quote.Token.Asset ||
+			market.AssetID(priceConfig.QuoteAsset) != fixedCostAsset {
+			return ParsedConfig{}, fmt.Errorf("price source must convert market quote asset into fixed-cost asset")
+		}
+		if err := validateProvider(priceConfig.Primary, topology.Chains); err != nil {
+			return ParsedConfig{}, fmt.Errorf("primary price provider: %w", err)
+		}
+		if err := validateProvider(priceConfig.Fallback, topology.Chains); err != nil {
+			return ParsedConfig{}, fmt.Errorf("fallback price provider: %w", err)
+		}
+		if priceConfig.Primary.Kind != "coingecko" || priceConfig.Fallback.Kind != "chainlink" {
+			return ParsedConfig{}, fmt.Errorf("price source requires CoinGecko primary and Chainlink fallback")
+		}
+		for _, provider := range []ProviderConfig{priceConfig.Primary, priceConfig.Fallback} {
+			if provider.Chain != "" {
+				chain, err := resolveChain(provider.Chain, topology.Chains[provider.Chain])
+				if err != nil {
+					return ParsedConfig{}, err
+				}
+				chains[chain.ID] = chain
 			}
-			chains[chain.ID] = chain
+		}
+		priceSource = ResolvedPriceSource{
+			ID: market.SourceID(research.PriceSource), Base: market.AssetID(priceConfig.BaseAsset),
+			Quote: market.AssetID(priceConfig.QuoteAsset), Primary: priceConfig.Primary, Fallback: priceConfig.Fallback,
+		}
+	} else {
+		priceSource = ResolvedPriceSource{
+			ID: market.SourceID("fixed-cost-parity"), Base: fixedCostAsset, Quote: fixedCostAsset,
 		}
 	}
 	fixedCost, err := positiveOrZero(research.FixedCost.Amount, "fixed cost")
 	if err != nil {
 		return ParsedConfig{}, err
 	}
-	minimum, err := positive(research.Sizing.Minimum, "minimum size")
-	if err != nil {
-		return ParsedConfig{}, err
-	}
-	maximum, err := positive(research.Sizing.Maximum, "maximum size")
 	sizingAsset := strings.TrimSpace(research.Sizing.Asset)
 	if sizingAsset == "" {
 		sizingAsset = "quote"
@@ -404,12 +615,74 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 	if sizingAsset != "base" && sizingAsset != "quote" {
 		return ParsedConfig{}, fmt.Errorf("sizing asset must be base or quote")
 	}
-	if err != nil || maximum.Cmp(minimum) <= 0 || research.Sizing.Kind != "linear_range" || research.Sizing.Samples < 2 {
-		return ParsedConfig{}, fmt.Errorf("linear sizing requires increasing positive bounds and at least two samples")
+	var minimum, maximum *big.Rat
+	sizeSamples := research.Sizing.Samples
+	sizingKind := strings.TrimSpace(research.Sizing.Kind)
+	switch sizingKind {
+	case "fixed":
+		if strings.TrimSpace(research.Sizing.Minimum) != "" || strings.TrimSpace(research.Sizing.Maximum) != "" || research.Sizing.Samples != 0 {
+			return ParsedConfig{}, fmt.Errorf("fixed sizing requires amount and forbids range bounds and samples")
+		}
+		amount, amountErr := positive(research.Sizing.Amount, "fixed sizing amount")
+		if amountErr != nil {
+			return ParsedConfig{}, amountErr
+		}
+		minimum = new(big.Rat).Set(amount)
+		maximum = new(big.Rat).Set(amount)
+		sizeSamples = 1
+	case "linear_range":
+		if strings.TrimSpace(research.Sizing.Amount) != "" {
+			return ParsedConfig{}, fmt.Errorf("linear sizing forbids a fixed amount")
+		}
+		var rangeErr error
+		minimum, rangeErr = positive(research.Sizing.Minimum, "minimum size")
+		if rangeErr != nil {
+			return ParsedConfig{}, rangeErr
+		}
+		maximum, rangeErr = positive(research.Sizing.Maximum, "maximum size")
+		if rangeErr != nil || maximum.Cmp(minimum) <= 0 || research.Sizing.Samples < 2 {
+			return ParsedConfig{}, fmt.Errorf("linear sizing requires increasing positive bounds and at least two samples")
+		}
+	default:
+		return ParsedConfig{}, fmt.Errorf("sizing kind must be fixed or linear_range")
 	}
 	minimumNet, err := positiveOrZero(research.MinNetProfit, "minimum net profit")
 	if err != nil {
 		return ParsedConfig{}, err
+	}
+	evaluationMode := strings.TrimSpace(research.EvaluationMode)
+	if evaluationMode == "" {
+		evaluationMode = "two_market"
+	}
+	if evaluationMode != "two_market" && evaluationMode != "best_buy_opposite_sell" {
+		return ParsedConfig{}, fmt.Errorf("unsupported research evaluation mode %q", evaluationMode)
+	}
+	windowQualification := strings.TrimSpace(research.WindowQualification)
+	if windowQualification == "" {
+		windowQualification = "economic"
+	}
+	if windowQualification != "economic" && windowQualification != "policy_qualified" {
+		return ParsedConfig{}, fmt.Errorf("unsupported window qualification %q", windowQualification)
+	}
+	if research.IdleEvaluationIntervalMS < 0 {
+		return ParsedConfig{}, fmt.Errorf("idle evaluation interval cannot be negative")
+	}
+	idleInterval := time.Duration(research.IdleEvaluationIntervalMS) * time.Millisecond
+	retryAttempts := research.Retry.Attempts
+	if retryAttempts == 0 {
+		retryAttempts = 1
+	}
+	if research.Retry.Attempts < 0 || retryAttempts > 1 || research.Retry.DelayMS < 0 {
+		return ParsedConfig{}, fmt.Errorf("research retry policy is invalid")
+	}
+	retryDelay := time.Duration(research.Retry.DelayMS) * time.Millisecond
+	if retryDelay == 0 {
+		retryDelay = 100 * time.Millisecond
+	}
+	if research.Telegram.Enabled &&
+		(!environmentName.MatchString(research.Telegram.BotTokenEnv) ||
+			!environmentName.MatchString(research.Telegram.ChatIDEnv)) {
+		return ParsedConfig{}, fmt.Errorf("telegram alert environment is invalid")
 	}
 	bundle := struct {
 		Manifest Manifest
@@ -424,8 +697,207 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 	return ParsedConfig{
 		Hash: hex.EncodeToString(sum[:]), ResearchID: manifest.ActiveResearch, RunID: research.RunID,
 		SetupID: research.Setup, InventoryMode: research.InventoryMode, Assets: assets, Chains: chains, Markets: markets, QuoteSources: quoteSources,
-		PriceSource: ResolvedPriceSource{ID: market.SourceID(research.PriceSource), Base: market.AssetID(priceConfig.BaseAsset), Quote: market.AssetID(priceConfig.QuoteAsset), Primary: priceConfig.Primary, Fallback: priceConfig.Fallback},
-		FixedCost:   fixedCost, MinimumSize: minimum, MaximumSize: maximum, SizeSamples: research.Sizing.Samples, SizingAsset: sizingAsset, MinimumNet: minimumNet,
+		PriceSource: priceSource,
+		FixedCost:   fixedCost, SizingKind: sizingKind, MinimumSize: minimum, MaximumSize: maximum,
+		SizeSamples: sizeSamples, SizingAsset: sizingAsset, MinimumNet: minimumNet,
+		EvaluationMode: evaluationMode, IdleEvaluationInterval: idleInterval,
+		WindowQualification: windowQualification, RetryAttempts: retryAttempts, RetryDelay: retryDelay,
+		TelegramEnabled: research.Telegram.Enabled, TelegramBotTokenEnv: research.Telegram.BotTokenEnv,
+		TelegramChatIDEnv: research.Telegram.ChatIDEnv,
+	}, nil
+}
+
+func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiveConfig, error) {
+	config, ok := policy.Live[manifest.ActiveLive]
+	if !ok || strings.TrimSpace(config.RunID) == "" || config.InventoryMode != "prefunded_live" {
+		return ParsedLiveConfig{}, fmt.Errorf("active live profile requires a run ID and prefunded_live inventory")
+	}
+	setup, ok := policy.Setups[config.Setup]
+	if !ok || len(setup.Markets) != 2 || setup.Markets[0] == setup.Markets[1] {
+		return ParsedLiveConfig{}, fmt.Errorf("active live setup requires two distinct markets")
+	}
+	assets := make(map[market.AssetID]market.Asset, len(topology.Assets))
+	for id, candidate := range topology.Assets {
+		if strings.TrimSpace(id) == "" || strings.TrimSpace(candidate.Symbol) == "" {
+			return ParsedLiveConfig{}, fmt.Errorf("assets require IDs and symbols")
+		}
+		assets[market.AssetID(id)] = market.Asset{ID: market.AssetID(id), Symbol: candidate.Symbol}
+	}
+	quoteSources := make(map[string]ResolvedQuoteSource, len(topology.QuoteSources))
+	for id, candidate := range topology.QuoteSources {
+		resolved, err := resolveQuoteSource(id, candidate)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		quoteSources[id] = resolved
+	}
+	chains := make(map[string]ResolvedChain)
+	markets := [2]ResolvedMarket{}
+	remoteMarkets := 0
+	for index, id := range setup.Markets {
+		resolved, chain, err := resolveMarket(id, topology, assets)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		if resolved.QuoteSource != "" {
+			if _, exists := quoteSources[resolved.QuoteSource]; !exists {
+				return ParsedLiveConfig{}, fmt.Errorf("market %q references unknown quote source %q", resolved.ID, resolved.QuoteSource)
+			}
+			if chain.Kind != "solana" || len(resolved.TriggerPools) == 0 {
+				return ParsedLiveConfig{}, fmt.Errorf("live remote market %q requires Solana trigger pools", resolved.ID)
+			}
+			remoteMarkets++
+		}
+		markets[index], chains[chain.ID] = resolved, chain
+	}
+	if remoteMarkets != 1 {
+		return ParsedLiveConfig{}, fmt.Errorf("initial live vertical requires exactly one event-refreshed remote market")
+	}
+	if markets[0].Base.Token.Asset != markets[1].Base.Token.Asset ||
+		markets[0].Quote.Token.Asset != markets[1].Quote.Token.Asset {
+		return ParsedLiveConfig{}, fmt.Errorf("live setup markets must share base and quote assets")
+	}
+	if market.AssetID(config.Notional.Asset) != markets[0].Quote.Token.Asset ||
+		market.AssetID(config.ExecutionCost.Asset) != markets[0].Quote.Token.Asset ||
+		market.AssetID(config.MaxExecutionCost.Asset) != markets[0].Quote.Token.Asset ||
+		market.AssetID(config.MaxBaseExposure.Asset) != markets[0].Base.Token.Asset ||
+		market.AssetID(config.MinNetProfit.Asset) != markets[0].Quote.Token.Asset {
+		return ParsedLiveConfig{}, fmt.Errorf("live economic limits use inconsistent setup assets")
+	}
+	notional, err := positive(config.Notional.Amount, "live notional")
+	if err != nil {
+		return ParsedLiveConfig{}, err
+	}
+	executionCost, err := positive(config.ExecutionCost.Amount, "live execution cost")
+	if err != nil {
+		return ParsedLiveConfig{}, err
+	}
+	maximumExecutionCost, err := positive(config.MaxExecutionCost.Amount, "live maximum execution cost")
+	if err != nil {
+		return ParsedLiveConfig{}, err
+	}
+	if executionCost.Cmp(maximumExecutionCost) > 0 {
+		return ParsedLiveConfig{}, fmt.Errorf("live execution cost exceeds its configured maximum")
+	}
+	maximumBaseExposure, err := positive(config.MaxBaseExposure.Amount, "live maximum base exposure")
+	if err != nil {
+		return ParsedLiveConfig{}, err
+	}
+	minimumNet, err := positiveOrZero(config.MinNetProfit.Amount, "live minimum net profit")
+	if err != nil {
+		return ParsedLiveConfig{}, err
+	}
+	if config.SlippageBPS == 0 || config.SlippageBPS > 10_000 {
+		return ParsedLiveConfig{}, fmt.Errorf("live slippage must be between 1 and 10000 basis points")
+	}
+	tip, ok := new(big.Int).SetString(config.TipLamports, 10)
+	if !ok || tip.Sign() <= 0 {
+		return ParsedLiveConfig{}, fmt.Errorf("live tip_lamports must be a positive integer")
+	}
+	if strings.TrimSpace(config.ComputeUnitPricePercentile) == "" || config.ComputeUnitLimit == 0 ||
+		config.ComputeUnitLimit > 1_400_000 {
+		return ParsedLiveConfig{}, fmt.Errorf("live compute-unit policy is incomplete")
+	}
+	if config.FeeCacheMaxAgeMS <= 0 ||
+		config.BlockhashSlotsToExpiry == 0 || config.BlockhashSlotsToExpiry > 300 ||
+		config.BuildToBroadcastTimeoutMS <= 0 || config.EVMDeadlineSeconds <= 0 {
+		return ParsedLiveConfig{}, fmt.Errorf("live transaction validity policy is invalid")
+	}
+	synchronous := strings.ToUpper(strings.TrimSpace(config.OperationalStore.Synchronous))
+	if synchronous == "" {
+		synchronous = "FULL"
+	}
+	if strings.TrimSpace(config.OperationalStore.Path) == "" || synchronous != "FULL" && synchronous != "NORMAL" {
+		return ParsedLiveConfig{}, fmt.Errorf("live operational store requires path and FULL or NORMAL synchronous mode")
+	}
+	accounts := make(map[string]ResolvedLiveAccount, len(config.Accounts))
+	for chainID := range chains {
+		account, exists := config.Accounts[chainID]
+		chain := chains[chainID]
+		if !exists || strings.TrimSpace(account.ID) == "" ||
+			!environmentName.MatchString(account.PublicAddressEnv) ||
+			!environmentName.MatchString(account.SignerEnv) {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live chain %q requires account ID, public address, and signer environments", chainID,
+			)
+		}
+		switch chain.Kind {
+		case "solana":
+			if !environmentName.MatchString(account.SenderURLEnv) || account.FanoutRPCURLEnv != "" || account.ContractAddressEnv != "" {
+				return ParsedLiveConfig{}, fmt.Errorf("live Solana account %q requires only sender_url_env", account.ID)
+			}
+		case "evm":
+			if !environmentName.MatchString(account.FanoutRPCURLEnv) || !environmentName.MatchString(account.ContractAddressEnv) ||
+				account.SenderURLEnv != "" {
+				return ParsedLiveConfig{}, fmt.Errorf("live EVM account %q requires fanout and contract environments", account.ID)
+			}
+		default:
+			return ParsedLiveConfig{}, fmt.Errorf("live chain %q has unsupported kind %q", chainID, chain.Kind)
+		}
+		accounts[chainID] = ResolvedLiveAccount{
+			ID: account.ID, Chain: chainID, PublicAddressEnv: account.PublicAddressEnv,
+			SignerEnv:    account.SignerEnv,
+			SenderURLEnv: account.SenderURLEnv, FanoutRPCURLEnv: account.FanoutRPCURLEnv,
+			ContractAddressEnv: account.ContractAddressEnv,
+		}
+	}
+	tokenByID := make(map[string]market.Token)
+	for _, configuredMarket := range markets {
+		tokenByID[string(configuredMarket.Base.Token.ID)] = configuredMarket.Base.Token
+		tokenByID[string(configuredMarket.Quote.Token.ID)] = configuredMarket.Quote.Token
+	}
+	inventoryBalances := make([]ResolvedInventoryBalance, 0, len(config.Inventory))
+	covered := make(map[string]bool)
+	for _, balance := range config.Inventory {
+		account, accountOK := accounts[balance.Chain]
+		token, tokenOK := tokenByID[balance.Token]
+		amount, amountOK := new(big.Rat).SetString(balance.Amount)
+		if !accountOK || account.ID != balance.Account || !tokenOK || token.Chain != market.ChainID(balance.Chain) ||
+			!amountOK || amount.Sign() <= 0 {
+			return ParsedLiveConfig{}, fmt.Errorf("live inventory balance is invalid")
+		}
+		key := balance.Chain + "/" + balance.Account + "/" + balance.Token
+		if covered[key] {
+			return ParsedLiveConfig{}, fmt.Errorf("live inventory repeats balance %q", key)
+		}
+		covered[key] = true
+		inventoryBalances = append(inventoryBalances, ResolvedInventoryBalance{
+			Chain: balance.Chain, Account: balance.Account, Token: token, Amount: amount,
+		})
+	}
+	for _, configuredMarket := range markets {
+		account := accounts[configuredMarket.Venue.Chain]
+		for _, token := range []market.Token{configuredMarket.Base.Token, configuredMarket.Quote.Token} {
+			key := configuredMarket.Venue.Chain + "/" + account.ID + "/" + string(token.ID)
+			if !covered[key] {
+				return ParsedLiveConfig{}, fmt.Errorf("live inventory is missing prefunded token %q", token.ID)
+			}
+		}
+	}
+	bundle := struct {
+		Manifest Manifest
+		Topology Topology
+		Policy   Policy
+	}{manifest, topology, policy}
+	canonical, err := json.Marshal(bundle)
+	if err != nil {
+		return ParsedLiveConfig{}, err
+	}
+	sum := sha256.Sum256(canonical)
+	return ParsedLiveConfig{
+		Hash: hex.EncodeToString(sum[:]), LiveID: manifest.ActiveLive, RunID: config.RunID,
+		SetupID: config.Setup, Assets: assets, Chains: chains, Markets: markets, QuoteSources: quoteSources,
+		Notional: notional, ExecutionCost: executionCost,
+		MaximumExecutionCost: maximumExecutionCost, MaximumBaseExposure: maximumBaseExposure,
+		MinimumNet:     minimumNet,
+		FeeCacheMaxAge: time.Duration(config.FeeCacheMaxAgeMS) * time.Millisecond,
+		SlippageBPS:    config.SlippageBPS, TipLamports: config.TipLamports,
+		ComputeUnitPricePercentile: config.ComputeUnitPricePercentile, ComputeUnitLimit: config.ComputeUnitLimit,
+		BlockhashSlotsToExpiry:  config.BlockhashSlotsToExpiry,
+		BuildToBroadcastTimeout: time.Duration(config.BuildToBroadcastTimeoutMS) * time.Millisecond,
+		EVMDeadline:             time.Duration(config.EVMDeadlineSeconds) * time.Second,
+		OperationalStorePath:    config.OperationalStore.Path, SQLiteSynchronous: synchronous,
+		Accounts: accounts, Inventory: inventoryBalances,
 	}, nil
 }
 
@@ -433,6 +905,45 @@ func resolveMarket(id string, topology Topology, assets map[market.AssetID]marke
 	config, ok := topology.Markets[id]
 	if !ok {
 		return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("unknown market %q", id)
+	}
+	if config.QuoteSource != "" && config.Chain != "" {
+		if config.Venue != "" || config.Path != "" {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("remote market %q requires chain and quote_source without venue or path", id)
+		}
+		chain, err := resolveChain(config.Chain, topology.Chains[config.Chain])
+		if err != nil {
+			return ResolvedMarket{}, ResolvedChain{}, err
+		}
+		base, err := resolveToken(config.BaseToken, topology.Tokens[config.BaseToken], chain.ID, assets)
+		if err != nil {
+			return ResolvedMarket{}, ResolvedChain{}, err
+		}
+		quote, err := resolveToken(config.QuoteToken, topology.Tokens[config.QuoteToken], chain.ID, assets)
+		if err != nil || base.Token.ID == quote.Token.ID || base.Token.Asset == quote.Token.Asset {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q requires distinct valid endpoints", id)
+		}
+		triggers, err := resolveTriggerPools(config.TriggerPools, nil, chain.ID, topology)
+		if err != nil {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q trigger pools: %w", id, err)
+		}
+		if len(triggers) == 0 {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("remote market %q requires trigger pools", id)
+		}
+		for _, trigger := range triggers {
+			if strings.TrimSpace(trigger.Kind) == "" {
+				return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("remote market %q trigger pool %q requires kind", id, trigger.ID)
+			}
+			if chain.Kind == "evm" && !common.IsHexAddress(trigger.Address) {
+				return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("trigger pool %q has invalid EVM address", trigger.ID)
+			}
+			if chain.Kind == "solana" && len(trigger.Address) < 32 {
+				return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("trigger pool %q has invalid Solana public key", trigger.ID)
+			}
+		}
+		return ResolvedMarket{
+			ID: market.MarketID(id), Chain: chain.ID, Base: base, Quote: quote,
+			QuoteSource: config.QuoteSource, TriggerPools: triggers, ReferenceQuote: config.ReferenceQuote,
+		}, chain, nil
 	}
 	if config.Path != "" {
 		path, ok := topology.Paths[config.Path]
@@ -458,7 +969,18 @@ func resolveMarket(id string, topology Topology, assets map[market.AssetID]marke
 		if err != nil || base.Token.ID == quote.Token.ID || base.Token.Asset == quote.Token.Asset {
 			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q requires distinct valid endpoints", id)
 		}
-		return ResolvedMarket{ID: market.MarketID(id), Venue: resolvedPath[0].Venue, Base: base, Quote: quote, Path: resolvedPath, ReferenceQuote: config.ReferenceQuote}, chain, nil
+		triggers, err := resolveTriggerPools(config.TriggerPools, resolvedPath, chain.ID, topology)
+		if err != nil {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q trigger pools: %w", id, err)
+		}
+		if config.QuoteSource == "" && len(config.TriggerPools) > 0 {
+			return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q trigger pools require quote_source", id)
+		}
+		return ResolvedMarket{
+			ID: market.MarketID(id), Chain: chain.ID, Venue: resolvedPath[0].Venue,
+			Base: base, Quote: quote, Path: resolvedPath, QuoteSource: config.QuoteSource,
+			TriggerPools: triggers, ReferenceQuote: config.ReferenceQuote,
+		}, chain, nil
 	}
 	venueConfig, ok := topology.Venues[config.Venue]
 	if !ok {
@@ -480,7 +1002,82 @@ func resolveMarket(id string, topology Topology, assets map[market.AssetID]marke
 	if err != nil {
 		return ResolvedMarket{}, ResolvedChain{}, err
 	}
-	return ResolvedMarket{ID: market.MarketID(id), Venue: venue, Base: base, Quote: quote, Path: []ResolvedHop{{Pool: config.Venue, Venue: venue, In: base, Out: quote}}, ReferenceQuote: config.ReferenceQuote}, chain, nil
+	path := []ResolvedHop{{Pool: config.Venue, Venue: venue, In: base, Out: quote}}
+	triggers, err := resolveTriggerPools(config.TriggerPools, path, chain.ID, topology)
+	if err != nil {
+		return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q trigger pools: %w", id, err)
+	}
+	if config.QuoteSource == "" && len(config.TriggerPools) > 0 {
+		return ResolvedMarket{}, ResolvedChain{}, fmt.Errorf("market %q trigger pools require quote_source", id)
+	}
+	return ResolvedMarket{
+		ID: market.MarketID(id), Chain: chain.ID, Venue: venue, Base: base, Quote: quote,
+		Path: path, QuoteSource: config.QuoteSource, TriggerPools: triggers, ReferenceQuote: config.ReferenceQuote,
+	}, chain, nil
+}
+
+func resolveTriggerPools(configured []string, path []ResolvedHop, chain string, topology Topology) ([]ResolvedTriggerPool, error) {
+	ids := append([]string(nil), configured...)
+	if len(ids) == 0 {
+		for _, hop := range path {
+			ids = append(ids, hop.Pool)
+		}
+	}
+	result := make([]ResolvedTriggerPool, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return nil, fmt.Errorf("pool ID cannot be empty")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return nil, fmt.Errorf("duplicate pool %q", id)
+		}
+		seen[id] = struct{}{}
+		pool, ok := topology.Pools[id]
+		if !ok {
+			// Legacy one-pool markets identify their pool through the venue.
+			for _, hop := range path {
+				if hop.Pool == id && hop.Venue.PoolText != "" {
+					result = append(result, ResolvedTriggerPool{
+						ID: id, Chain: chain, Kind: hop.Venue.Kind, Address: hop.Venue.PoolText,
+					})
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				return nil, fmt.Errorf("unknown pool %q", id)
+			}
+			continue
+		}
+		poolChain := pool.Chain
+		if poolChain == "" {
+			poolChain = chain
+		}
+		if poolChain != chain {
+			return nil, fmt.Errorf("pool %q belongs to chain %q, market uses %q", id, poolChain, chain)
+		}
+		address := strings.TrimSpace(pool.Address)
+		if address == "" {
+			venue, venueOK := topology.Venues[pool.Venue]
+			if !venueOK {
+				return nil, fmt.Errorf("pool %q references unknown venue", id)
+			}
+			address = strings.TrimSpace(venue.PoolAddress)
+		}
+		if address == "" {
+			return nil, fmt.Errorf("pool %q has no address", id)
+		}
+		kind := strings.TrimSpace(pool.Kind)
+		if kind == "" && pool.Venue != "" {
+			if venue, venueOK := topology.Venues[pool.Venue]; venueOK {
+				kind = venue.Kind
+			}
+		}
+		result = append(result, ResolvedTriggerPool{ID: id, Chain: poolChain, Kind: kind, Address: address})
+	}
+	return result, nil
 }
 
 func resolvePath(id string, config PathConfig, topology Topology, assets map[market.AssetID]market.Asset) ([]ResolvedHop, ResolvedChain, error) {
@@ -636,8 +1233,48 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 }
 
 func resolveQuoteSource(id string, config QuoteSourceConfig) (ResolvedQuoteSource, error) {
-	if strings.TrimSpace(id) == "" || config.Kind != "jupiter" || strings.TrimSpace(config.TakerEnv) == "" || !environmentName.MatchString(config.TakerEnv) {
-		return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid Jupiter profile", id)
+	if strings.TrimSpace(id) == "" {
+		return ResolvedQuoteSource{}, fmt.Errorf("quote source ID is required")
+	}
+	switch config.Kind {
+	case "jupiter":
+		if config.TakerEnv != "" && !environmentName.MatchString(config.TakerEnv) ||
+			config.ClientIDEnv != "" || config.ChainSlug != "" {
+			return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid Jupiter profile", id)
+		}
+		if config.QuotePath != "" &&
+			(!strings.HasPrefix(config.QuotePath, "/") || strings.ContainsAny(config.QuotePath, "?#")) {
+			return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid Jupiter quote path", id)
+		}
+		config.ExpectedMode = strings.ToLower(strings.TrimSpace(config.ExpectedMode))
+		if config.ExpectedMode != "" && config.ExpectedMode != "manual" && config.ExpectedMode != "ultra" {
+			return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid Jupiter expected mode", id)
+		}
+		if config.ExpectedMode != "" && config.QuotePath == "" {
+			return ResolvedQuoteSource{}, fmt.Errorf("quote source %q expected mode requires an explicit quote path", id)
+		}
+		config.SwapMode = strings.TrimSpace(config.SwapMode)
+		if config.SwapMode != "" && config.SwapMode != "ExactIn" {
+			return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid Jupiter swap mode", id)
+		}
+		config.BroadcastFeeType = strings.TrimSpace(config.BroadcastFeeType)
+		if config.BroadcastFeeType != "" && config.BroadcastFeeType != "maxCap" &&
+			config.BroadcastFeeType != "exactFee" {
+			return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid Jupiter broadcast fee type", id)
+		}
+		config.ExcludeDexes = strings.TrimSpace(config.ExcludeDexes)
+		config.ExcludeRouters = strings.TrimSpace(config.ExcludeRouters)
+		config.ClientPlatform = strings.TrimSpace(config.ClientPlatform)
+	case "kyberswap":
+		if !environmentName.MatchString(config.ClientIDEnv) || strings.TrimSpace(config.ChainSlug) == "" ||
+			config.TakerEnv != "" || config.APIKeyEnv != "" || config.MaxAccounts != 0 ||
+			config.QuotePath != "" || config.ExpectedMode != "" || config.SwapMode != "" ||
+			config.PriorityFeeLamports != 0 || config.BroadcastFeeType != "" || config.UseWSOL != nil ||
+			config.ExcludeDexes != "" || config.ExcludeRouters != "" || config.ClientPlatform != "" {
+			return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid KyberSwap profile", id)
+		}
+	default:
+		return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has unsupported kind %q", id, config.Kind)
 	}
 	if config.APIKeyEnv != "" && !environmentName.MatchString(config.APIKeyEnv) {
 		return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid API key environment", id)
@@ -645,7 +1282,16 @@ func resolveQuoteSource(id string, config QuoteSourceConfig) (ResolvedQuoteSourc
 	if config.SlippageBPS > 10_000 || config.MaxAccounts > 256 {
 		return ResolvedQuoteSource{}, fmt.Errorf("quote source %q has invalid request limits", id)
 	}
-	return ResolvedQuoteSource{ID: id, Kind: config.Kind, BaseURL: config.BaseURL, TakerEnv: config.TakerEnv, APIKeyEnv: config.APIKeyEnv, SlippageBPS: config.SlippageBPS, MaxAccounts: config.MaxAccounts}, nil
+	return ResolvedQuoteSource{
+		ID: id, Kind: config.Kind, BaseURL: config.BaseURL, QuotePath: config.QuotePath,
+		ExpectedMode: config.ExpectedMode, TakerEnv: config.TakerEnv,
+		APIKeyEnv: config.APIKeyEnv, ClientIDEnv: config.ClientIDEnv, ChainSlug: config.ChainSlug,
+		SlippageBPS: config.SlippageBPS, MaxAccounts: config.MaxAccounts,
+		SwapMode: config.SwapMode, PriorityFeeLamports: config.PriorityFeeLamports,
+		BroadcastFeeType: config.BroadcastFeeType, UseWSOL: config.UseWSOL,
+		ExcludeDexes: config.ExcludeDexes, ExcludeRouters: config.ExcludeRouters,
+		ClientPlatform: config.ClientPlatform,
+	}, nil
 }
 
 func validateProvider(config ProviderConfig, chains map[string]ChainConfig) error {

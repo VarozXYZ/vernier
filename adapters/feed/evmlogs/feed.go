@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	BlockPositionKind      market.SourcePositionKind  = "block"
-	BlockHashReferenceKind market.SourceReferenceKind = "evm_block_hash"
+	BlockPositionKind        market.SourcePositionKind  = "block"
+	BlockHashReferenceKind   market.SourceReferenceKind = "evm_block_hash"
+	TransactionReferenceKind market.SourceReferenceKind = "evm_transaction_hash"
 )
 
 type Venue interface {
@@ -285,10 +286,14 @@ func ignoredLogReason(observed types.Log, highest uint64) string {
 }
 
 func (f *Feed) event(block evm.BlockReference, data market.EventData) market.MarketEvent {
+	reference := market.SourceReference{Kind: BlockHashReferenceKind, Value: block.Hash.Hex()}
+	if identified, ok := data.(interface{ EventReference() market.SourceReference }); ok {
+		reference = identified.EventReference()
+	}
 	event, err := market.NewMarketEvent(market.MarketEvent{
 		Market: f.market, Source: f.source,
 		Position:  market.SourcePosition{Kind: BlockPositionKind, Value: block.Number},
-		Reference: market.SourceReference{Kind: BlockHashReferenceKind, Value: block.Hash.Hex()},
+		Reference: reference,
 		Finality:  market.FinalityPreconfirmed, ReceivedAt: f.clock().UTC(), Data: data,
 	})
 	if err != nil {

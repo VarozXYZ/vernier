@@ -1,14 +1,19 @@
 package market
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrQuoteOutputRoundsToZero = errors.New("quote output rounds to zero")
 
 type QuotePurpose string
 
 const (
 	QuotePurposeResearchDiscovery QuotePurpose = "research_discovery"
+	QuotePurposeLiveDiscovery     QuotePurpose = "live_discovery"
+	QuotePurposeLiveValidation    QuotePurpose = "live_validation"
 )
 
 type QuoteMode string
@@ -17,6 +22,21 @@ const (
 	QuoteModeExactInput  QuoteMode = "exact_input"
 	QuoteModeExactOutput QuoteMode = "exact_output"
 )
+
+// QuoteQuality describes whether the amounts came directly from the quoted
+// snapshot/provider or were reused as an interim value. The empty value is
+// normalized to exact for backwards-compatible local quote constructors.
+type QuoteQuality string
+
+const (
+	QuoteQualityExact                QuoteQuality = "exact"
+	QuoteQualityCachedExact          QuoteQuality = "cached_exact"
+	QuoteQualityProportionalEstimate QuoteQuality = "proportional_estimate"
+)
+
+func (q QuoteQuality) RequiresRefresh() bool {
+	return q == QuoteQualityCachedExact || q == QuoteQualityProportionalEstimate
+}
 
 type QuoteFeeEffect string
 
@@ -54,8 +74,11 @@ type Quote struct {
 	Market          MarketID
 	SnapshotVersion uint64
 	SnapshotHash    [32]byte
+	SourcePosition  SourcePosition
+	ResponseHash    [32]byte
 	Purpose         QuotePurpose
 	Mode            QuoteMode
+	Quality         QuoteQuality
 	AmountIn        TokenAmount
 	AmountOut       TokenAmount
 	QuotedAt        time.Time
@@ -66,8 +89,18 @@ func NewQuote(quote Quote, fees ...QuoteFee) (Quote, error) {
 	if quote.Source == "" || quote.Market == "" || quote.SnapshotVersion == 0 {
 		return Quote{}, fmt.Errorf("quote source, market, and snapshot version are required")
 	}
+	if err := quote.SourcePosition.Validate(); err != nil {
+		return Quote{}, fmt.Errorf("quote source position: %w", err)
+	}
 	if quote.Purpose == "" || quote.QuotedAt.IsZero() || quote.Mode != QuoteModeExactInput && quote.Mode != QuoteModeExactOutput {
 		return Quote{}, fmt.Errorf("quote purpose, mode, and timestamp are required")
+	}
+	if quote.Quality == "" {
+		quote.Quality = QuoteQualityExact
+	}
+	if quote.Quality != QuoteQualityExact && quote.Quality != QuoteQualityCachedExact &&
+		quote.Quality != QuoteQualityProportionalEstimate {
+		return Quote{}, fmt.Errorf("invalid quote quality %q", quote.Quality)
 	}
 	if quote.AmountIn.Token() == "" || quote.AmountOut.Token() == "" {
 		return Quote{}, fmt.Errorf("quote amounts are required")

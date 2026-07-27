@@ -73,6 +73,35 @@ func TestRouteCacheReusesUnchangedHop(t *testing.T) {
 	}
 }
 
+func TestUncachedRouteRecomputesEveryHop(t *testing.T) {
+	first := &countingSource{id: "first"}
+	second := &countingSource{id: "second"}
+	source, err := routequote.NewUncached("route-local", market.Market{ID: "route", BaseToken: "base", QuoteToken: "quote"}, []routequote.Hop{
+		{Market: "hop1", In: "base", Out: "mid", Source: first},
+		{Market: "hop2", In: "mid", Out: "quote", Source: second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := quoteport.Input{
+		Snapshot: routeSnapshot(t, snapshot(t, "hop1", 1, 1), snapshot(t, "hop2", 1, 2)),
+		TokenIn:  "base", TokenOut: "quote", AmountIn: mustAmount("base", 10),
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now(),
+	}
+	for range 2 {
+		if _, err := source.Quote(context.Background(), input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if first.calls.Load() != 2 || second.calls.Load() != 2 {
+		t.Fatalf("uncached route calls first=%d second=%d", first.calls.Load(), second.calls.Load())
+	}
+	trace := source.LastTiming()
+	if trace.Cached || len(trace.Hops) != 2 || trace.Hops[0].Cached || trace.Hops[1].Cached {
+		t.Fatalf("uncached route reported cached work: %+v", trace)
+	}
+}
+
 func TestRouteQuotesReverseDirection(t *testing.T) {
 	first := &countingSource{id: "first"}
 	second := &countingSource{id: "second"}

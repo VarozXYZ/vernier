@@ -149,6 +149,7 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 	}
 	if *stream {
 		var outputMu sync.Mutex
+		reportsWritten := 0
 		var opportunityStore persistence.OpportunityStore
 		if strings.TrimSpace(*opportunityStorePath) != "" {
 			opportunityStore, err = sqlitepersistence.Open(*opportunityStorePath)
@@ -164,11 +165,20 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 			OnReport: func(report livecompare.Report) error {
 				outputMu.Lock()
 				defer outputMu.Unlock()
-				options := livecompare.OutputOptions{Calculations: livecompare.CalculationDetail(*calculations)}
-				if *format == "jsonl" {
-					return livecompare.WriteJSONLineWithOptions(stdout, report, options)
+				options := livecompare.OutputOptions{
+					Calculations: livecompare.CalculationDetail(*calculations),
+					OmitCost:     reportsWritten > 0,
 				}
-				return livecompare.WriteTextWithOptions(stdout, report, options)
+				var writeErr error
+				if *format == "jsonl" {
+					writeErr = livecompare.WriteJSONLineWithOptions(stdout, report, options)
+				} else {
+					writeErr = livecompare.WriteTextWithOptions(stdout, report, options)
+				}
+				if writeErr == nil {
+					reportsWritten++
+				}
+				return writeErr
 			},
 			OnReference: func(report livecompare.ReferenceReport) error {
 				outputMu.Lock()
@@ -281,6 +291,8 @@ type windowOutput struct {
 	Degraded          bool                      `json:"degraded"`
 	Trigger           *windowTriggerOutput      `json:"trigger,omitempty"`
 	Best              windowCandidateOutput     `json:"best"`
+	Threshold         string                    `json:"threshold"`
+	ThresholdAsset    string                    `json:"threshold_asset"`
 	Observations      []windowObservationOutput `json:"observations"`
 }
 
@@ -329,10 +341,11 @@ func writeWindowsText(writer io.Writer, records []arbitrage.WindowRecord) error 
 	}
 	for _, record := range records {
 		window := record.Window
-		if _, err := fmt.Fprintf(writer, "window: %s %s %s->%s classification=%s opened=%s closed=%s duration=%s best_size=%s %s best_net=%s %s reason=%s degraded=%t\n",
+		if _, err := fmt.Fprintf(writer, "window: %s %s %s->%s classification=%s opened=%s closed=%s duration=%s best_size=%s %s best_net=%s %s threshold=%s %s reason=%s degraded=%t\n",
 			window.ID, window.Status, window.Direction.BuyMarket, window.Direction.SellMarket, window.Classification,
 			window.OpenedAt.UTC().Format(time.RFC3339Nano), formatOptionalTime(window.ClosedAt), window.Duration(),
-			window.Best.Size.Decimal(8), window.Best.Size.Asset(), window.Best.NetPnL.Decimal(8), window.Best.NetPnL.Asset(), window.CloseReason, window.Degraded); err != nil {
+			window.Best.Size.Decimal(8), window.Best.Size.Asset(), window.Best.NetPnL.Decimal(8), window.Best.NetPnL.Asset(),
+			window.Threshold.Decimal(8), window.Threshold.Asset(), window.CloseReason, window.Degraded); err != nil {
 			return err
 		}
 		for _, observation := range record.Observations {
@@ -353,6 +366,7 @@ func newWindowOutput(record arbitrage.WindowRecord) windowOutput {
 		FirstProfitableAt: window.FirstProfitableAt.UTC().Format(time.RFC3339Nano), LastProfitableAt: window.LastProfitableAt.UTC().Format(time.RFC3339Nano),
 		ClosedAt: optionalJSONTime(window.ClosedAt), Duration: window.Duration().String(), CloseReason: window.CloseReason, Degraded: window.Degraded,
 		Best: newWindowCandidateOutput(window.Best), Observations: make([]windowObservationOutput, 0, len(record.Observations)),
+		Threshold: window.Threshold.String(), ThresholdAsset: string(window.Threshold.Asset()),
 	}
 	if window.HasTrigger {
 		output.Trigger = &windowTriggerOutput{Market: string(window.Trigger.Market), Source: string(window.Trigger.Source), PositionKind: string(window.Trigger.Position.Kind), PositionValue: window.Trigger.Position.Value, ReferenceKind: string(window.Trigger.Reference.Kind), ReferenceValue: window.Trigger.Reference.Value, At: window.Trigger.At.UTC().Format(time.RFC3339Nano)}

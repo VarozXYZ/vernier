@@ -2,6 +2,7 @@ package uniswapv3_test
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -48,6 +49,22 @@ func TestExactInputQuoteMatchesIndependentSingleRangeVector(t *testing.T) {
 	}
 	if quote.AmountOut.String() != "996999" || quote.Fees()[0].Amount().String() != "3000" {
 		t.Fatalf("quote output=%s fee=%s, want 996999 and 3000", quote.AmountOut, quote.Fees()[0].Amount())
+	}
+}
+
+func TestExactInputQuoteReturnsTypedRoundedZeroError(t *testing.T) {
+	snapshot := snapshotForTest(t, big.NewInt(1_000_000_000_000), nil)
+	quoter, err := uniswapv3.NewQuoter("local-v3", testMarket(), "token0", "token1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	amountIn, _ := market.ParseTokenAmount("token0", "1")
+	_, err = quoter.Quote(context.Background(), quoteport.Input{
+		Snapshot: snapshot, TokenIn: "token0", TokenOut: "token1", AmountIn: amountIn,
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: testTime().Add(time.Second),
+	})
+	if !errors.Is(err, market.ErrQuoteOutputRoundsToZero) {
+		t.Fatalf("expected typed rounded-zero error, got %v", err)
 	}
 }
 
@@ -149,6 +166,47 @@ func TestReducerAcceptsZeroLiquidityProtocolEvent(t *testing.T) {
 	next := applyV3(t, mirror, v3Event(t, 11, update))
 	if next.Data().(uniswapv3.Snapshot).Liquidity().Cmp(initial.Data().(uniswapv3.Snapshot).Liquidity()) != 0 {
 		t.Fatal("zero-liquidity event changed active liquidity")
+	}
+}
+
+func TestBoundedReducerIgnoresUncoveredBoundariesButUpdatesActiveLiquidity(t *testing.T) {
+	coverage, err := uniswapv3.NewTickCoverage(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialUpdate, err := uniswapv3.NewCoveredStateUpdate(
+		q96(), 0, big.NewInt(1_000), 3000, 1, nil, coverage,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirror := newV3Mirror(t)
+	applyV3(t, mirror, v3Event(t, 10, initialUpdate))
+	mint, err := uniswapv3.NewLiquidityUpdate(
+		uniswapv3.MinTick, uniswapv3.MaxTick, big.NewInt(250),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minted := applyV3(t, mirror, v3Event(t, 11, mint)).Data().(uniswapv3.Snapshot)
+	if minted.Liquidity().Cmp(big.NewInt(1_250)) != 0 || len(minted.Ticks()) != 0 {
+		t.Fatalf(
+			"uncovered mint produced liquidity=%s ticks=%d",
+			minted.Liquidity(), len(minted.Ticks()),
+		)
+	}
+	burn, err := uniswapv3.NewLiquidityUpdate(
+		uniswapv3.MinTick, uniswapv3.MaxTick, big.NewInt(-250),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	burned := applyV3(t, mirror, v3Event(t, 12, burn)).Data().(uniswapv3.Snapshot)
+	if burned.Liquidity().Cmp(big.NewInt(1_000)) != 0 || len(burned.Ticks()) != 0 {
+		t.Fatalf(
+			"uncovered burn produced liquidity=%s ticks=%d",
+			burned.Liquidity(), len(burned.Ticks()),
+		)
 	}
 }
 

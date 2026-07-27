@@ -3,6 +3,8 @@ package orcawhirlpool
 import (
 	"fmt"
 	"math/big"
+
+	"github.com/VarozXYZ/vernier/domain/market"
 )
 
 const (
@@ -97,7 +99,7 @@ func swap(state Snapshot, aToB bool, amount *big.Int, exactInput bool) (*big.Int
 		}
 	}
 	if !exactInput && calculated.Sign() == 0 {
-		return nil, nil, fmt.Errorf("whirlpool output rounds to zero")
+		return nil, nil, fmt.Errorf("whirlpool: %w", market.ErrQuoteOutputRoundsToZero)
 	}
 	return calculated, fees, nil
 }

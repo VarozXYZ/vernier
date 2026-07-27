@@ -3,6 +3,7 @@ package uniswapv3
 import (
 	"context"
 	"fmt"
+	"math/big"
 
 	"github.com/VarozXYZ/vernier/domain/market"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
@@ -13,6 +14,27 @@ type Quoter struct {
 	market market.Market
 	token0 market.TokenID
 	token1 market.TokenID
+}
+
+// ValidateExactInputCoverage runs the same deterministic swap calculation as
+// Quoter and is used by compatible concentrated-liquidity adapters while
+// deciding how many bitmap words must be loaded at bootstrap.
+func ValidateExactInputCoverage(update StateUpdate, zeroForOne bool, amountIn *big.Int) error {
+	if amountIn == nil || amountIn.Sign() <= 0 {
+		return fmt.Errorf("positive exact-input amount is required")
+	}
+	state := Snapshot{
+		schemaVersion: snapshotSchemaVersion,
+		sqrtPriceX96:  cloneInt(update.sqrtPriceX96),
+		tick:          update.tick,
+		liquidity:     cloneInt(update.liquidity),
+		feePips:       update.feePips,
+		tickSpacing:   update.tickSpacing,
+		ticks:         cloneTicks(update.ticks),
+		coverage:      update.coverage,
+	}
+	_, err := quoteExactInput(state, zeroForOne, amountIn)
+	return err
 }
 
 func NewQuoter(id market.SourceID, candidate market.Market, token0, token1 market.TokenID) (*Quoter, error) {

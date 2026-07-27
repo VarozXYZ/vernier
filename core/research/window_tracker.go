@@ -19,24 +19,54 @@ import (
 // live comparison loop already orders evaluations, so it needs no event log or
 // replay queue of its own.
 type WindowTracker struct {
-	store   persistence.OpportunityStore
-	clock   func() time.Time
-	session string
-	active  map[arbitrage.WindowKey]arbitrage.OpportunityWindow
+	store         persistence.OpportunityStore
+	clock         func() time.Time
+	session       string
+	active        map[arbitrage.WindowKey]arbitrage.OpportunityWindow
+	qualification string
+}
+
+type WindowTransitionKind string
+
+const (
+	WindowTransitionNone     WindowTransitionKind = "none"
+	WindowTransitionOpened   WindowTransitionKind = "opened"
+	WindowTransitionImproved WindowTransitionKind = "improved"
+	WindowTransitionClosed   WindowTransitionKind = "closed"
+)
+
+type WindowTransition struct {
+	Kind        WindowTransitionKind
+	Window      arbitrage.OpportunityWindow
+	Opportunity arbitrage.Opportunity
 }
 
 func NewWindowTracker(store persistence.OpportunityStore, clock func() time.Time) (*WindowTracker, error) {
 	if store == nil || clock == nil {
 		return nil, fmt.Errorf("opportunity store and clock are required")
 	}
-	return NewWindowTrackerWithSession(store, clock, newSessionID(clock()))
+	return NewWindowTrackerWithQualification(store, clock, "economic")
+}
+
+func NewWindowTrackerWithQualification(store persistence.OpportunityStore, clock func() time.Time, qualification string) (*WindowTracker, error) {
+	return newWindowTracker(store, clock, newSessionID(clock()), qualification)
 }
 
 func NewWindowTrackerWithSession(store persistence.OpportunityStore, clock func() time.Time, session string) (*WindowTracker, error) {
+	return newWindowTracker(store, clock, session, "economic")
+}
+
+func newWindowTracker(store persistence.OpportunityStore, clock func() time.Time, session, qualification string) (*WindowTracker, error) {
 	if store == nil || clock == nil || strings.TrimSpace(session) == "" {
 		return nil, fmt.Errorf("opportunity store, clock, and session are required")
 	}
-	return &WindowTracker{store: store, clock: clock, session: session, active: make(map[arbitrage.WindowKey]arbitrage.OpportunityWindow)}, nil
+	if qualification != "economic" && qualification != "policy_qualified" {
+		return nil, fmt.Errorf("unsupported window qualification %q", qualification)
+	}
+	return &WindowTracker{
+		store: store, clock: clock, session: session, qualification: qualification,
+		active: make(map[arbitrage.WindowKey]arbitrage.OpportunityWindow),
+	}, nil
 }
 
 // Start closes windows left open by a previous process. This is lifecycle
@@ -48,30 +78,36 @@ func (t *WindowTracker) Start(ctx context.Context) error {
 // Observe applies one completed strategy opportunity. Only economic and
 // policy-qualified classifications create or extend windows. All other
 // classifications close an active window, if one exists.
-func (t *WindowTracker) Observe(ctx context.Context, opportunity arbitrage.Opportunity) error {
+func (t *WindowTracker) Observe(ctx context.Context, opportunity arbitrage.Opportunity) (WindowTransition, error) {
 	key := arbitrage.WindowKey{Run: opportunity.Run, Strategy: opportunity.Strategy, ConfigHash: opportunity.ConfigHash, Direction: opportunity.Direction}
 	if key.Run == "" || key.Strategy == "" || key.ConfigHash == "" {
-		return fmt.Errorf("opportunity identity is required")
+		return WindowTransition{}, fmt.Errorf("opportunity identity is required")
 	}
 	active, exists := t.active[key]
-	if isFavorable(opportunity.Classification) {
+	if t.isFavorable(opportunity.Classification) {
 		if !exists {
 			window, err := t.opening(opportunity)
 			if err != nil {
-				return err
+				return WindowTransition{}, err
 			}
 			if err := t.store.OpenWindow(ctx, arbitrage.WindowOpening{Window: window}); err != nil {
-				return err
+				return WindowTransition{}, err
 			}
 			t.active[key] = window
-			return nil
+			return WindowTransition{Kind: WindowTransitionOpened, Window: window, Opportunity: opportunity}, nil
 		}
-		return t.improve(ctx, key, active, opportunity)
+		if err := t.improve(ctx, key, active, opportunity); err != nil {
+			return WindowTransition{}, err
+		}
+		return WindowTransition{Kind: WindowTransitionImproved, Window: t.active[key], Opportunity: opportunity}, nil
 	}
 	if !exists {
-		return nil
+		return WindowTransition{Kind: WindowTransitionNone, Opportunity: opportunity}, nil
 	}
-	return t.close(ctx, key, active, opportunity)
+	if err := t.close(ctx, key, active, opportunity); err != nil {
+		return WindowTransition{}, err
+	}
+	return WindowTransition{Kind: WindowTransitionClosed, Window: active, Opportunity: opportunity}, nil
 }
 
 // FailMarket closes active windows that depend on a market after an explicit
@@ -128,7 +164,8 @@ func (t *WindowTracker) opening(opportunity arbitrage.Opportunity) (arbitrage.Op
 		ConfigHash: opportunity.ConfigHash, Direction: opportunity.Direction,
 		Trigger: opportunity.Trigger, HasTrigger: opportunity.HasTrigger,
 		OpenedAt: openedAt, FirstProfitableAt: observedAt, LastProfitableAt: observedAt,
-		Best: candidate, HasBest: true, Classification: opportunity.Classification, Status: arbitrage.WindowStatusOpen,
+		Best: candidate, HasBest: true, Threshold: opportunity.Threshold,
+		Classification: opportunity.Classification, Status: arbitrage.WindowStatusOpen,
 	}
 	if window.HasTrigger {
 		if window.Trigger.At.IsZero() {
@@ -231,7 +268,10 @@ func opportunityTime(opportunity arbitrage.Opportunity, fallback time.Time) time
 	return fallback.UTC()
 }
 
-func isFavorable(classification arbitrage.Classification) bool {
+func (t *WindowTracker) isFavorable(classification arbitrage.Classification) bool {
+	if t.qualification == "policy_qualified" {
+		return classification == arbitrage.ClassificationPolicyQualified
+	}
 	return classification == arbitrage.ClassificationEconomic || classification == arbitrage.ClassificationPolicyQualified
 }
 

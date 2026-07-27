@@ -26,7 +26,7 @@ func TestVerifierRejectsNestedEnvFiles(t *testing.T) {
 		t.Fatalf("build verifier: %v\n%s", err, output)
 	}
 
-	for _, filename := range []string{".env", ".env.local"} {
+	for _, filename := range []string{".env", ".env.local", ".env.test"} {
 		t.Run(filename, func(t *testing.T) {
 			testRepository := t.TempDir()
 			runGit(t, testRepository, "init", "--quiet")
