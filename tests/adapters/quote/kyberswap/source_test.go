@@ -82,15 +82,18 @@ func TestBuildReturnsUnsignedTransactionData(t *testing.T) {
 					Sender       string          `json:"sender"`
 					Recipient    string          `json:"recipient"`
 					Slippage     uint16          `json:"slippageTolerance"`
+					GasEstimate  bool            `json:"enableGasEstimation"`
 					Source       string          `json:"source"`
 				}
 				if err := json.Unmarshal(body, &payload); err != nil {
 					t.Fatal(err)
 				}
-				if len(payload.RouteSummary) == 0 || payload.Sender != taker || payload.Recipient != taker || payload.Slippage != 50 || payload.Source != "vernier-test" {
+				if len(payload.RouteSummary) == 0 || payload.Sender != taker ||
+					payload.Recipient != taker || payload.Slippage != 50 ||
+					!payload.GasEstimate || payload.Source != "vernier-test" {
 					t.Fatalf("unexpected build payload: %s", body)
 				}
-				build := `{"code":0,"message":"successfully","data":{"amountIn":"1000000","amountOut":"2490000000000000000","gas":"250000","routerAddress":"` + router + `","data":"0xabcdef","transactionValue":"0"}}`
+				build := `{"code":0,"message":"successfully","data":{"amountIn":"1000000","amountOut":"2490000000000000000","gas":"250000","outputChange":{"amount":"42","percent":0.1},"routerAddress":"` + router + `","data":"0xabcdef","transactionValue":"0"}}`
 				return response(http.StatusOK, build), nil
 			default:
 				t.Fatalf("unexpected path: %s", request.URL.Path)
@@ -106,16 +109,19 @@ func TestBuildReturnsUnsignedTransactionData(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := source.Build(context.Background(), kyberswap.BuildRequest{
-		Route:       route,
-		Sender:      taker,
-		Recipient:   taker,
-		Origin:      taker,
-		SlippageBPS: 50,
+		Route:               route,
+		Sender:              taker,
+		Recipient:           taker,
+		Origin:              taker,
+		SlippageBPS:         50,
+		EnableGasEstimation: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests != 2 || result.RouterAddress != router || result.Data != "0xabcdef" || result.AmountOut != "2490000000000000000" {
+	if requests != 2 || result.RouterAddress != router || result.Data != "0xabcdef" ||
+		result.AmountOut != "2490000000000000000" ||
+		result.OutputChange != `{"amount":"42","percent":0.1}` {
 		t.Fatalf("unexpected build result: requests=%d result=%+v", requests, result)
 	}
 }
