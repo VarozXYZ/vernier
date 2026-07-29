@@ -128,3 +128,98 @@ func TestSenderPostsConfigurationWarningForAcceptedModeMismatch(t *testing.T) {
 		t.Fatalf("requests=%d, want 1", requests)
 	}
 }
+
+func TestSenderEditsOneMessageThroughoutLiveLifecycle(t *testing.T) {
+	var paths []string
+	var texts []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token",
+		ChatID:   "synthetic-chat",
+		BaseURL:  "https://telegram.test",
+		Client: clientFunc(func(
+			request *http.Request,
+		) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			paths = append(paths, request.URL.Path)
+			texts = append(texts, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":42}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	events := []notificationport.LiveExecutionEvent{
+		{
+			Kind:           notificationport.LiveExecutionStarted,
+			Operation:      "synthetic-operation",
+			State:          "live",
+			Direction:      "market-a -> market-b",
+			Input:          "100 QUOTE",
+			ExpectedBase:   "400 BASE",
+			ExpectedOutput: "102 QUOTE",
+			ExpectedNetPnL: "1 QUOTE",
+			BuyProvider:    "adapter-a",
+			SellProvider:   "adapter-b",
+			Trigger:        "chain-a/transaction",
+			TriggerURL:     "https://explorer.test/tx/trigger",
+		},
+		{
+			Kind:              notificationport.LiveExecutionStageCompleted,
+			Operation:         "synthetic-operation",
+			Stage:             "buy",
+			Ordinal:           1,
+			TotalStages:       4,
+			SourceChain:       "chain-a",
+			Input:             "100 QUOTE",
+			Output:            "401.123456 BASE",
+			SourceTransaction: "source-transaction",
+			SourceURL:         "https://explorer.test/tx/source",
+			Duration:          730 * time.Millisecond,
+		},
+		{
+			Kind:          notificationport.LiveExecutionCompleted,
+			Operation:     "synthetic-operation",
+			Output:        "101.500000 QUOTE",
+			ExecutionCost: "0.500000 QUOTE",
+			NetPnL:        "1.000000 QUOTE",
+			Duration:      2500 * time.Millisecond,
+		},
+	}
+	for _, event := range events {
+		if err := sender.SendLiveExecution(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(paths) != 3 ||
+		paths[0] != "/botsynthetic-token/sendMessage" ||
+		paths[1] != "/botsynthetic-token/editMessageText" ||
+		paths[2] != "/botsynthetic-token/editMessageText" {
+		t.Fatalf("unexpected Telegram operations: %v", paths)
+	}
+	final := texts[len(texts)-1]
+	for _, expected := range []string{
+		"🏁 <b>LIVE · COMPLETE</b>",
+		"market-a → market-b",
+		"✅ <b>1/4 · BUY</b> · chain-a",
+		`<a href="https://explorer.test/tx/source">Swap on chain-a</a>`,
+		"Return   <b>101.5 QUOTE</b>",
+		"Costs    0.5 QUOTE",
+		"Net PnL  <b>1 QUOTE</b>",
+		"Total · 2.500 s",
+	} {
+		if !strings.Contains(final, expected) {
+			t.Fatalf("final message missing %q:\n%s", expected, final)
+		}
+	}
+}
