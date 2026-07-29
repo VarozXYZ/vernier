@@ -249,6 +249,7 @@ type Settlement struct {
 	Economic   EconomicState
 	ActualIn   market.TokenAmount
 	ActualOut  market.TokenAmount
+	Costs      []CostComponent
 	ObservedAt time.Time
 	Evidence   string
 }

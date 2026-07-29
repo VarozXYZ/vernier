@@ -31,12 +31,17 @@ type TxClient interface {
 	TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error)
 }
 
+type TransactionSimulator interface {
+	CallContract(context.Context, geth.CallMsg, *big.Int) ([]byte, error)
+}
+
 type TxManagerConfig struct {
 	Chain              market.ChainID
 	Account            execution.AccountID
 	ChainID            *big.Int
 	PrivateKey         *ecdsa.PrivateKey
 	Primary            TxClient
+	Simulator          TransactionSimulator
 	Fanout             map[string]TxClient
 	DefaultGasLimit    uint64
 	Clock              func() time.Time
@@ -60,6 +65,7 @@ type TxManager struct {
 	privateKey         *ecdsa.PrivateKey
 	address            common.Address
 	primary            TxClient
+	simulator          TransactionSimulator
 	fanout             map[string]TxClient
 	gasLimit           uint64
 	clock              func() time.Time
@@ -68,11 +74,20 @@ type TxManager struct {
 	feeRefreshInterval time.Duration
 	warmOnce           sync.Once
 
-	mu     sync.Mutex
-	warmed bool
-	nonce  uint64
-	tipCap *big.Int
-	feeCap *big.Int
+	mu      sync.Mutex
+	warmed  bool
+	nonce   uint64
+	baseFee *big.Int
+	tipCap  *big.Int
+	feeCap  *big.Int
+	feesAt  time.Time
+}
+
+type FeeSnapshot struct {
+	BaseFee    *big.Int
+	TipCap     *big.Int
+	FeeCap     *big.Int
+	CapturedAt time.Time
 }
 
 func NewTxManager(config TxManagerConfig) (*TxManager, error) {
@@ -99,13 +114,38 @@ func NewTxManager(config TxManagerConfig) (*TxManager, error) {
 	return &TxManager{
 		chain: config.Chain, account: config.Account, chainID: new(big.Int).Set(config.ChainID),
 		privateKey: config.PrivateKey, address: crypto.PubkeyToAddress(config.PrivateKey.PublicKey),
-		primary: config.Primary, fanout: fanout, gasLimit: config.DefaultGasLimit, clock: config.Clock,
+		primary: config.Primary, simulator: config.Simulator,
+		fanout: fanout, gasLimit: config.DefaultGasLimit, clock: config.Clock,
 		onFanout: config.OnFanoutResult, receiptDecoder: config.ReceiptDecoder,
 		feeRefreshInterval: config.FeeRefreshInterval,
 	}, nil
 }
 
 func (m *TxManager) Account() execution.AccountID { return m.account }
+
+// NextNonce returns the next nonce preloaded for this account without making a
+// network call. Callers must invoke MarkNonceUsed after a broadcast is accepted
+// or has an uncertain outcome.
+func (m *TxManager) NextNonce() (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.warmed {
+		return 0, fmt.Errorf("EVM nonce coordinator is not warmed")
+	}
+	return m.nonce, nil
+}
+
+// MarkNonceUsed advances monotonically. It deliberately treats an uncertain
+// broadcast as consumed so the process never reuses a nonce that may be in the
+// public or private mempool.
+func (m *TxManager) MarkNonceUsed(nonce uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.warmed || nonce < m.nonce {
+		return
+	}
+	m.nonce = nonce + 1
+}
 
 // Warm preloads nonce and fee inputs so Prepare performs no network calls.
 func (m *TxManager) Warm(ctx context.Context) error {
@@ -126,12 +166,13 @@ func (m *TxManager) Warm(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("preload EVM nonce: %w", err)
 	}
-	tip, feeCap, err := m.readFees(ctx)
+	baseFee, tip, feeCap, err := m.readFees(ctx)
 	if err != nil {
 		return err
 	}
 	m.mu.Lock()
-	m.nonce, m.tipCap, m.feeCap, m.warmed = nonce, new(big.Int).Set(tip), feeCap, true
+	m.nonce, m.baseFee, m.tipCap, m.feeCap, m.feesAt, m.warmed =
+		nonce, baseFee, new(big.Int).Set(tip), feeCap, m.clock().UTC(), true
 	m.mu.Unlock()
 	m.warmOnce.Do(func() {
 		go m.refreshFees(ctx)
@@ -139,23 +180,23 @@ func (m *TxManager) Warm(ctx context.Context) error {
 	return nil
 }
 
-func (m *TxManager) readFees(ctx context.Context) (*big.Int, *big.Int, error) {
+func (m *TxManager) readFees(ctx context.Context) (*big.Int, *big.Int, *big.Int, error) {
 	tip, err := m.primary.SuggestGasTipCap(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("preload EVM priority fee: %w", err)
+		return nil, nil, nil, fmt.Errorf("preload EVM priority fee: %w", err)
 	}
 	if tip == nil || tip.Sign() <= 0 {
-		return nil, nil, fmt.Errorf("preload EVM priority fee: endpoint returned a non-positive fee")
+		return nil, nil, nil, fmt.Errorf("preload EVM priority fee: endpoint returned a non-positive fee")
 	}
 	header, err := m.primary.HeaderByNumber(ctx, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("preload EVM base fee: %w", err)
+		return nil, nil, nil, fmt.Errorf("preload EVM base fee: %w", err)
 	}
 	if header == nil || header.BaseFee == nil || header.BaseFee.Sign() < 0 {
-		return nil, nil, fmt.Errorf("preload EVM base fee: endpoint returned no EIP-1559 base fee")
+		return nil, nil, nil, fmt.Errorf("preload EVM base fee: endpoint returned no EIP-1559 base fee")
 	}
 	feeCap := new(big.Int).Add(new(big.Int).Mul(header.BaseFee, big.NewInt(2)), tip)
-	return tip, feeCap, nil
+	return new(big.Int).Set(header.BaseFee), tip, feeCap, nil
 }
 
 func (m *TxManager) refreshFees(ctx context.Context) {
@@ -167,16 +208,75 @@ func (m *TxManager) refreshFees(ctx context.Context) {
 			return
 		case <-ticker.C:
 			refreshCtx, cancel := context.WithTimeout(ctx, m.feeRefreshInterval)
-			tip, feeCap, err := m.readFees(refreshCtx)
+			baseFee, tip, feeCap, err := m.readFees(refreshCtx)
 			cancel()
 			if err != nil {
 				continue
 			}
 			m.mu.Lock()
-			m.tipCap, m.feeCap = new(big.Int).Set(tip), new(big.Int).Set(feeCap)
+			m.baseFee, m.tipCap, m.feeCap, m.feesAt =
+				new(big.Int).Set(baseFee), new(big.Int).Set(tip),
+				new(big.Int).Set(feeCap), m.clock().UTC()
 			m.mu.Unlock()
 		}
 	}
+}
+
+// FeeSnapshot returns the fee inputs maintained by the background refresher.
+// It never performs RPC I/O and is safe for complete-flow cost estimation.
+func (m *TxManager) FeeSnapshot() (FeeSnapshot, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.warmed || m.baseFee == nil || m.tipCap == nil ||
+		m.feeCap == nil || m.feesAt.IsZero() {
+		return FeeSnapshot{}, false
+	}
+	return FeeSnapshot{
+		BaseFee:    new(big.Int).Set(m.baseFee),
+		TipCap:     new(big.Int).Set(m.tipCap),
+		FeeCap:     new(big.Int).Set(m.feeCap),
+		CapturedAt: m.feesAt,
+	}, true
+}
+
+// EstimateArtifactNetworkCost values the validator's latest eth_estimateGas
+// result with the fee cap maintained by the background fee cache. It performs
+// no RPC call.
+func (m *TxManager) EstimateArtifactNetworkCost(
+	_ context.Context,
+	artifact executionport.Artifact,
+) (*big.Int, time.Time, error) {
+	text := strings.TrimSpace(artifact.Metadata["estimated_gas"])
+	gas, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || gas == 0 {
+		return nil, time.Time{}, fmt.Errorf("EVM artifact has no estimated gas evidence")
+	}
+	fees, ok := m.FeeSnapshot()
+	if !ok {
+		return nil, time.Time{}, fmt.Errorf("EVM fee cache is unavailable")
+	}
+	expectedGasPrice := new(big.Int).Add(fees.BaseFee, fees.TipCap)
+	return new(big.Int).Mul(
+		new(big.Int).SetUint64(gas), expectedGasPrice,
+	), fees.CapturedAt, nil
+}
+
+func (m *TxManager) ConfirmedGasUsed(
+	ctx context.Context,
+	identity string,
+) (uint64, error) {
+	if len(identity) != 66 || !strings.HasPrefix(identity, "0x") {
+		return 0, fmt.Errorf("EVM transaction identity is invalid")
+	}
+	receipt, err := m.primary.TransactionReceipt(ctx, common.HexToHash(identity))
+	if err != nil {
+		return 0, err
+	}
+	if receipt == nil || receipt.Status != types.ReceiptStatusSuccessful ||
+		receipt.GasUsed == 0 {
+		return 0, fmt.Errorf("EVM calibration receipt is not a successful transaction")
+	}
+	return receipt.GasUsed, nil
 }
 
 func (m *TxManager) Prepare(_ context.Context, artifact executionport.Artifact) (chainport.PreparedTransaction, error) {
@@ -203,12 +303,11 @@ func (m *TxManager) Prepare(_ context.Context, artifact executionport.Artifact) 
 		}
 		gasLimit = parsed
 	}
-	m.mu.Lock()
-	if !m.warmed {
-		m.mu.Unlock()
-		return chainport.PreparedTransaction{}, fmt.Errorf("EVM TxManager is not warmed")
+	nonce, err := m.NextNonce()
+	if err != nil {
+		return chainport.PreparedTransaction{}, err
 	}
-	nonce := m.nonce
+	m.mu.Lock()
 	tipCap := new(big.Int).Set(m.tipCap)
 	feeCap := new(big.Int).Set(m.feeCap)
 	m.mu.Unlock()
@@ -233,6 +332,39 @@ func (m *TxManager) Prepare(_ context.Context, artifact executionport.Artifact) 
 		},
 		SignedPayload: raw, PreparedAt: m.clock().UTC(),
 	}, nil
+}
+
+func (m *TxManager) SimulatePrepared(
+	ctx context.Context,
+	prepared chainport.PreparedTransaction,
+) error {
+	if m.simulator == nil {
+		return fmt.Errorf("EVM transaction simulator is unavailable")
+	}
+	if prepared.Leg.Account != m.account || len(prepared.SignedPayload) == 0 {
+		return fmt.Errorf("EVM prepared transaction is invalid")
+	}
+	var transaction types.Transaction
+	if err := transaction.UnmarshalBinary(prepared.SignedPayload); err != nil {
+		return fmt.Errorf("decode EVM transaction for simulation: %w", err)
+	}
+	if transaction.To() == nil {
+		return fmt.Errorf("simulate EVM contract creation is unsupported")
+	}
+	_, err := m.simulator.CallContract(ctx, geth.CallMsg{
+		From:       m.address,
+		To:         transaction.To(),
+		Gas:        transaction.Gas(),
+		GasFeeCap:  transaction.GasFeeCap(),
+		GasTipCap:  transaction.GasTipCap(),
+		Value:      transaction.Value(),
+		Data:       transaction.Data(),
+		AccessList: transaction.AccessList(),
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("simulate EVM prepared transaction: %w", err)
+	}
+	return nil
 }
 
 func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTransaction) (chainport.BroadcastResult, error) {
@@ -266,11 +398,7 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 	for attempt := 1; attempt <= len(m.fanout); attempt++ {
 		result := <-results
 		if result.err == nil || isKnownTransaction(result.err) {
-			m.mu.Lock()
-			if transaction.Nonce() == m.nonce {
-				m.nonce++
-			}
-			m.mu.Unlock()
+			m.MarkNonceUsed(transaction.Nonce())
 			return chainport.BroadcastResult{
 				Identity: prepared.Identity, Disposition: chainport.BroadcastAccepted,
 				Accepted: true, Endpoint: result.name,
@@ -285,6 +413,9 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 			disposition = chainport.BroadcastPossible
 			break
 		}
+	}
+	if disposition == chainport.BroadcastPossible {
+		m.MarkNonceUsed(transaction.Nonce())
 	}
 	return chainport.BroadcastResult{
 		Identity: prepared.Identity, Disposition: disposition, Attempts: len(m.fanout),
@@ -359,3 +490,5 @@ func broadcastMayHaveSucceeded(err error) bool {
 }
 
 var _ chainport.TxManager = (*TxManager)(nil)
+var _ chainport.EVMNonceCoordinator = (*TxManager)(nil)
+var _ chainport.PreparedTransactionSimulator = (*TxManager)(nil)

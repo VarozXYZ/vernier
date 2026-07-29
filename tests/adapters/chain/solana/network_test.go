@@ -2,6 +2,7 @@ package solana_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,130 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/chain/solana"
 	"github.com/gorilla/websocket"
 )
+
+func TestReadOnlyNetworkSimulatesExactSignedTransaction(t *testing.T) {
+	raw := []byte{1, 2, 3, 4}
+	server := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, request *http.Request) {
+			var envelope struct {
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Method != "simulateTransaction" ||
+				len(envelope.Params) != 2 {
+				t.Fatalf("request = %+v", envelope)
+			}
+			var encoded string
+			var options map[string]any
+			_ = json.Unmarshal(envelope.Params[0], &encoded)
+			_ = json.Unmarshal(envelope.Params[1], &options)
+			if encoded != base64.StdEncoding.EncodeToString(raw) ||
+				options["encoding"] != "base64" ||
+				options["sigVerify"] != true ||
+				options["commitment"] != "confirmed" {
+				t.Fatalf(
+					"simulation payload=%q options=%v",
+					encoded,
+					options,
+				)
+			}
+			_, _ = writer.Write([]byte(
+				`{"jsonrpc":"2.0","id":1,"result":{"value":{"err":null,"logs":[],"unitsConsumed":123}}}`,
+			))
+		},
+	))
+	defer server.Close()
+	network, err := solana.NewReadOnlyNetwork(
+		"solana",
+		"test",
+		server.URL,
+		websocketURL(server.URL),
+		server.Client(),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := network.SimulateSignedTransaction(
+		context.Background(),
+		raw,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadOnlyNetworkCanSimulateNonBroadcastableReferenceTransaction(t *testing.T) {
+	raw := []byte{4, 3, 2, 1}
+	server := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, request *http.Request) {
+			var envelope struct {
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&envelope); err != nil {
+				t.Fatal(err)
+			}
+			var options map[string]any
+			if len(envelope.Params) != 2 ||
+				json.Unmarshal(envelope.Params[1], &options) != nil ||
+				options["sigVerify"] != false {
+				t.Fatalf("simulation options=%v", options)
+			}
+			_, _ = writer.Write([]byte(
+				`{"jsonrpc":"2.0","id":1,"result":{"value":{"err":null,"logs":[]}}}`,
+			))
+		},
+	))
+	defer server.Close()
+	network, err := solana.NewReadOnlyNetwork(
+		"solana",
+		"test",
+		server.URL,
+		websocketURL(server.URL),
+		server.Client(),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := network.SimulateTransactionWithoutSignatureVerification(
+		context.Background(),
+		raw,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadOnlyNetworkRejectsFailedSimulation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, _ *http.Request) {
+			_, _ = writer.Write([]byte(
+				`{"jsonrpc":"2.0","id":1,"result":{"value":{"err":{"InstructionError":[2,{"Custom":1}]},"logs":["failed"]}}}`,
+			))
+		},
+	))
+	defer server.Close()
+	network, err := solana.NewReadOnlyNetwork(
+		"solana",
+		"test",
+		server.URL,
+		websocketURL(server.URL),
+		server.Client(),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := network.SimulateSignedTransaction(
+		context.Background(),
+		[]byte{1},
+	); err == nil {
+		t.Fatal("failed simulation was accepted")
+	}
+}
 
 func TestReadOnlyNetworkReadsSlotsAndAccounts(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
