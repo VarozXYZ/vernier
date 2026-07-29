@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,11 +24,21 @@ import (
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 )
 
+const maxSerializedTransactionBytes = 1232
+
 type ReconciliationRPC interface {
 	ReadSignatureStatus(context.Context, string) (SignatureStatus, error)
 	ReadTransaction(context.Context, string) (Transaction, error)
 	CurrentBlockHeight(context.Context) (uint64, error)
 	IsBlockhashValid(context.Context, string) (bool, error)
+}
+
+type SignedTransactionSimulator interface {
+	SimulateSignedTransaction(context.Context, []byte) error
+}
+
+type MessageFeeEstimator interface {
+	FeeForMessage(context.Context, string) (uint64, error)
 }
 
 type TxManagerConfig struct {
@@ -36,9 +47,13 @@ type TxManagerConfig struct {
 	PrivateKey        solanago.PrivateKey
 	SenderEndpoint    string
 	PingEndpoint      string
+	SenderTipAccount  solanago.PublicKey
+	SenderTipLamports uint64
 	ComputeUnitLimit  uint32
 	Client            *http.Client
 	Reconciliation    ReconciliationRPC
+	Simulator         SignedTransactionSimulator
+	FeeEstimator      MessageFeeEstimator
 	Clock             func() time.Time
 	WarmInterval      time.Duration
 	SettlementDecoder TransactionSettlementDecoder
@@ -50,9 +65,13 @@ type TxManager struct {
 	privateKey        solanago.PrivateKey
 	senderEndpoint    string
 	pingEndpoint      string
+	senderTipAccount  solanago.PublicKey
+	senderTipLamports uint64
 	computeLimit      uint32
 	client            *http.Client
 	reconciliation    ReconciliationRPC
+	simulator         SignedTransactionSimulator
+	feeEstimator      MessageFeeEstimator
 	clock             func() time.Time
 	warmInterval      time.Duration
 	settlementDecoder TransactionSettlementDecoder
@@ -82,6 +101,15 @@ func NewTxManager(config TxManagerConfig) (*TxManager, error) {
 	if config.ComputeUnitLimit == 0 {
 		config.ComputeUnitLimit = 1_400_000
 	}
+	if config.SenderTipAccount.IsZero() {
+		config.SenderTipAccount = NextHeliusSenderTipAccount()
+	}
+	if !IsHeliusSenderTipAccount(config.SenderTipAccount) {
+		return nil, fmt.Errorf("invalid Helius Sender tip account")
+	}
+	if config.SenderTipLamports == 0 {
+		config.SenderTipLamports = 1_000_000
+	}
 	if config.Client == nil {
 		config.Client = &http.Client{Timeout: 5 * time.Second}
 	}
@@ -94,8 +122,10 @@ func NewTxManager(config TxManagerConfig) (*TxManager, error) {
 	return &TxManager{
 		chain: config.Chain, account: config.Account, privateKey: append(solanago.PrivateKey(nil), config.PrivateKey...),
 		senderEndpoint: endpoint.String(), pingEndpoint: ping.String(), computeLimit: config.ComputeUnitLimit,
+		senderTipAccount: config.SenderTipAccount, senderTipLamports: config.SenderTipLamports,
 		client: config.Client, reconciliation: config.Reconciliation, clock: config.Clock,
-		warmInterval: config.WarmInterval, settlementDecoder: config.SettlementDecoder,
+		simulator: config.Simulator, feeEstimator: config.FeeEstimator, warmInterval: config.WarmInterval,
+		settlementDecoder: config.SettlementDecoder,
 	}, nil
 }
 
@@ -146,9 +176,20 @@ func (m *TxManager) Prepare(_ context.Context, artifact executionport.Artifact) 
 		artifact.Metadata["kind"] != "jupiter_build_v2" {
 		return chainport.PreparedTransaction{}, fmt.Errorf("solana artifact targets another TxManager or is not Jupiter build v2")
 	}
-	raw, signature, blockhash, err := assembleJupiterBuild(artifact.Payload, m.privateKey, m.computeLimit)
+	raw, signature, blockhash, err := AssembleJupiterBuildForSender(
+		artifact.Payload,
+		m.privateKey,
+		m.computeLimit,
+		m.senderTipAccount,
+		m.senderTipLamports,
+	)
 	if err != nil {
 		return chainport.PreparedTransaction{}, err
+	}
+	if len(raw) > maxSerializedTransactionBytes {
+		return chainport.PreparedTransaction{}, &executionport.ArtifactTooLargeError{
+			ActualBytes: len(raw), MaximumBytes: maxSerializedTransactionBytes,
+		}
 	}
 	if artifact.Blockhash != "" && artifact.Blockhash != blockhash {
 		// BuildSource may retain a hexadecimal representation for byte-array
@@ -163,6 +204,49 @@ func (m *TxManager) Prepare(_ context.Context, artifact executionport.Artifact) 
 		},
 		SignedPayload: raw, PreparedAt: m.clock().UTC(),
 	}, nil
+}
+
+func (m *TxManager) SimulatePrepared(
+	ctx context.Context,
+	prepared chainport.PreparedTransaction,
+) error {
+	if m.simulator == nil {
+		return fmt.Errorf("solana transaction simulator is unavailable")
+	}
+	if prepared.Leg.Account != m.account ||
+		prepared.Leg.Chain != m.chain ||
+		len(prepared.SignedPayload) == 0 {
+		return fmt.Errorf("solana prepared transaction is invalid")
+	}
+	return m.simulator.SimulateSignedTransaction(ctx, prepared.SignedPayload)
+}
+
+// EstimateArtifactNetworkCost builds the exact Helius Sender transaction and
+// asks the RPC for its current signature/priority fee. The call is intended
+// exclusively for the background cost oracle. The Sender tip is an ordinary
+// transfer and is added separately.
+func (m *TxManager) EstimateArtifactNetworkCost(
+	ctx context.Context,
+	artifact executionport.Artifact,
+) (*big.Int, time.Time, error) {
+	if m.feeEstimator == nil {
+		return nil, time.Time{}, fmt.Errorf("solana message fee estimator is unavailable")
+	}
+	prepared, err := m.Prepare(ctx, artifact)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	transaction, err := solanago.TransactionFromBytes(prepared.SignedPayload)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("decode Solana transaction for fee estimate: %w", err)
+	}
+	fee, err := m.feeEstimator.FeeForMessage(ctx, transaction.Message.ToBase64())
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	total := new(big.Int).SetUint64(fee)
+	total.Add(total, new(big.Int).SetUint64(m.senderTipLamports))
+	return total, m.clock().UTC(), nil
 }
 
 func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTransaction) (chainport.BroadcastResult, error) {
@@ -203,26 +287,22 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 			Identity: prepared.Identity, Disposition: chainport.BroadcastPossible, Attempts: 1,
 		}, err
 	}
+	var envelope senderRPCEnvelope
+	envelopeErr := json.Unmarshal(responseBody, &envelope)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		disposition := chainport.BroadcastRejected
-		if response.StatusCode >= 500 {
+		if response.StatusCode >= 500 &&
+			!senderInvalidRequest(envelope, envelopeErr) {
 			disposition = chainport.BroadcastPossible
 		}
 		return chainport.BroadcastResult{
 			Identity: prepared.Identity, Disposition: disposition, Attempts: 1,
-		}, fmt.Errorf("helius Sender HTTP %s", response.Status)
+		}, senderHTTPError(response.Status, responseBody, envelope, envelopeErr)
 	}
-	var envelope struct {
-		Result string `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(responseBody, &envelope); err != nil {
+	if envelopeErr != nil {
 		return chainport.BroadcastResult{
 			Identity: prepared.Identity, Disposition: chainport.BroadcastPossible, Attempts: 1,
-		}, err
+		}, envelopeErr
 	}
 	if envelope.Error != nil {
 		return chainport.BroadcastResult{
@@ -241,6 +321,59 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 		Accepted: true, Endpoint: endpoint.Host,
 		Attempts: 1, AcceptedAt: m.clock().UTC(),
 	}, nil
+}
+
+type senderRPCEnvelope struct {
+	Result string `json:"result"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func senderInvalidRequest(
+	envelope senderRPCEnvelope,
+	decodeErr error,
+) bool {
+	if decodeErr != nil || envelope.Error == nil {
+		return false
+	}
+	switch envelope.Error.Code {
+	case -32600, -32601, -32602:
+		return true
+	default:
+		return false
+	}
+}
+
+func senderHTTPError(
+	status string,
+	body []byte,
+	envelope senderRPCEnvelope,
+	decodeErr error,
+) error {
+	if decodeErr == nil && envelope.Error != nil {
+		return fmt.Errorf(
+			"helius Sender HTTP %s RPC %d: %s",
+			status,
+			envelope.Error.Code,
+			sanitizeSenderMessage(envelope.Error.Message),
+		)
+	}
+	detail := sanitizeSenderMessage(string(body))
+	if detail == "" {
+		return fmt.Errorf("helius Sender HTTP %s", status)
+	}
+	return fmt.Errorf("helius Sender HTTP %s: %s", status, detail)
+}
+
+func sanitizeSenderMessage(message string) string {
+	const maximum = 512
+	message = strings.Join(strings.Fields(message), " ")
+	if len(message) > maximum {
+		message = message[:maximum] + "..."
+	}
+	return message
 }
 
 func (m *TxManager) Reconcile(ctx context.Context, step execution.OperationStep) (execution.Settlement, error) {
@@ -331,7 +464,82 @@ type wireInstruction struct {
 	Data string `json:"data"`
 }
 
-func assembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, computeLimit uint32) ([]byte, string, string, error) {
+// AssembleJupiterBuild compiles and signs one Swap V2 /build response without
+// broadcasting it. Manual canaries use this to run RPC simulation before any
+// armed execution; TxManager uses the same path in the Live hot path.
+func AssembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, computeLimit uint32) ([]byte, string, string, error) {
+	return assembleJupiterBuildWithTip(
+		payload,
+		privateKey,
+		computeLimit,
+		solanago.PublicKey{},
+		0,
+		false,
+	)
+}
+
+// AssembleJupiterBuildForSender replaces any provider-specific tip with one
+// transfer to a Helius-designated tip account. This avoids paying two tips and
+// ensures the signed transaction is eligible for Helius Sender routing.
+func AssembleJupiterBuildForSender(
+	payload []byte,
+	privateKey solanago.PrivateKey,
+	computeLimit uint32,
+	tipAccount solanago.PublicKey,
+	tipLamports uint64,
+) ([]byte, string, string, error) {
+	if !IsHeliusSenderTipAccount(tipAccount) {
+		return nil, "", "", fmt.Errorf("invalid Helius Sender tip account")
+	}
+	if tipLamports == 0 {
+		return nil, "", "", fmt.Errorf("helius Sender tip must be positive")
+	}
+	return assembleJupiterBuildWithTip(
+		payload,
+		privateKey,
+		computeLimit,
+		tipAccount,
+		tipLamports,
+		false,
+	)
+}
+
+// AssembleJupiterBuildForSimulation creates a transaction that is signed by
+// the configured payer while deliberately leaving any other required signer
+// slots empty. It is only valid with RPC simulation using sigVerify=false and
+// must never be broadcast.
+func AssembleJupiterBuildForSimulation(
+	payload []byte,
+	payer solanago.PrivateKey,
+	computeLimit uint32,
+	tipAccount solanago.PublicKey,
+	tipLamports uint64,
+) ([]byte, string, error) {
+	if !IsHeliusSenderTipAccount(tipAccount) {
+		return nil, "", fmt.Errorf("invalid Helius Sender tip account")
+	}
+	if tipLamports == 0 {
+		return nil, "", fmt.Errorf("helius Sender tip must be positive")
+	}
+	raw, _, blockhash, err := assembleJupiterBuildWithTip(
+		payload,
+		payer,
+		computeLimit,
+		tipAccount,
+		tipLamports,
+		true,
+	)
+	return raw, blockhash, err
+}
+
+func assembleJupiterBuildWithTip(
+	payload []byte,
+	privateKey solanago.PrivateKey,
+	computeLimit uint32,
+	senderTipAccount solanago.PublicKey,
+	senderTipLamports uint64,
+	partial bool,
+) ([]byte, string, string, error) {
 	var build buildTransactionResponse
 	if err := json.Unmarshal(payload, &build); err != nil {
 		return nil, "", "", fmt.Errorf("decode Jupiter build artifact: %w", err)
@@ -341,13 +549,6 @@ func assembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, comput
 	}
 	instructions := make([]solanago.Instruction, 0,
 		2+len(build.ComputeBudgetInstructions)+len(build.SetupInstructions)+len(build.OtherInstructions))
-	limitData := make([]byte, 5)
-	limitData[0] = 2
-	binary.LittleEndian.PutUint32(limitData[1:], computeLimit)
-	instructions = append(instructions, solanago.NewInstruction(
-		solanago.MustPublicKeyFromBase58("ComputeBudget111111111111111111111111111111"),
-		nil, limitData,
-	))
 	appendWire := func(candidate wireInstruction) error {
 		instruction, err := decodeWireInstruction(candidate)
 		if err != nil {
@@ -356,13 +557,29 @@ func assembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, comput
 		instructions = append(instructions, instruction)
 		return nil
 	}
+	hasComputeLimit := false
 	for _, instruction := range build.ComputeBudgetInstructions {
-		if isSetComputeUnitLimit(instruction) {
+		if providerLimit, ok := computeUnitLimit(instruction); ok {
+			if hasComputeLimit {
+				continue
+			}
+			selectedLimit := providerLimit
+			if computeLimit > 0 && selectedLimit > computeLimit {
+				selectedLimit = computeLimit
+			}
+			instructions = append(instructions, setComputeUnitLimit(selectedLimit))
+			hasComputeLimit = true
 			continue
 		}
 		if err := appendWire(instruction); err != nil {
 			return nil, "", "", err
 		}
+	}
+	if !hasComputeLimit {
+		instructions = append(
+			[]solanago.Instruction{setComputeUnitLimit(computeLimit)},
+			instructions...,
+		)
 	}
 	for _, instruction := range build.SetupInstructions {
 		if err := appendWire(instruction); err != nil {
@@ -382,11 +599,25 @@ func assembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, comput
 			return nil, "", "", err
 		}
 	}
-	if build.TipInstruction == nil {
-		return nil, "", "", errors.New("jupiter build artifact has no Sender tip instruction")
-	}
-	if err := appendWire(*build.TipInstruction); err != nil {
-		return nil, "", "", err
+	if !senderTipAccount.IsZero() {
+		tipData := make([]byte, 12)
+		binary.LittleEndian.PutUint32(tipData[:4], 2)
+		binary.LittleEndian.PutUint64(tipData[4:], senderTipLamports)
+		instructions = append(instructions, solanago.NewInstruction(
+			solanago.SystemProgramID,
+			solanago.AccountMetaSlice{
+				solanago.NewAccountMeta(privateKey.PublicKey(), true, true),
+				solanago.NewAccountMeta(senderTipAccount, true, false),
+			},
+			tipData,
+		))
+	} else {
+		if build.TipInstruction == nil {
+			return nil, "", "", errors.New("jupiter build artifact has no tip instruction")
+		}
+		if err := appendWire(*build.TipInstruction); err != nil {
+			return nil, "", "", err
+		}
 	}
 	tables := make(map[solanago.PublicKey]solanago.PublicKeySlice, len(build.Addresses))
 	for tableText, addressTexts := range build.Addresses {
@@ -411,7 +642,11 @@ func assembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, comput
 	if err != nil {
 		return nil, "", "", fmt.Errorf("compile Jupiter v0 transaction: %w", err)
 	}
-	if _, err := transaction.Sign(func(key solanago.PublicKey) *solanago.PrivateKey {
+	sign := transaction.Sign
+	if partial {
+		sign = transaction.PartialSign
+	}
+	if _, err := sign(func(key solanago.PublicKey) *solanago.PrivateKey {
 		if key.Equals(privateKey.PublicKey()) {
 			return &privateKey
 		}
@@ -429,12 +664,56 @@ func assembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, comput
 	return raw, transaction.Signatures[0].String(), hash.String(), nil
 }
 
-func isSetComputeUnitLimit(candidate wireInstruction) bool {
+var heliusSenderTipAccounts = [...]solanago.PublicKey{
+	solanago.MustPublicKeyFromBase58("4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE"),
+	solanago.MustPublicKeyFromBase58("D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ"),
+	solanago.MustPublicKeyFromBase58("9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta"),
+	solanago.MustPublicKeyFromBase58("5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn"),
+	solanago.MustPublicKeyFromBase58("2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD"),
+	solanago.MustPublicKeyFromBase58("2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ"),
+	solanago.MustPublicKeyFromBase58("wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF"),
+	solanago.MustPublicKeyFromBase58("3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT"),
+	solanago.MustPublicKeyFromBase58("4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey"),
+	solanago.MustPublicKeyFromBase58("4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or"),
+}
+
+var heliusSenderTipIndex atomic.Uint64
+
+func NextHeliusSenderTipAccount() solanago.PublicKey {
+	index := heliusSenderTipIndex.Add(1) - 1
+	return heliusSenderTipAccounts[index%uint64(len(heliusSenderTipAccounts))]
+}
+
+func IsHeliusSenderTipAccount(candidate solanago.PublicKey) bool {
+	for _, account := range heliusSenderTipAccounts {
+		if candidate.Equals(account) {
+			return true
+		}
+	}
+	return false
+}
+
+func computeUnitLimit(candidate wireInstruction) (uint32, bool) {
 	if candidate.ProgramID != "ComputeBudget111111111111111111111111111111" {
-		return false
+		return 0, false
 	}
 	data, err := base64.StdEncoding.DecodeString(candidate.Data)
-	return err == nil && len(data) == 5 && data[0] == 2
+	if err != nil || len(data) != 5 || data[0] != 2 {
+		return 0, false
+	}
+	limit := binary.LittleEndian.Uint32(data[1:])
+	return limit, limit > 0
+}
+
+func setComputeUnitLimit(limit uint32) solanago.Instruction {
+	data := make([]byte, 5)
+	data[0] = 2
+	binary.LittleEndian.PutUint32(data[1:], limit)
+	return solanago.NewInstruction(
+		solanago.MustPublicKeyFromBase58("ComputeBudget111111111111111111111111111111"),
+		nil,
+		data,
+	)
 }
 
 func decodeWireInstruction(candidate wireInstruction) (solanago.Instruction, error) {
@@ -458,4 +737,6 @@ func decodeWireInstruction(candidate wireInstruction) (solanago.Instruction, err
 }
 
 var _ chainport.TxManager = (*TxManager)(nil)
+var _ chainport.PreparedTransactionSimulator = (*TxManager)(nil)
 var _ ReconciliationRPC = (*ReadOnlyNetwork)(nil)
+var _ SignedTransactionSimulator = (*ReadOnlyNetwork)(nil)

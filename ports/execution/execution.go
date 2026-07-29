@@ -4,6 +4,7 @@ package execution
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
@@ -34,6 +35,26 @@ type Artifact struct {
 
 type Validator interface {
 	Validate(context.Context, ValidationRequest) (Artifact, error)
+}
+
+// CompactValidator can rebuild a provider artifact under a tighter account or
+// payload budget after the chain adapter proves that the first artifact cannot
+// fit on wire. The previous artifact is in-memory only.
+type CompactValidator interface {
+	ValidateCompact(context.Context, ValidationRequest, Artifact) (Artifact, error)
+}
+
+type ArtifactTooLargeError struct {
+	ActualBytes  int
+	MaximumBytes int
+}
+
+func (e *ArtifactTooLargeError) Error() string {
+	return fmt.Sprintf(
+		"serialized transaction is too large: %d bytes exceeds %d",
+		e.ActualBytes,
+		e.MaximumBytes,
+	)
 }
 
 type CostRequest struct {

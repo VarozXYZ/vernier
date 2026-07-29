@@ -161,6 +161,101 @@ func (n *ReadOnlyNetwork) CurrentSlot(ctx context.Context) (uint64, error) {
 	return slot, nil
 }
 
+func (n *ReadOnlyNetwork) FeeForMessage(
+	ctx context.Context,
+	messageBase64 string,
+) (uint64, error) {
+	if strings.TrimSpace(messageBase64) == "" {
+		return 0, fmt.Errorf("read %s message fee: message is empty", n.label)
+	}
+	var result struct {
+		Value *uint64 `json:"value"`
+	}
+	if err := n.callHTTP(
+		ctx,
+		"getFeeForMessage",
+		[]any{
+			messageBase64,
+			map[string]string{"commitment": "confirmed"},
+		},
+		&result,
+	); err != nil {
+		return 0, fmt.Errorf("read %s message fee: %w", n.label, err)
+	}
+	if result.Value == nil {
+		return 0, fmt.Errorf("read %s message fee: blockhash is no longer valid", n.label)
+	}
+	return *result.Value, nil
+}
+
+// SimulateSignedTransaction executes an exact signed transaction against the
+// node's current confirmed state without broadcasting it.
+func (n *ReadOnlyNetwork) SimulateSignedTransaction(
+	ctx context.Context,
+	raw []byte,
+) error {
+	return n.simulateTransaction(ctx, raw, true)
+}
+
+// SimulateTransactionWithoutSignatureVerification is restricted to
+// non-broadcastable preflight transactions whose account metas are exact but
+// whose reference token owner is not controlled by this process.
+func (n *ReadOnlyNetwork) SimulateTransactionWithoutSignatureVerification(
+	ctx context.Context,
+	raw []byte,
+) error {
+	return n.simulateTransaction(ctx, raw, false)
+}
+
+func (n *ReadOnlyNetwork) simulateTransaction(
+	ctx context.Context,
+	raw []byte,
+	verifySignatures bool,
+) error {
+	if len(raw) == 0 {
+		return fmt.Errorf("simulate %s transaction: payload is empty", n.label)
+	}
+	var result struct {
+		Value *struct {
+			Err           json.RawMessage `json:"err"`
+			Logs          []string        `json:"logs"`
+			UnitsConsumed *uint64         `json:"unitsConsumed"`
+		} `json:"value"`
+	}
+	if err := n.callHTTP(
+		ctx,
+		"simulateTransaction",
+		[]any{
+			base64.StdEncoding.EncodeToString(raw),
+			map[string]any{
+				"encoding":   "base64",
+				"sigVerify":  verifySignatures,
+				"commitment": "confirmed",
+			},
+		},
+		&result,
+	); err != nil {
+		return fmt.Errorf("simulate %s transaction: %w", n.label, err)
+	}
+	if result.Value == nil {
+		return fmt.Errorf("simulate %s transaction: response has no value", n.label)
+	}
+	if len(result.Value.Err) > 0 &&
+		string(result.Value.Err) != "null" {
+		logs := result.Value.Logs
+		if len(logs) > 8 {
+			logs = logs[len(logs)-8:]
+		}
+		return fmt.Errorf(
+			"simulate %s transaction failed: %s logs=%v",
+			n.label,
+			string(result.Value.Err),
+			logs,
+		)
+	}
+	return nil
+}
+
 type Account struct {
 	Lamports   uint64
 	Owner      string
@@ -361,6 +456,38 @@ func (n *ReadOnlyNetwork) ReadTransaction(ctx context.Context, signature string)
 		Signature: signature, Slot: result.Slot, BlockTime: result.BlockTime,
 		Transaction: result.Transaction, Meta: result.Meta,
 	}, nil
+}
+
+// ConfirmedPayerDebit returns the source account's actual lamport decrease.
+// For bridge calibration this includes signature/priority fees, rent and any
+// explicit native debit made by the transaction.
+func (n *ReadOnlyNetwork) ConfirmedPayerDebit(
+	ctx context.Context,
+	signature string,
+) (uint64, error) {
+	transaction, err := n.ReadTransaction(ctx, signature)
+	if err != nil {
+		return 0, err
+	}
+	var metadata struct {
+		Err          json.RawMessage `json:"err"`
+		PreBalances  []uint64        `json:"preBalances"`
+		PostBalances []uint64        `json:"postBalances"`
+	}
+	if err := json.Unmarshal(transaction.Meta, &metadata); err != nil {
+		return 0, fmt.Errorf("decode %s transaction balances: %w", n.label, err)
+	}
+	if len(metadata.Err) > 0 && string(metadata.Err) != "null" {
+		return 0, fmt.Errorf("solana calibration transaction failed")
+	}
+	if len(metadata.PreBalances) == 0 ||
+		len(metadata.PreBalances) != len(metadata.PostBalances) {
+		return 0, fmt.Errorf("solana calibration transaction has no payer balances")
+	}
+	if metadata.PostBalances[0] >= metadata.PreBalances[0] {
+		return 0, nil
+	}
+	return metadata.PreBalances[0] - metadata.PostBalances[0], nil
 }
 
 type jsonAccountValue struct {

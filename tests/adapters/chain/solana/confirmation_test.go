@@ -63,7 +63,10 @@ func TestSolanaConfirmationUsesBufferedTransactionBalanceDeltas(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta, _ := json.Marshal(map[string]any{
-		"err": nil,
+		"err":          nil,
+		"fee":          5000,
+		"preBalances":  []uint64{2_000_000},
+		"postBalances": []uint64{1_000_000},
 		"preTokenBalances": []any{
 			tokenBalance("quote-mint", "owner", "1000"),
 			tokenBalance("base-mint", "owner", "50"),
@@ -96,6 +99,13 @@ func TestSolanaConfirmationUsesBufferedTransactionBalanceDeltas(t *testing.T) {
 		settlement.ActualIn.Units().Cmp(big.NewInt(100)) != 0 ||
 		settlement.ActualOut.Units().Cmp(big.NewInt(145)) != 0 {
 		t.Fatalf("settlement = %+v", settlement)
+	}
+	if len(settlement.Costs) != 2 ||
+		settlement.Costs[0].Kind != "network_fee" ||
+		settlement.Costs[1].Kind != "additional_payer_debit" ||
+		settlement.Costs[0].Amount.Rat().Cmp(big.NewRat(5, 1_000_000)) != 0 ||
+		settlement.Costs[1].Amount.Rat().Cmp(big.NewRat(995, 1_000_000)) != 0 {
+		t.Fatalf("unexpected Solana costs: %+v", settlement.Costs)
 	}
 }
 
