@@ -63,6 +63,7 @@ closed.
 | **Opportunity** | The result of evaluating a strategy at a particular point in time. |
 | **OpportunityWindow** | A sequence of related opportunities observed over time. |
 | **SagaPlan** | A dependency graph describing a potential durable execution. |
+| **SequentialPlan** | An ordered execution whose next input is the previous stage's confirmed output. |
 
 An `ArbitrageSetup` selects the markets. A strategy determines how to compare
 them. A Research profile adds sizing, costs, inventory assumptions, and
@@ -114,6 +115,8 @@ Implemented or available experimentally:
 - SQLite persistence for selected opportunity windows;
 - inventory, execution allocation, saga, reconciliation, and operational
   persistence primitives;
+- a provider-neutral sequential execution kernel for inventory-carrying
+  buy, transfer, sell, and return workflows;
 - a separate Live entry point that remains disarmed without setup-specific
   private execution components.
 
