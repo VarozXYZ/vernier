@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
@@ -36,6 +37,9 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 	if r.config.TelegramEnabled && options.OpportunityStore == nil {
 		return fmt.Errorf("telegram opening alerts require an opportunity store")
 	}
+	if options.OnQualifiedOpening != nil && options.OpportunityStore == nil {
+		return fmt.Errorf("qualified opening callback requires an opportunity store")
+	}
 	if options.OnReport == nil {
 		options.OnReport = func(Report) error { return nil }
 	}
@@ -53,14 +57,20 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 		remote[configured.ID] = candidate
 		sources[configured.ID] = candidate.source
 	}
-	blocks, err := r.currentBlocks(ctx)
-	if err != nil {
-		return err
-	}
 	now := r.clock().UTC()
-	costEvidence, cost, err := r.cost(ctx, blocks, now)
-	if err != nil {
-		return err
+	var (
+		fixedCostEvidence CostEvidence
+		fixedCost         arbitrage.CostSnapshot
+	)
+	if r.directionalCosts == nil {
+		blocks, blockErr := r.currentBlocks(ctx)
+		if blockErr != nil {
+			return blockErr
+		}
+		fixedCostEvidence, fixedCost, err = r.cost(ctx, blocks, now)
+		if err != nil {
+			return err
+		}
 	}
 	candidate, err := r.newStrategy(registry, setup, sources)
 	if err != nil {
@@ -128,6 +138,7 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 	gate := runtimeresearch.NewTriggerGate(10_000)
 	evaluations := 0
 	idleSequence := uint64(0)
+	retrySequence := uint64(0)
 	var pending *streamSignal
 	for {
 		var signal streamSignal
@@ -152,6 +163,27 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 				idleSequence++
 				signal = syntheticIdleSignal(r.config.Markets[0].ID, at.UTC(), idleSequence)
 				resetIdle()
+			case at := <-options.ReevaluationRequests:
+				// Prefer a real event already waiting in the feed queue. When
+				// none exists, synthesize one invalidation against the newest
+				// snapshots so a rejected first transaction is not silently
+				// lost.
+				latest := drainLatestRemoteSignal(
+					signals,
+					r.config.Markets,
+					gate,
+				)
+				if latest != nil {
+					signal = *latest
+				} else {
+					retrySequence++
+					signal = syntheticRetrySignal(
+						r.config.Markets[0].ID,
+						at.UTC(),
+						retrySequence,
+					)
+				}
+				resetIdle()
 			}
 		}
 
@@ -165,14 +197,40 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 			}
 			continue
 		}
-		research, evaluateErr := r.evaluate(
-			runCtx, candidate, snapshots, cost,
+		costEvidence, cost, directionalCosts, costsReady := r.remoteEvaluationCosts(
+			setup.Directions(), fixedCostEvidence, fixedCost,
+		)
+		if !costsReady {
+			r.logger.Warn(
+				"complete-flow cost cache is unavailable or stale; evaluation cannot qualify",
+				"reason", "cost_cache_stale",
+			)
+			costEvidence, cost, directionalCosts, err =
+				r.unavailableRemoteCosts(setup.Directions())
+			if err != nil {
+				return err
+			}
+		}
+		research, evaluateErr := r.evaluateWithDirectionalCosts(
+			runCtx, candidate, snapshots, cost, directionalCosts,
 			fmt.Sprintf("remote-stream/%s/%d", r.config.ResearchID, evaluations+1),
-			signal.triggered, triggerPointer(signal),
+			signal.triggered, triggerPointer(signal), false,
 		)
 		r.dispatchQuoteWarnings(sources)
 		if evaluateErr != nil {
 			return evaluateErr
+		}
+		if observer, ok := r.directionalCosts.(DirectionalCostObserver); ok {
+			observer.Observe(research.Opportunities)
+		}
+		if !costsReady {
+			for index := range research.Opportunities {
+				research.Opportunities[index].SelectedIndex = -1
+				research.Opportunities[index].Classification =
+					arbitrage.ClassificationUnclassifiable
+				research.Opportunities[index].Reasons =
+					[]string{"cost_cache_stale"}
+			}
 		}
 		research.Evaluations = evaluations + 1
 		if tracker != nil {
@@ -187,6 +245,19 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 						r.logger.Error("build opening alert failed", "error", alertErr)
 					} else {
 						go r.sendOpeningAlert(alert)
+					}
+				}
+				if transition.Kind == coreresearch.WindowTransitionOpened &&
+					opportunity.Classification == arbitrage.ClassificationPolicyQualified &&
+					options.OnQualifiedOpening != nil {
+					if callbackErr := options.OnQualifiedOpening(opportunity); callbackErr != nil {
+						return fmt.Errorf("dispatch qualified opening: %w", callbackErr)
+					}
+				}
+				if opportunity.Classification == arbitrage.ClassificationPolicyQualified &&
+					options.OnQualifiedOpportunity != nil {
+					if callbackErr := options.OnQualifiedOpportunity(opportunity); callbackErr != nil {
+						return fmt.Errorf("dispatch qualified opportunity: %w", callbackErr)
 					}
 				}
 			}
@@ -206,6 +277,63 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 			resetIdle()
 		}
 	}
+}
+
+func (r *Runner) unavailableRemoteCosts(
+	directions []arbitrage.Direction,
+) (CostEvidence, arbitrage.CostSnapshot, map[arbitrage.Direction]arbitrage.CostSnapshot, error) {
+	amount, err := market.NewAssetQuantity(
+		r.config.Markets[0].Quote.Token.Asset, new(big.Rat),
+	)
+	if err != nil {
+		return CostEvidence{}, arbitrage.CostSnapshot{}, nil, err
+	}
+	at := r.clock().UTC()
+	fallback := arbitrage.CostSnapshot{
+		ID: "complete-flow/unavailable", Amount: amount, CapturedAt: at,
+	}
+	costs := make(map[arbitrage.Direction]arbitrage.CostSnapshot, len(directions))
+	for _, direction := range directions {
+		costs[direction] = fallback
+	}
+	return CostEvidence{
+		FixedAmount: new(big.Rat), FixedAsset: amount.Asset(), Cost: amount,
+		Model: "complete_flow_cache", Available: false,
+	}, fallback, costs, nil
+}
+
+func (r *Runner) remoteEvaluationCosts(
+	directions []arbitrage.Direction,
+	fixedEvidence CostEvidence,
+	fixed arbitrage.CostSnapshot,
+) (CostEvidence, arbitrage.CostSnapshot, map[arbitrage.Direction]arbitrage.CostSnapshot, bool) {
+	if r.directionalCosts == nil {
+		return fixedEvidence, fixed, nil, true
+	}
+	now := r.clock().UTC()
+	costs := make(map[arbitrage.Direction]arbitrage.CostSnapshot, len(directions))
+	var maximum arbitrage.CostSnapshot
+	for _, direction := range directions {
+		cost, ok := r.directionalCosts.Snapshot(direction, now)
+		if !ok || cost.ID == "" || cost.Amount.Asset() == "" ||
+			cost.CapturedAt.IsZero() {
+			return CostEvidence{}, arbitrage.CostSnapshot{}, nil, false
+		}
+		if maximum.ID == "" || cost.Amount.Rat().Cmp(maximum.Amount.Rat()) > 0 {
+			maximum = cost
+		}
+		costs[direction] = cost
+	}
+	if maximum.ID == "" {
+		return CostEvidence{}, arbitrage.CostSnapshot{}, nil, false
+	}
+	return CostEvidence{
+		FixedAmount: maximum.Amount.Rat(),
+		FixedAsset:  maximum.Amount.Asset(),
+		Cost:        maximum.Amount,
+		Model:       "complete_flow_cache",
+		Available:   true,
+	}, maximum, costs, true
 }
 
 func drainLatestRemoteSignal(signals <-chan streamSignal, configured [2]configuration.ResolvedMarket, gate *runtimeresearch.TriggerGate) *streamSignal {
@@ -364,6 +492,27 @@ func syntheticIdleSignal(marketID market.MarketID, at time.Time, sequence uint64
 		At:        at,
 	}
 	return streamSignal{market: marketID, triggered: at, trigger: trigger, hasTrigger: true}
+}
+
+func syntheticRetrySignal(
+	marketID market.MarketID,
+	at time.Time,
+	sequence uint64,
+) streamSignal {
+	trigger := arbitrage.TriggerMetadata{
+		Market: marketID, Source: "live/retry",
+		Position: market.SourcePosition{
+			Kind: "retry_sequence", Value: sequence,
+		},
+		Reference: market.SourceReference{
+			Kind: "execution_retry", Value: fmt.Sprintf("%d", sequence),
+		},
+		At: at,
+	}
+	return streamSignal{
+		market: marketID, triggered: at,
+		trigger: trigger, hasTrigger: true,
+	}
 }
 
 func refreshRemoteSnapshots(ctx context.Context, signal streamSignal, remote map[market.MarketID]eventRefreshedRuntime) error {

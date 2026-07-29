@@ -89,8 +89,10 @@ func (s *BestBuyOppositeSell) EvaluateWithTiming(ctx context.Context, evaluation
 	if evaluation.Strategy() != s.id {
 		return nil, EvaluationTiming{}, fmt.Errorf("evaluation targets strategy %q, expected %q", evaluation.Strategy(), s.id)
 	}
-	if evaluation.Cost().Amount.Asset() != s.threshold.Asset() {
-		return nil, EvaluationTiming{}, fmt.Errorf("cost asset does not match strategy quote asset")
+	for _, direction := range s.setup.Directions() {
+		if evaluation.CostFor(direction).Amount.Asset() != s.threshold.Asset() {
+			return nil, EvaluationTiming{}, fmt.Errorf("cost asset does not match strategy quote asset")
+		}
 	}
 
 	started := s.clock()
@@ -240,11 +242,12 @@ func (s *BestBuyOppositeSell) evaluateDirection(
 		return finish("sell_output_invalid")
 	}
 
+	cost := evaluation.CostFor(direction)
 	gross, _ := output.Sub(s.notional)
-	net, _ := gross.Sub(evaluation.Cost().Amount)
+	net, _ := gross.Sub(cost.Amount)
 	opportunity.Candidates = []arbitrage.Candidate{{
 		Size: s.notional, Input: s.notional, Output: output, GrossPnL: gross,
-		Cost: evaluation.Cost(), NetPnL: net, BuyQuote: buyResult, SellQuote: sellResult,
+		Cost: cost, NetPnL: net, BuyQuote: buyResult, SellQuote: sellResult,
 	}}
 	opportunity.SelectedIndex = 0
 	switch {
