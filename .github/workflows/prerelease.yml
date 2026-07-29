@@ -1,0 +1,95 @@
+name: Prerelease
+
+on:
+  push:
+    tags:
+      - "v*-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prerelease-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish prerelease
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.5
+          cache: true
+      - name: Verify tag revision
+        run: |
+          git fetch origin main --no-tags
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Prerelease tags must point to a revision already merged into main." >&2
+            exit 1
+          fi
+          go run ./tools/verify
+      - name: Build reproducible archives
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export CGO_ENABLED=0
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          BUILT_AT="$(git show -s --format=%cI HEAD)"
+          LDFLAGS="-s -w -buildid= -X github.com/VarozXYZ/vernier/internal/buildinfo.Version=${VERSION} -X github.com/VarozXYZ/vernier/internal/buildinfo.Commit=${COMMIT} -X github.com/VarozXYZ/vernier/internal/buildinfo.BuiltAt=${BUILT_AT}"
+
+          mkdir -p dist
+          for target in linux-amd64 windows-amd64; do
+            os="${target%-*}"
+            arch="${target#*-}"
+            directory="vernier-${VERSION}-${target}"
+            mkdir -p "dist/${directory}"
+            extension=""
+            if [[ "${os}" == "windows" ]]; then
+              extension=".exe"
+            fi
+            GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags="${LDFLAGS}" -o "dist/${directory}/vernier-research${extension}" ./cmd/research
+            GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags="${LDFLAGS}" -o "dist/${directory}/vernier-live${extension}" ./cmd/live
+            cp README.md LICENSE "dist/${directory}/"
+            find "dist/${directory}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+            if [[ "${os}" == "windows" ]]; then
+              (
+                cd dist
+                zip -X -q -r "${directory}.zip" "${directory}"
+              )
+            else
+              tar \
+                --sort=name \
+                --mtime="@${SOURCE_DATE_EPOCH}" \
+                --owner=0 \
+                --group=0 \
+                --numeric-owner \
+                -C dist \
+                -cf - \
+                "${directory}" | gzip -n > "dist/${directory}.tar.gz"
+            fi
+            rm -rf "dist/${directory}"
+          done
+          (
+            cd dist
+            sha256sum vernier-* > SHA256SUMS
+          )
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/vernier-*.tar.gz \
+            dist/vernier-*.zip \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --prerelease \
+            --generate-notes \
+            --title "Vernier ${GITHUB_REF_NAME}"
