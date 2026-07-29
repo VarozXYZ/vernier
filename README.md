@@ -103,6 +103,17 @@ network I/O outside that decision path.
 Vernier is pre-release software. Its public API and configuration schema may
 still change.
 
+The first packaged milestone is `v0.1.0-alpha.1`. Tagged prereleases contain
+Linux and Windows archives with:
+
+- `vernier-research`, the runnable Research CLI;
+- `vernier-live`, the disarmed Live entry point and configuration validator.
+
+Both commands support `--version`. The public Live binary cannot broadcast
+unless a setup composition is supplied at build time outside the public tree.
+Release archives never include environment files, operational databases, or
+private configuration.
+
 Implemented or available experimentally:
 
 - a deterministic offline Research example with synthetic events;

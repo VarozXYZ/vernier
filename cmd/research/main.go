@@ -21,6 +21,7 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/chain/solana"
 	sqlitepersistence "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
+	"github.com/VarozXYZ/vernier/internal/buildinfo"
 	persistence "github.com/VarozXYZ/vernier/ports/persistence"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
@@ -34,6 +35,11 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 &&
+		(args[0] == "--version" || args[0] == "version") {
+		fmt.Fprintln(stdout, buildinfo.Summary())
+		return 0
+	}
 	if len(args) > 0 && args[0] == "observe-v3" {
 		return runObserveV3(ctx, args[1:], stdout, stderr)
 	}

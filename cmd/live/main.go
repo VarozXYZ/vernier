@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/VarozXYZ/vernier/internal/buildinfo"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 )
 
@@ -43,6 +44,11 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 &&
+		(args[0] == "--version" || args[0] == "version") {
+		fmt.Fprintln(stdout, buildinfo.Summary())
+		return 0
+	}
 	flags := flag.NewFlagSet("live", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "config/live/vernier.yaml", "private modular Live manifest")
