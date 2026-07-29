@@ -260,6 +260,55 @@ func TestBestBuyOppositeSellDoesNotSelectEqualRoundTripOutputs(t *testing.T) {
 	}
 }
 
+func TestBestBuyOppositeSellUsesTheCostOfEachCompleteDirection(t *testing.T) {
+	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+	left := &remoteQuoteSource{
+		id: "provider-a", market: "market-a",
+		buyOut: big.NewInt(14_550_000_000), sellOut: big.NewInt(753_000_000),
+	}
+	right := &remoteQuoteSource{
+		id: "provider-b", market: "market-b",
+		buyOut: big.NewInt(1_450_000_000_000), sellOut: big.NewInt(752_500_000),
+	}
+	candidate, evaluation := bestBuyFixture(t, now, left, right)
+	leftDirection := arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"}
+	rightDirection := arbitrage.Direction{BuyMarket: "market-b", SellMarket: "market-a"}
+	var err error
+	evaluation, err = evaluation.WithDirectionalCosts(map[arbitrage.Direction]arbitrage.CostSnapshot{
+		leftDirection: {
+			ID: "flow/a-b", Amount: quantity(t, "0.25"), CapturedAt: now,
+		},
+		rightDirection: {
+			ID: "flow/b-a", Amount: quantity(t, "2"), CapturedAt: now,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opportunities, _, err := candidate.EvaluateWithTiming(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opportunity := range opportunities {
+		if len(opportunity.Candidates) != 1 {
+			t.Fatalf("missing candidate for %v", opportunity.Direction)
+		}
+		selected := opportunity.Candidates[0]
+		switch opportunity.Direction {
+		case leftDirection:
+			if selected.Cost.Amount.String() != "1/4" ||
+				selected.NetPnL.String() != "9/4" {
+				t.Fatalf("left cost/net = %s/%s", selected.Cost.Amount, selected.NetPnL)
+			}
+		case rightDirection:
+			if selected.Cost.Amount.String() != "2" ||
+				selected.NetPnL.String() != "1" {
+				t.Fatalf("right cost/net = %s/%s", selected.Cost.Amount, selected.NetPnL)
+			}
+		}
+	}
+}
+
 func TestBestBuyOppositeSellDoesNotRetryPermanentClientError(t *testing.T) {
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
 	left := &remoteQuoteSource{
