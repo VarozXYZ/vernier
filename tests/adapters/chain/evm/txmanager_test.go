@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	geth "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -20,12 +21,13 @@ import (
 )
 
 type txClientStub struct {
-	chainID *big.Int
-	sendErr error
-	delay   time.Duration
-	calls   atomic.Int32
-	sentMu  sync.Mutex
-	sent    []*types.Transaction
+	chainID   *big.Int
+	sendErr   error
+	delay     time.Duration
+	calls     atomic.Int32
+	sentMu    sync.Mutex
+	sent      []*types.Transaction
+	simulated atomic.Int32
 }
 
 func (c *txClientStub) ChainID(context.Context) (*big.Int, error) {
@@ -63,6 +65,14 @@ func (c *txClientStub) SendTransaction(ctx context.Context, tx *types.Transactio
 func (*txClientStub) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
 	return nil, errors.New("not used")
 }
+func (c *txClientStub) CallContract(
+	context.Context,
+	geth.CallMsg,
+	*big.Int,
+) ([]byte, error) {
+	c.simulated.Add(1)
+	return nil, nil
+}
 
 func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 	key, err := crypto.GenerateKey()
@@ -76,6 +86,7 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 	telemetry := make(chan evmadapter.FanoutAttempt, 2)
 	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
 		Chain: "evm", Account: "executor", ChainID: chainID, PrivateKey: key, Primary: primary,
+		Simulator:       primary,
 		Fanout:          map[string]evmadapter.TxClient{"failed": failed, "accepted": accepted},
 		DefaultGasLimit: 100_000, Clock: time.Now,
 		OnFanoutResult: func(attempt evmadapter.FanoutAttempt) { telemetry <- attempt },
@@ -113,6 +124,15 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 	}
 	if prepared.Identity.Nonce == nil || *prepared.Identity.Nonce != 9 || prepared.Identity.Hash == "" {
 		t.Fatalf("prepared identity = %+v", prepared.Identity)
+	}
+	if err := manager.SimulatePrepared(
+		context.Background(),
+		prepared,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if primary.simulated.Load() != 1 {
+		t.Fatalf("prepared simulations = %d", primary.simulated.Load())
 	}
 	result, err := manager.Broadcast(context.Background(), prepared)
 	if err != nil {
