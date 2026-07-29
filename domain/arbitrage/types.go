@@ -80,6 +80,7 @@ type Evaluation struct {
 	configHash  string
 	snapshots   []market.MarketSnapshot
 	cost        CostSnapshot
+	costs       map[Direction]CostSnapshot
 	trigger     TriggerMetadata
 	hasTrigger  bool
 	triggeredAt time.Time
@@ -114,11 +115,21 @@ func NewEvaluation(id EvaluationID, run ResearchRunID, strategy StrategyID, conf
 	}, nil
 }
 
-func (e Evaluation) ID() EvaluationID       { return e.id }
-func (e Evaluation) Run() ResearchRunID     { return e.run }
-func (e Evaluation) Strategy() StrategyID   { return e.strategy }
-func (e Evaluation) ConfigHash() string     { return e.configHash }
-func (e Evaluation) Cost() CostSnapshot     { return e.cost }
+func (e Evaluation) ID() EvaluationID     { return e.id }
+func (e Evaluation) Run() ResearchRunID   { return e.run }
+func (e Evaluation) Strategy() StrategyID { return e.strategy }
+func (e Evaluation) ConfigHash() string   { return e.configHash }
+func (e Evaluation) Cost() CostSnapshot   { return e.cost }
+
+// CostFor returns the cost snapshot for one complete arbitrage direction.
+// Configurations without a directional cost oracle retain the common snapshot
+// supplied to NewEvaluation.
+func (e Evaluation) CostFor(direction Direction) CostSnapshot {
+	if cost, ok := e.costs[direction]; ok {
+		return cost
+	}
+	return e.cost
+}
 func (e Evaluation) TriggeredAt() time.Time { return e.triggeredAt }
 func (e Evaluation) StartedAt() time.Time   { return e.startedAt }
 func (e Evaluation) Trigger() (TriggerMetadata, bool) {
@@ -131,8 +142,40 @@ func (e Evaluation) Trigger() (TriggerMetadata, bool) {
 func (e Evaluation) WithTrigger(trigger TriggerMetadata) Evaluation {
 	trigger.At = trigger.At.UTC()
 	return Evaluation{id: e.id, run: e.run, strategy: e.strategy, configHash: e.configHash,
-		snapshots: append([]market.MarketSnapshot(nil), e.snapshots...), cost: e.cost,
+		snapshots: append([]market.MarketSnapshot(nil), e.snapshots...), cost: e.cost, costs: cloneCosts(e.costs),
 		trigger: trigger, hasTrigger: true, triggeredAt: e.triggeredAt, startedAt: e.startedAt}
+}
+
+// WithDirectionalCosts returns an immutable evaluation copy with one cost for
+// every supplied direction. All costs must use the same quote asset as the
+// common fallback snapshot.
+func (e Evaluation) WithDirectionalCosts(costs map[Direction]CostSnapshot) (Evaluation, error) {
+	for direction, cost := range costs {
+		if direction.BuyMarket == "" || direction.SellMarket == "" ||
+			direction.BuyMarket == direction.SellMarket {
+			return Evaluation{}, fmt.Errorf("directional cost has an invalid direction")
+		}
+		if cost.ID == "" || cost.Amount.Asset() == "" || cost.CapturedAt.IsZero() {
+			return Evaluation{}, fmt.Errorf("directional cost for %s -> %s is invalid", direction.BuyMarket, direction.SellMarket)
+		}
+		if cost.Amount.Asset() != e.cost.Amount.Asset() {
+			return Evaluation{}, fmt.Errorf("directional cost asset does not match common cost asset")
+		}
+	}
+	e.snapshots = append([]market.MarketSnapshot(nil), e.snapshots...)
+	e.costs = cloneCosts(costs)
+	return e, nil
+}
+
+func cloneCosts(source map[Direction]CostSnapshot) map[Direction]CostSnapshot {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[Direction]CostSnapshot, len(source))
+	for direction, cost := range source {
+		result[direction] = cost
+	}
+	return result
 }
 func (e Evaluation) Snapshots() []market.MarketSnapshot {
 	return append([]market.MarketSnapshot(nil), e.snapshots...)

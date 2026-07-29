@@ -22,10 +22,22 @@ import (
 // the number of evaluations to emit after both markets have a snapshot; zero
 // keeps the stream running until its context is canceled.
 type StreamOptions struct {
-	Updates          int
-	OnReport         func(Report) error
-	OnReference      func(ReferenceReport) error
-	OpportunityStore persistence.OpportunityStore
+	Updates            int
+	OnReport           func(Report) error
+	OnReference        func(ReferenceReport) error
+	OnQualifiedOpening func(arbitrage.Opportunity) error
+	// OnQualifiedOpportunity is invoked for every policy-qualified remote
+	// evaluation, independently of the persisted window transition. Live
+	// runtimes use it so restarting during an already-open window does not
+	// silently suppress execution. Their execution manager owns deduplication
+	// and the per-run operation limit.
+	OnQualifiedOpportunity func(arbitrage.Opportunity) error
+	OpportunityStore       persistence.OpportunityStore
+	// ReevaluationRequests asks a remote stream to evaluate its latest
+	// snapshots even when no new chain event arrived. It is used after a
+	// definitively rejected first Live transaction and is ignored by local
+	// pool streams.
+	ReevaluationRequests <-chan time.Time
 }
 
 // ReferenceReport is emitted independently from the local report. This keeps
