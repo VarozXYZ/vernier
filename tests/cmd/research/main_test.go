@@ -68,6 +68,19 @@ func TestRunTextMatchesGolden(t *testing.T) {
 	}
 }
 
+func TestVersionDoesNotRequireConfiguration(t *testing.T) {
+	code, stdout, stderr := runCLI(t, "--version")
+	if code != 0 || strings.TrimSpace(stdout) != "vernier dev" ||
+		strings.TrimSpace(stderr) != "" {
+		t.Fatalf(
+			"version exit=%d stdout=%q stderr=%q",
+			code,
+			stdout,
+			stderr,
+		)
+	}
+}
+
 func TestRunExitCodes(t *testing.T) {
 	fixture := filepath.Join(repositoryRoot, "examples", "synthetic", "two-market.yaml")
 	for name, args := range map[string][]string{
