@@ -96,11 +96,12 @@ type RouteResult struct {
 // BuildRequest contains the transaction-specific fields required to turn a
 // fresh route into unsigned calldata.
 type BuildRequest struct {
-	Route       RouteResult
-	Sender      string
-	Recipient   string
-	Origin      string
-	SlippageBPS uint16
+	Route               RouteResult
+	Sender              string
+	Recipient           string
+	Origin              string
+	SlippageBPS         uint16
+	EnableGasEstimation bool
 }
 
 // BuildResult contains unsigned transaction data returned by KyberSwap.
@@ -272,6 +273,7 @@ func (s *Source) Build(ctx context.Context, input BuildRequest) (BuildResult, er
 		Recipient         string          `json:"recipient"`
 		Origin            string          `json:"origin,omitempty"`
 		SlippageTolerance uint16          `json:"slippageTolerance"`
+		EnableGasEstimate bool            `json:"enableGasEstimation"`
 		Source            string          `json:"source"`
 	}{
 		RouteSummary:      resolved.Route.routeSummary,
@@ -279,6 +281,7 @@ func (s *Source) Build(ctx context.Context, input BuildRequest) (BuildResult, er
 		Recipient:         resolved.Recipient,
 		Origin:            resolved.Origin,
 		SlippageTolerance: resolved.SlippageBPS,
+		EnableGasEstimate: resolved.EnableGasEstimation,
 		Source:            s.clientID,
 	}
 	body, err := json.Marshal(payload)
@@ -324,6 +327,10 @@ func (s *Source) Build(ctx context.Context, input BuildRequest) (BuildResult, er
 	if !strings.EqualFold(result.RouterAddress, resolved.Route.RouterAddress) {
 		return result, &APIError{Operation: "build", HTTPStatus: status, Code: "MISMATCHED_ROUTER", Message: "transaction router does not match the quoted route"}
 	}
+	if result.AmountIn != resolved.Route.AmountIn ||
+		!positiveInteger(result.AmountOut) {
+		return result, &APIError{Operation: "build", HTTPStatus: status, Code: "MISMATCHED_AMOUNT", Message: "transaction amounts do not match the quoted route"}
+	}
 	return result, nil
 }
 
@@ -358,16 +365,16 @@ type buildEnvelope struct {
 }
 
 type buildData struct {
-	AmountIn         string `json:"amountIn"`
-	AmountOut        string `json:"amountOut"`
-	AmountInUSD      string `json:"amountInUsd"`
-	AmountOutUSD     string `json:"amountOutUsd"`
-	Gas              string `json:"gas"`
-	GasUSD           string `json:"gasUsd"`
-	OutputChange     string `json:"outputChange"`
-	RouterAddress    string `json:"routerAddress"`
-	Data             string `json:"data"`
-	TransactionValue string `json:"transactionValue"`
+	AmountIn         string          `json:"amountIn"`
+	AmountOut        string          `json:"amountOut"`
+	AmountInUSD      string          `json:"amountInUsd"`
+	AmountOutUSD     string          `json:"amountOutUsd"`
+	Gas              string          `json:"gas"`
+	GasUSD           string          `json:"gasUsd"`
+	OutputChange     json.RawMessage `json:"outputChange"`
+	RouterAddress    string          `json:"routerAddress"`
+	Data             string          `json:"data"`
+	TransactionValue string          `json:"transactionValue"`
 }
 
 func (r *RouteResult) apply(routerAddress string, raw json.RawMessage, summary routeSummary) {
@@ -394,10 +401,25 @@ func (r *BuildResult) apply(data buildData) {
 	r.AmountOutUSD = data.AmountOutUSD
 	r.Gas = data.Gas
 	r.GasUSD = data.GasUSD
-	r.OutputChange = data.OutputChange
+	r.OutputChange = normalizeJSONText(data.OutputChange)
 	r.RouterAddress = data.RouterAddress
 	r.Data = data.Data
 	r.TransactionValue = data.TransactionValue
+}
+
+func normalizeJSONText(raw json.RawMessage) string {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) == nil {
+		return compact.String()
+	}
+	return string(raw)
 }
 
 func (s *Source) setHeaders(request *http.Request) {

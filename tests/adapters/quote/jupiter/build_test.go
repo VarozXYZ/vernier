@@ -18,9 +18,11 @@ import (
 
 func TestBuildSourceValidatesFixedExactInputWithoutFastMode(t *testing.T) {
 	var receivedKey string
+	var receivedMaxAccounts []string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		receivedKey = request.Header.Get("x-api-key")
 		query := request.URL.Query()
+		receivedMaxAccounts = append(receivedMaxAccounts, query.Get("maxAccounts"))
 		if query.Get("amount") != "1000000" || query.Get("mode") != "" {
 			t.Errorf("unexpected build query: %s", request.URL.RawQuery)
 		}
@@ -76,12 +78,35 @@ func TestBuildSourceValidatesFixedExactInputWithoutFastMode(t *testing.T) {
 	if receivedKey != "key-a" {
 		t.Fatalf("API key = %q", receivedKey)
 	}
+	if artifact.Metadata["max_accounts"] != "64" {
+		t.Fatalf("initial max_accounts = %q", artifact.Metadata["max_accounts"])
+	}
 	if artifact.ValidatedQuote.AmountIn.String() != "1000000" ||
 		artifact.ValidatedQuote.AmountOut.String() != "14550" {
 		t.Fatalf("validated amounts = %s -> %s", artifact.ValidatedQuote.AmountIn, artifact.ValidatedQuote.AmountOut)
 	}
 	if artifact.LastValidBlockHeight != 500 || artifact.Blockhash == "" || len(artifact.Payload) == 0 {
 		t.Fatalf("incomplete artifact: %+v", artifact)
+	}
+	compact, err := source.ValidateCompact(
+		context.Background(),
+		executionport.ValidationRequest{
+			Leg: leg, Discovery: discovery, RequestedAt: now,
+		},
+		artifact,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compact.Metadata["max_accounts"] != "48" ||
+		len(receivedMaxAccounts) != 2 ||
+		receivedMaxAccounts[0] != "64" ||
+		receivedMaxAccounts[1] != "48" {
+		t.Fatalf(
+			"compact limits = %v metadata=%q",
+			receivedMaxAccounts,
+			compact.Metadata["max_accounts"],
+		)
 	}
 }
 

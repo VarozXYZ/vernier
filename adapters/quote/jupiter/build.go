@@ -128,7 +128,43 @@ func NewBuildSource(config BuildConfig) (*BuildSource, error) {
 	}, nil
 }
 
-func (s *BuildSource) Validate(ctx context.Context, request executionport.ValidationRequest) (executionport.Artifact, error) {
+func (s *BuildSource) Validate(
+	ctx context.Context,
+	request executionport.ValidationRequest,
+) (executionport.Artifact, error) {
+	return s.validate(ctx, request, s.maxAccounts)
+}
+
+func (s *BuildSource) ValidateCompact(
+	ctx context.Context,
+	request executionport.ValidationRequest,
+	previous executionport.Artifact,
+) (executionport.Artifact, error) {
+	current := s.maxAccounts
+	if text := strings.TrimSpace(previous.Metadata["max_accounts"]); text != "" {
+		parsed, err := strconv.ParseUint(text, 10, 16)
+		if err != nil || parsed == 0 || parsed > 64 {
+			return executionport.Artifact{}, fmt.Errorf(
+				"jupiter compact rebuild has invalid previous account limit",
+			)
+		}
+		current = uint16(parsed)
+	}
+	next := nextCompactAccountLimit(current)
+	if next == 0 {
+		return executionport.Artifact{}, fmt.Errorf(
+			"jupiter build cannot be compacted below %d accounts",
+			current,
+		)
+	}
+	return s.validate(ctx, request, next)
+}
+
+func (s *BuildSource) validate(
+	ctx context.Context,
+	request executionport.ValidationRequest,
+	maxAccounts uint16,
+) (executionport.Artifact, error) {
 	if err := request.Leg.Validate(); err != nil {
 		return executionport.Artifact{}, err
 	}
@@ -148,7 +184,7 @@ func (s *BuildSource) Validate(ctx context.Context, request executionport.Valida
 	query.Set("amount", discovery.AmountIn.String())
 	query.Set("taker", s.taker)
 	query.Set("slippageBps", strconv.FormatUint(uint64(s.slippageBPS), 10))
-	query.Set("maxAccounts", strconv.FormatUint(uint64(s.maxAccounts), 10))
+	query.Set("maxAccounts", strconv.FormatUint(uint64(maxAccounts), 10))
 	query.Set("blockhashSlotsToExpiry", strconv.FormatUint(uint64(s.blockhashSlots), 10))
 	if s.payer != "" {
 		query.Set("payer", s.payer)
@@ -222,10 +258,26 @@ func (s *BuildSource) Validate(ctx context.Context, request executionport.Valida
 	}
 	return executionport.Artifact{
 		Leg: request.Leg, ValidatedQuote: validated, Payload: append([]byte(nil), body...),
-		Metadata: map[string]string{"kind": "jupiter_build_v2"},
-		BuiltAt:  s.clock().UTC(), Blockhash: blockhash,
+		Metadata: map[string]string{
+			"kind":         "jupiter_build_v2",
+			"max_accounts": strconv.FormatUint(uint64(maxAccounts), 10),
+		},
+		BuiltAt: s.clock().UTC(), Blockhash: blockhash,
 		LastValidBlockHeight: payload.BlockhashWithMetadata.LastValidBlockHeight,
 	}, nil
+}
+
+func nextCompactAccountLimit(current uint16) uint16 {
+	switch {
+	case current > 48:
+		return 48
+	case current > 32:
+		return 32
+	case current > 24:
+		return 24
+	default:
+		return 0
+	}
 }
 
 type apiInstruction struct {
@@ -273,3 +325,4 @@ func (m blockhashMetadata) String() string {
 }
 
 var _ executionport.Validator = (*BuildSource)(nil)
+var _ executionport.CompactValidator = (*BuildSource)(nil)
