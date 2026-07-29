@@ -172,6 +172,7 @@ active_research: private_research
 | `paths` | Ordered hops for markets that are not backed by one direct pool. |
 | `markets` | Base and quote tokens plus the venue, path, or quote source used. |
 | `price_sources` / `quote_sources` | Optional external evidence providers. |
+| `transfer_sources` | Named cross-chain capabilities selected by Live policies. |
 
 The private pair is defined in `policy.yaml` by referencing two market IDs:
 
@@ -219,6 +220,23 @@ updates. It cannot sign or broadcast transactions.
 Research binaries do not contain a signing or broadcast path. Live is composed
 separately and fails closed when its private signer, broadcaster, or
 setup-specific execution components are absent.
+
+A sequential Live policy refers to market and transfer capabilities by stable
+IDs rather than naming adapters in the economic plan:
+
+```yaml
+live:
+  synthetic_sequential:
+    setup: synthetic_pair
+    execution_mode: sequential_bridge_live
+    base_transfer_source: transfer_alpha
+    quote_transfer_source: transfer_beta
+```
+
+Each transfer source selects a compiled adapter kind in topology and keeps its
+endpoint, profile, and environment-variable names outside the domain. Runtime
+composition validates that the selected binary actually provides the required
+swap, transfer, broadcast, confirmation, and cost capabilities.
 
 An unknown broadcast result is reconciled before any retry is considered.
 Technical transaction success and economic settlement are tracked separately.
