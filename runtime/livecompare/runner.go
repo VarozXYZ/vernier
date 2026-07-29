@@ -61,6 +61,20 @@ type Options struct {
 	Logger              *slog.Logger
 	OpeningAlerts       notificationport.OpeningSender
 	ConfigurationAlerts notificationport.ConfigurationWarningSender
+	// DirectionalCosts is a background-refreshed, memory-only source. Runner
+	// never asks it to perform I/O in an evaluation.
+	DirectionalCosts DirectionalCostSource
+}
+
+// DirectionalCostSource exposes a previously refreshed complete-flow cost.
+// A false result means that the cache is absent or stale and therefore cannot
+// authorize a policy-qualified opportunity.
+type DirectionalCostSource interface {
+	Snapshot(arbitrage.Direction, time.Time) (arbitrage.CostSnapshot, bool)
+}
+
+type DirectionalCostObserver interface {
+	Observe([]arbitrage.Opportunity)
 }
 
 type Runner struct {
@@ -75,6 +89,7 @@ type Runner struct {
 	logger                 *slog.Logger
 	openingAlerts          notificationport.OpeningSender
 	configurationAlerts    notificationport.ConfigurationWarningSender
+	directionalCosts       DirectionalCostSource
 	alertFailures          atomic.Uint64
 	warningMu              sync.Mutex
 	deliveredWarnings      map[string]struct{}
@@ -85,6 +100,8 @@ type CostEvidence struct {
 	FixedAsset  market.AssetID
 	Cost        market.AssetQuantity
 	Price       market.PriceObservation
+	Model       string
+	Available   bool
 }
 
 type ParityEvidence struct {
@@ -182,6 +199,7 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		referenceSources: options.ReferenceSources, referenceQuoteOverride: options.ReferenceQuoteOverride,
 		clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger,
 		openingAlerts: options.OpeningAlerts, configurationAlerts: options.ConfigurationAlerts,
+		directionalCosts:  options.DirectionalCosts,
 		deliveredWarnings: make(map[string]struct{}),
 	}, nil
 }
@@ -356,6 +374,20 @@ func (r *Runner) evaluateFresh(ctx context.Context, candidate evaluationStrategy
 }
 
 func (r *Runner) evaluateWithQuoteMode(ctx context.Context, candidate evaluationStrategy, snapshots []market.MarketSnapshot, cost arbitrage.CostSnapshot, id string, triggeredAt time.Time, trigger *arbitrage.TriggerMetadata, refresh bool) (runtimeresearch.Report, error) {
+	return r.evaluateWithDirectionalCosts(ctx, candidate, snapshots, cost, nil, id, triggeredAt, trigger, refresh)
+}
+
+func (r *Runner) evaluateWithDirectionalCosts(
+	ctx context.Context,
+	candidate evaluationStrategy,
+	snapshots []market.MarketSnapshot,
+	cost arbitrage.CostSnapshot,
+	costs map[arbitrage.Direction]arbitrage.CostSnapshot,
+	id string,
+	triggeredAt time.Time,
+	trigger *arbitrage.TriggerMetadata,
+	refresh bool,
+) (runtimeresearch.Report, error) {
 	startedAt := r.clock().UTC()
 	evaluation, err := arbitrage.NewEvaluation(
 		arbitrage.EvaluationID(id), arbitrage.ResearchRunID(r.config.RunID), candidate.ID(),
@@ -363,6 +395,12 @@ func (r *Runner) evaluateWithQuoteMode(ctx context.Context, candidate evaluation
 	)
 	if err != nil {
 		return runtimeresearch.Report{}, err
+	}
+	if len(costs) > 0 {
+		evaluation, err = evaluation.WithDirectionalCosts(costs)
+		if err != nil {
+			return runtimeresearch.Report{}, err
+		}
 	}
 	if trigger != nil {
 		evaluation = evaluation.WithTrigger(*trigger)

@@ -176,9 +176,21 @@ func writeTextSummary(writer io.Writer, report Report, options OutputOptions) er
 		return err
 	}
 	if !options.OmitCost && report.Cost.Cost.Asset() != "" {
-		if _, err := fmt.Fprintf(writer, "  Fixed cost   %s\n",
-			readableQuantity(report.Cost.Cost)); err != nil {
-			return err
+		if report.Cost.Model == "complete_flow_cache" {
+			state := "warming"
+			if report.Cost.Available {
+				state = "ready (per route)"
+			}
+			if _, err := fmt.Fprintf(
+				writer, "  Flow costs   %s\n", state,
+			); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintf(writer, "  Fixed cost   %s\n",
+				readableQuantity(report.Cost.Cost)); err != nil {
+				return err
+			}
 		}
 	}
 	if discovery := report.Research.LocalTiming.Discovery; discovery != nil {
@@ -220,9 +232,10 @@ func writeTextSummary(writer io.Writer, report Report, options OutputOptions) er
 		candidate := opportunity.Candidates[opportunity.SelectedIndex]
 		if _, err := fmt.Fprintf(
 			writer,
-			"\nRESULT (%s -> %s)\n  Gross PnL    %s\n  Net PnL      %s  [%s]\n",
+			"\nRESULT (%s -> %s)\n  Gross PnL    %s\n  Flow cost    %s\n  Net PnL      %s  [%s]\n",
 			readableMarket(opportunity.Direction.BuyMarket), readableMarket(opportunity.Direction.SellMarket),
-			readableQuantity(candidate.GrossPnL), readableQuantity(candidate.NetPnL),
+			readableQuantity(candidate.GrossPnL), readableQuantity(candidate.Cost.Amount),
+			readableQuantity(candidate.NetPnL),
 			readableVerdict(opportunity),
 		); err != nil {
 			return err
