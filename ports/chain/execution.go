@@ -44,6 +44,22 @@ type TxManager interface {
 	Reconcile(context.Context, execution.OperationStep) (execution.Settlement, error)
 }
 
+// PreparedTransactionSimulator executes the exact signed payload against the
+// current chain state without broadcasting it. Live uses this before durable
+// persistence so a transaction that is already stale or would revert cannot
+// enter the emission path.
+type PreparedTransactionSimulator interface {
+	SimulatePrepared(context.Context, PreparedTransaction) error
+}
+
+// EVMNonceCoordinator is the single in-process authority for the next nonce of
+// one EVM account. Every component that broadcasts with that account must use
+// the same coordinator, including swaps and bridge source/destination calls.
+type EVMNonceCoordinator interface {
+	NextNonce() (uint64, error)
+	MarkNonceUsed(uint64)
+}
+
 // ConfirmationSource is the primary WebSocket evidence path. Implementations
 // must bind an observation to the supplied durable step and include actual
 // economic amounts when reporting success.

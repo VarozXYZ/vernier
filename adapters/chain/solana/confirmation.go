@@ -203,17 +203,19 @@ func (s *ConfirmationSource) finish(err error) {
 }
 
 type SPLBalanceDecoderConfig struct {
-	Owner      string
-	TokenMints map[market.TokenID]string
-	Clock      func() time.Time
+	Owner       string
+	TokenMints  map[market.TokenID]string
+	NativeAsset market.AssetID
+	Clock       func() time.Time
 }
 
 // SPLBalanceDecoder proves the wallet's actual input and output from summed
 // pre/post token balances. It supports multiple token accounts for one mint.
 type SPLBalanceDecoder struct {
-	owner      string
-	tokenMints map[market.TokenID]string
-	clock      func() time.Time
+	owner       string
+	tokenMints  map[market.TokenID]string
+	nativeAsset market.AssetID
+	clock       func() time.Time
 }
 
 func NewSPLBalanceDecoder(config SPLBalanceDecoderConfig) (*SPLBalanceDecoder, error) {
@@ -227,7 +229,13 @@ func NewSPLBalanceDecoder(config SPLBalanceDecoderConfig) (*SPLBalanceDecoder, e
 		}
 		mints[token] = mint
 	}
-	return &SPLBalanceDecoder{owner: config.Owner, tokenMints: mints, clock: config.Clock}, nil
+	if config.NativeAsset == "" {
+		config.NativeAsset = "sol"
+	}
+	return &SPLBalanceDecoder{
+		owner: config.Owner, tokenMints: mints,
+		nativeAsset: config.NativeAsset, clock: config.Clock,
+	}, nil
 }
 
 func (d *SPLBalanceDecoder) DecodeTransaction(step execution.OperationStep, transaction Transaction) (execution.Settlement, error) {
@@ -270,18 +278,67 @@ func (d *SPLBalanceDecoder) DecodeTransaction(step execution.OperationStep, tran
 	if err != nil {
 		return execution.Settlement{}, err
 	}
+	costs, err := d.costs(step.Leg.Chain, meta)
+	if err != nil {
+		return execution.Settlement{}, err
+	}
 	return execution.Settlement{
 		Identity: step.Identity, Technical: execution.StateConfirmedSuccess,
 		Economic: execution.EconomicEffectVerified,
 		ActualIn: actualIn, ActualOut: actualOut, ObservedAt: d.clock().UTC(),
-		Evidence: "solana_token_balance_delta",
+		Costs: costs, Evidence: "solana_token_balance_delta",
 	}, nil
 }
 
 type transactionMeta struct {
 	Err               json.RawMessage `json:"err"`
+	Fee               uint64          `json:"fee"`
+	PreBalances       []uint64        `json:"preBalances"`
+	PostBalances      []uint64        `json:"postBalances"`
 	PreTokenBalances  []tokenBalance  `json:"preTokenBalances"`
 	PostTokenBalances []tokenBalance  `json:"postTokenBalances"`
+}
+
+func (d *SPLBalanceDecoder) costs(
+	chain market.ChainID,
+	meta transactionMeta,
+) ([]execution.CostComponent, error) {
+	result := make([]execution.CostComponent, 0, 2)
+	appendLamports := func(kind string, lamports uint64, evidence string) error {
+		if lamports == 0 {
+			return nil
+		}
+		amount, err := market.NewAssetQuantity(
+			d.nativeAsset,
+			new(big.Rat).SetFrac(
+				new(big.Int).SetUint64(lamports),
+				new(big.Int).Exp(big.NewInt(10), big.NewInt(9), nil),
+			),
+		)
+		if err != nil {
+			return err
+		}
+		result = append(result, execution.CostComponent{
+			Kind: kind, Chain: chain, Amount: amount, Evidence: evidence,
+		})
+		return nil
+	}
+	if err := appendLamports("network_fee", meta.Fee, "solana_transaction_meta_fee"); err != nil {
+		return nil, err
+	}
+	if len(meta.PreBalances) > 0 && len(meta.PostBalances) > 0 &&
+		meta.PreBalances[0] >= meta.PostBalances[0] {
+		total := meta.PreBalances[0] - meta.PostBalances[0]
+		if total > meta.Fee {
+			if err := appendLamports(
+				"additional_payer_debit", total-meta.Fee,
+				"solana_payer_balance_delta",
+			); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return result, nil
 }
 
 type tokenBalance struct {
