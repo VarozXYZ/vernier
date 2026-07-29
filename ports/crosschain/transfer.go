@@ -13,8 +13,8 @@ import (
 )
 
 // Intent fixes the economic movement before any source-chain transaction is
-// built. Recipient is the destination-chain native address encoded as a
-// Wormhole universal address.
+// built. Recipient is a protocol-neutral 32-byte destination address. Each
+// adapter owns the conversion to its wire format.
 type Intent struct {
 	ID               string
 	SourceChain      market.ChainID
