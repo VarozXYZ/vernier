@@ -33,16 +33,17 @@ type Manifest struct {
 }
 
 type Topology struct {
-	SchemaVersion int                          `yaml:"schema_version"`
-	Chains        map[string]ChainConfig       `yaml:"chains"`
-	Assets        map[string]AssetConfig       `yaml:"assets"`
-	Tokens        map[string]TokenConfig       `yaml:"tokens"`
-	Venues        map[string]VenueConfig       `yaml:"venues"`
-	Pools         map[string]PoolConfig        `yaml:"pools"`
-	Paths         map[string]PathConfig        `yaml:"paths"`
-	Markets       map[string]MarketConfig      `yaml:"markets"`
-	PriceSources  map[string]PriceSourceConfig `yaml:"price_sources"`
-	QuoteSources  map[string]QuoteSourceConfig `yaml:"quote_sources"`
+	SchemaVersion   int                             `yaml:"schema_version"`
+	Chains          map[string]ChainConfig          `yaml:"chains"`
+	Assets          map[string]AssetConfig          `yaml:"assets"`
+	Tokens          map[string]TokenConfig          `yaml:"tokens"`
+	Venues          map[string]VenueConfig          `yaml:"venues"`
+	Pools           map[string]PoolConfig           `yaml:"pools"`
+	Paths           map[string]PathConfig           `yaml:"paths"`
+	Markets         map[string]MarketConfig         `yaml:"markets"`
+	PriceSources    map[string]PriceSourceConfig    `yaml:"price_sources"`
+	QuoteSources    map[string]QuoteSourceConfig    `yaml:"quote_sources"`
+	TransferSources map[string]TransferSourceConfig `yaml:"transfer_sources"`
 }
 
 type Policy struct {
@@ -139,6 +140,18 @@ type QuoteSourceConfig struct {
 	ClientPlatform      string `yaml:"client_platform"`
 }
 
+// TransferSourceConfig selects a compiled transfer adapter and supplies only
+// its external configuration. The resolver deliberately does not enumerate
+// provider kinds: composition owns the registry of capabilities available in
+// a particular binary.
+type TransferSourceConfig struct {
+	Kind            string `yaml:"kind"`
+	BaseURL         string `yaml:"base_url"`
+	Profile         string `yaml:"profile"`
+	APIKeyEnv       string `yaml:"api_key_env"`
+	IntegratorIDEnv string `yaml:"integrator_id_env"`
+}
+
 type PriceSourceConfig struct {
 	BaseAsset  string         `yaml:"base_asset"`
 	QuoteAsset string         `yaml:"quote_asset"`
@@ -188,25 +201,37 @@ type TelegramConfig struct {
 }
 
 type LiveConfig struct {
-	RunID                      string                       `yaml:"run_id"`
-	Setup                      string                       `yaml:"setup"`
-	InventoryMode              string                       `yaml:"inventory_mode"`
-	Notional                   AmountConfig                 `yaml:"notional"`
-	ExecutionCost              AmountConfig                 `yaml:"execution_cost"`
-	MaxExecutionCost           AmountConfig                 `yaml:"max_execution_cost"`
-	MaxBaseExposure            AmountConfig                 `yaml:"max_base_exposure"`
-	MinNetProfit               AmountConfig                 `yaml:"min_net_profit"`
-	FeeCacheMaxAgeMS           int                          `yaml:"fee_cache_max_age_ms"`
-	SlippageBPS                uint16                       `yaml:"slippage_bps"`
-	TipLamports                string                       `yaml:"tip_lamports"`
-	ComputeUnitPricePercentile string                       `yaml:"compute_unit_price_percentile"`
-	ComputeUnitLimit           uint32                       `yaml:"compute_unit_limit"`
-	BlockhashSlotsToExpiry     uint16                       `yaml:"blockhash_slots_to_expiry"`
-	BuildToBroadcastTimeoutMS  int                          `yaml:"build_to_broadcast_timeout_ms"`
-	EVMDeadlineSeconds         int                          `yaml:"evm_deadline_seconds"`
-	OperationalStore           OperationalStoreConfig       `yaml:"operational_store"`
-	Accounts                   map[string]LiveAccountConfig `yaml:"accounts"`
-	Inventory                  []InventoryBalanceConfig     `yaml:"inventory"`
+	RunID                         string                       `yaml:"run_id"`
+	Setup                         string                       `yaml:"setup"`
+	InventoryMode                 string                       `yaml:"inventory_mode"`
+	ExecutionMode                 string                       `yaml:"execution_mode"`
+	Notional                      AmountConfig                 `yaml:"notional"`
+	CanaryInput                   AmountConfig                 `yaml:"canary_input"`
+	ExecutionInput                AmountConfig                 `yaml:"execution_input"`
+	MaxOperationsPerRun           int                          `yaml:"max_operations_per_run"`
+	BaseTransferSource            string                       `yaml:"base_transfer_source"`
+	QuoteTransferSource           string                       `yaml:"quote_transfer_source"`
+	ConfirmationTimeoutSeconds    int                          `yaml:"confirmation_timeout_seconds"`
+	ExecutionCost                 AmountConfig                 `yaml:"execution_cost"`
+	MaxExecutionCost              AmountConfig                 `yaml:"max_execution_cost"`
+	MaxBaseExposure               AmountConfig                 `yaml:"max_base_exposure"`
+	MinNetProfit                  AmountConfig                 `yaml:"min_net_profit"`
+	ReturnBridgeSafetyMargin      AmountConfig                 `yaml:"return_bridge_safety_margin"`
+	FeeCacheMaxAgeMS              int                          `yaml:"fee_cache_max_age_ms"`
+	CostRefreshIntervalMS         int                          `yaml:"cost_refresh_interval_ms"`
+	CostCacheTTLMS                int                          `yaml:"cost_cache_ttl_ms"`
+	CostCalibrationStore          string                       `yaml:"cost_calibration_store"`
+	QuoteTransferCalibrationStore string                       `yaml:"quote_transfer_calibration_store"`
+	SlippageBPS                   uint16                       `yaml:"slippage_bps"`
+	TipLamports                   string                       `yaml:"tip_lamports"`
+	ComputeUnitPricePercentile    string                       `yaml:"compute_unit_price_percentile"`
+	ComputeUnitLimit              uint32                       `yaml:"compute_unit_limit"`
+	BlockhashSlotsToExpiry        uint16                       `yaml:"blockhash_slots_to_expiry"`
+	BuildToBroadcastTimeoutMS     int                          `yaml:"build_to_broadcast_timeout_ms"`
+	EVMDeadlineSeconds            int                          `yaml:"evm_deadline_seconds"`
+	OperationalStore              OperationalStoreConfig       `yaml:"operational_store"`
+	Accounts                      map[string]LiveAccountConfig `yaml:"accounts"`
+	Inventory                     []InventoryBalanceConfig     `yaml:"inventory"`
 }
 
 type OperationalStoreConfig struct {
@@ -215,12 +240,19 @@ type OperationalStoreConfig struct {
 }
 
 type LiveAccountConfig struct {
-	ID                 string `yaml:"id"`
-	PublicAddressEnv   string `yaml:"public_address_env"`
-	SignerEnv          string `yaml:"signer_env"`
-	SenderURLEnv       string `yaml:"sender_url_env"`
-	FanoutRPCURLEnv    string `yaml:"fanout_rpc_urls_env"`
-	ContractAddressEnv string `yaml:"contract_address_env"`
+	ID                         string                    `yaml:"id"`
+	PublicAddressEnv           string                    `yaml:"public_address_env"`
+	SignerEnv                  string                    `yaml:"signer_env"`
+	SellPreflightAddressEnv    string                    `yaml:"sell_preflight_address_env"`
+	SellPreflightStateOverride *ERC20StateOverrideConfig `yaml:"sell_preflight_state_override"`
+	SenderURLEnv               string                    `yaml:"sender_url_env"`
+	FanoutRPCURLEnv            string                    `yaml:"fanout_rpc_urls_env"`
+	ContractAddressEnv         string                    `yaml:"contract_address_env"`
+}
+
+type ERC20StateOverrideConfig struct {
+	BalanceSlot   uint64 `yaml:"balance_slot"`
+	AllowanceSlot uint64 `yaml:"allowance_slot"`
 }
 
 type InventoryBalanceConfig struct {
@@ -332,6 +364,15 @@ type ResolvedQuoteSource struct {
 	ClientPlatform      string
 }
 
+type ResolvedTransferSource struct {
+	ID              string
+	Kind            string
+	BaseURL         string
+	Profile         string
+	APIKeyEnv       string
+	IntegratorIDEnv string
+}
+
 type ParsedConfig struct {
 	Hash                   string
 	ResearchID             string
@@ -361,13 +402,15 @@ type ParsedConfig struct {
 }
 
 type ResolvedLiveAccount struct {
-	ID                 string
-	Chain              string
-	PublicAddressEnv   string
-	SignerEnv          string
-	SenderURLEnv       string
-	FanoutRPCURLEnv    string
-	ContractAddressEnv string
+	ID                         string
+	Chain                      string
+	PublicAddressEnv           string
+	SignerEnv                  string
+	SellPreflightAddressEnv    string
+	SellPreflightStateOverride *ERC20StateOverrideConfig
+	SenderURLEnv               string
+	FanoutRPCURLEnv            string
+	ContractAddressEnv         string
 }
 
 type ResolvedInventoryBalance struct {
@@ -378,31 +421,44 @@ type ResolvedInventoryBalance struct {
 }
 
 type ParsedLiveConfig struct {
-	Hash                       string
-	LiveID                     string
-	RunID                      string
-	SetupID                    string
-	Assets                     map[market.AssetID]market.Asset
-	Chains                     map[string]ResolvedChain
-	Markets                    [2]ResolvedMarket
-	QuoteSources               map[string]ResolvedQuoteSource
-	Notional                   *big.Rat
-	ExecutionCost              *big.Rat
-	MaximumExecutionCost       *big.Rat
-	MaximumBaseExposure        *big.Rat
-	MinimumNet                 *big.Rat
-	FeeCacheMaxAge             time.Duration
-	SlippageBPS                uint16
-	TipLamports                string
-	ComputeUnitPricePercentile string
-	ComputeUnitLimit           uint32
-	BlockhashSlotsToExpiry     uint16
-	BuildToBroadcastTimeout    time.Duration
-	EVMDeadline                time.Duration
-	OperationalStorePath       string
-	SQLiteSynchronous          string
-	Accounts                   map[string]ResolvedLiveAccount
-	Inventory                  []ResolvedInventoryBalance
+	Hash                          string
+	LiveID                        string
+	RunID                         string
+	SetupID                       string
+	Assets                        map[market.AssetID]market.Asset
+	Chains                        map[string]ResolvedChain
+	Markets                       [2]ResolvedMarket
+	QuoteSources                  map[string]ResolvedQuoteSource
+	TransferSources               map[string]ResolvedTransferSource
+	ExecutionMode                 string
+	Notional                      *big.Rat
+	CanaryInput                   *big.Rat
+	ExecutionInput                *big.Rat
+	MaxOperationsPerRun           int
+	BaseTransferSource            ResolvedTransferSource
+	QuoteTransferSource           ResolvedTransferSource
+	ConfirmationTimeout           time.Duration
+	ExecutionCost                 *big.Rat
+	MaximumExecutionCost          *big.Rat
+	MaximumBaseExposure           *big.Rat
+	MinimumNet                    *big.Rat
+	ReturnBridgeSafetyMargin      *big.Rat
+	FeeCacheMaxAge                time.Duration
+	CostRefreshInterval           time.Duration
+	CostCacheTTL                  time.Duration
+	CostCalibrationStore          string
+	QuoteTransferCalibrationStore string
+	SlippageBPS                   uint16
+	TipLamports                   string
+	ComputeUnitPricePercentile    string
+	ComputeUnitLimit              uint32
+	BlockhashSlotsToExpiry        uint16
+	BuildToBroadcastTimeout       time.Duration
+	EVMDeadline                   time.Duration
+	OperationalStorePath          string
+	SQLiteSynchronous             string
+	Accounts                      map[string]ResolvedLiveAccount
+	Inventory                     []ResolvedInventoryBalance
 }
 
 type LookupEnv func(string) (string, bool)
@@ -712,6 +768,16 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	if !ok || strings.TrimSpace(config.RunID) == "" || config.InventoryMode != "prefunded_live" {
 		return ParsedLiveConfig{}, fmt.Errorf("active live profile requires a run ID and prefunded_live inventory")
 	}
+	executionMode := strings.TrimSpace(config.ExecutionMode)
+	if executionMode == "" {
+		executionMode = "prefunded_parallel"
+	}
+	sequentialCanary := executionMode == "sequential_bridge_canary"
+	sequentialLive := executionMode == "sequential_bridge_live"
+	sequential := sequentialCanary || sequentialLive
+	if executionMode != "prefunded_parallel" && !sequential {
+		return ParsedLiveConfig{}, fmt.Errorf("unsupported live execution mode %q", executionMode)
+	}
 	setup, ok := policy.Setups[config.Setup]
 	if !ok || len(setup.Markets) != 2 || setup.Markets[0] == setup.Markets[1] {
 		return ParsedLiveConfig{}, fmt.Errorf("active live setup requires two distinct markets")
@@ -731,6 +797,17 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		}
 		quoteSources[id] = resolved
 	}
+	transferSources := make(
+		map[string]ResolvedTransferSource,
+		len(topology.TransferSources),
+	)
+	for id, candidate := range topology.TransferSources {
+		resolved, err := resolveTransferSource(id, candidate)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		transferSources[id] = resolved
+	}
 	chains := make(map[string]ResolvedChain)
 	markets := [2]ResolvedMarket{}
 	remoteMarkets := 0
@@ -743,22 +820,25 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 			if _, exists := quoteSources[resolved.QuoteSource]; !exists {
 				return ParsedLiveConfig{}, fmt.Errorf("market %q references unknown quote source %q", resolved.ID, resolved.QuoteSource)
 			}
-			if chain.Kind != "solana" || len(resolved.TriggerPools) == 0 {
-				return ParsedLiveConfig{}, fmt.Errorf("live remote market %q requires Solana trigger pools", resolved.ID)
+			if len(resolved.TriggerPools) == 0 ||
+				!sequential && chain.Kind != "solana" {
+				return ParsedLiveConfig{}, fmt.Errorf("live remote market %q requires compatible trigger pools", resolved.ID)
 			}
 			remoteMarkets++
 		}
 		markets[index], chains[chain.ID] = resolved, chain
 	}
-	if remoteMarkets != 1 {
+	if !sequential && remoteMarkets != 1 {
 		return ParsedLiveConfig{}, fmt.Errorf("initial live vertical requires exactly one event-refreshed remote market")
 	}
 	if markets[0].Base.Token.Asset != markets[1].Base.Token.Asset ||
 		markets[0].Quote.Token.Asset != markets[1].Quote.Token.Asset {
 		return ParsedLiveConfig{}, fmt.Errorf("live setup markets must share base and quote assets")
 	}
+	executionCostAsset := market.AssetID(config.ExecutionCost.Asset)
 	if market.AssetID(config.Notional.Asset) != markets[0].Quote.Token.Asset ||
-		market.AssetID(config.ExecutionCost.Asset) != markets[0].Quote.Token.Asset ||
+		(!sequential || executionCostAsset != "") &&
+			executionCostAsset != markets[0].Quote.Token.Asset ||
 		market.AssetID(config.MaxExecutionCost.Asset) != markets[0].Quote.Token.Asset ||
 		market.AssetID(config.MaxBaseExposure.Asset) != markets[0].Base.Token.Asset ||
 		market.AssetID(config.MinNetProfit.Asset) != markets[0].Quote.Token.Asset {
@@ -768,9 +848,59 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	if err != nil {
 		return ParsedLiveConfig{}, err
 	}
-	executionCost, err := positive(config.ExecutionCost.Amount, "live execution cost")
-	if err != nil {
-		return ParsedLiveConfig{}, err
+	var canaryInput *big.Rat
+	var executionInput *big.Rat
+	if sequentialCanary {
+		if market.AssetID(config.CanaryInput.Asset) != markets[0].Quote.Token.Asset {
+			return ParsedLiveConfig{}, fmt.Errorf("live canary input must use the setup quote asset")
+		}
+		canaryInput, err = positive(config.CanaryInput.Amount, "live canary input")
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		if canaryInput.Cmp(notional) > 0 {
+			return ParsedLiveConfig{}, fmt.Errorf("live canary input cannot exceed discovery notional")
+		}
+		executionInput = new(big.Rat).Set(canaryInput)
+	}
+	if sequentialLive {
+		if market.AssetID(config.ExecutionInput.Asset) != markets[0].Quote.Token.Asset {
+			return ParsedLiveConfig{}, fmt.Errorf("live execution input must use the setup quote asset")
+		}
+		executionInput, err = positive(config.ExecutionInput.Amount, "live execution input")
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		if executionInput.Cmp(notional) != 0 {
+			return ParsedLiveConfig{}, fmt.Errorf("live execution input must equal discovery notional")
+		}
+	}
+	var baseTransfer, quoteTransfer ResolvedTransferSource
+	if sequential {
+		var baseOK, quoteOK bool
+		baseTransfer, baseOK = transferSources[strings.TrimSpace(
+			config.BaseTransferSource,
+		)]
+		quoteTransfer, quoteOK = transferSources[strings.TrimSpace(
+			config.QuoteTransferSource,
+		)]
+		if config.MaxOperationsPerRun != 1 {
+			return ParsedLiveConfig{}, fmt.Errorf("initial sequential execution requires max_operations_per_run: 1")
+		}
+		if !baseOK || !quoteOK || config.ConfirmationTimeoutSeconds <= 0 {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"sequential transfer and confirmation policy is incomplete",
+			)
+		}
+	}
+	var executionCost *big.Rat
+	if sequential && strings.TrimSpace(config.ExecutionCost.Amount) == "" {
+		executionCost = new(big.Rat)
+	} else {
+		executionCost, err = positive(config.ExecutionCost.Amount, "live execution cost")
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
 	}
 	maximumExecutionCost, err := positive(config.MaxExecutionCost.Amount, "live maximum execution cost")
 	if err != nil {
@@ -787,21 +917,63 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	if err != nil {
 		return ParsedLiveConfig{}, err
 	}
+	returnSafetyMargin := new(big.Rat)
+	if strings.TrimSpace(config.ReturnBridgeSafetyMargin.Amount) != "" {
+		if market.AssetID(config.ReturnBridgeSafetyMargin.Asset) !=
+			markets[0].Quote.Token.Asset {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live return bridge safety margin must use the quote asset",
+			)
+		}
+		returnSafetyMargin, err = positiveOrZero(
+			config.ReturnBridgeSafetyMargin.Amount,
+			"live return bridge safety margin",
+		)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+	}
 	if config.SlippageBPS == 0 || config.SlippageBPS > 10_000 {
 		return ParsedLiveConfig{}, fmt.Errorf("live slippage must be between 1 and 10000 basis points")
 	}
-	tip, ok := new(big.Int).SetString(config.TipLamports, 10)
-	if !ok || tip.Sign() <= 0 {
-		return ParsedLiveConfig{}, fmt.Errorf("live tip_lamports must be a positive integer")
+	hasSolana := false
+	hasEVM := false
+	for _, chain := range chains {
+		hasSolana = hasSolana || chain.Kind == "solana"
+		hasEVM = hasEVM || chain.Kind == "evm"
 	}
-	if strings.TrimSpace(config.ComputeUnitPricePercentile) == "" || config.ComputeUnitLimit == 0 ||
-		config.ComputeUnitLimit > 1_400_000 {
-		return ParsedLiveConfig{}, fmt.Errorf("live compute-unit policy is incomplete")
+	if hasSolana {
+		tip, ok := new(big.Int).SetString(config.TipLamports, 10)
+		if !ok || tip.Sign() <= 0 {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live tip_lamports must be a positive integer",
+			)
+		}
+	}
+	if hasSolana &&
+		(strings.TrimSpace(config.ComputeUnitPricePercentile) == "" ||
+			config.ComputeUnitLimit == 0 ||
+			config.ComputeUnitLimit > 1_400_000 ||
+			config.BlockhashSlotsToExpiry == 0 ||
+			config.BlockhashSlotsToExpiry > 300) {
+		return ParsedLiveConfig{}, fmt.Errorf(
+			"live Solana transaction policy is incomplete",
+		)
 	}
 	if config.FeeCacheMaxAgeMS <= 0 ||
-		config.BlockhashSlotsToExpiry == 0 || config.BlockhashSlotsToExpiry > 300 ||
-		config.BuildToBroadcastTimeoutMS <= 0 || config.EVMDeadlineSeconds <= 0 {
+		config.BuildToBroadcastTimeoutMS <= 0 ||
+		hasEVM && config.EVMDeadlineSeconds <= 0 {
 		return ParsedLiveConfig{}, fmt.Errorf("live transaction validity policy is invalid")
+	}
+	if config.CostRefreshIntervalMS == 0 {
+		config.CostRefreshIntervalMS = 15_000
+	}
+	if config.CostCacheTTLMS == 0 {
+		config.CostCacheTTLMS = 60_000
+	}
+	if config.CostRefreshIntervalMS < 1_000 ||
+		config.CostCacheTTLMS < config.CostRefreshIntervalMS {
+		return ParsedLiveConfig{}, fmt.Errorf("live complete-flow cost cache policy is invalid")
 	}
 	synchronous := strings.ToUpper(strings.TrimSpace(config.OperationalStore.Synchronous))
 	if synchronous == "" {
@@ -813,31 +985,47 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	accounts := make(map[string]ResolvedLiveAccount, len(config.Accounts))
 	for chainID := range chains {
 		account, exists := config.Accounts[chainID]
-		chain := chains[chainID]
 		if !exists || strings.TrimSpace(account.ID) == "" ||
-			!environmentName.MatchString(account.PublicAddressEnv) ||
 			!environmentName.MatchString(account.SignerEnv) {
 			return ParsedLiveConfig{}, fmt.Errorf(
-				"live chain %q requires account ID, public address, and signer environments", chainID,
+				"live chain %q requires account ID and signer environment",
+				chainID,
 			)
 		}
-		switch chain.Kind {
-		case "solana":
-			if !environmentName.MatchString(account.SenderURLEnv) || account.FanoutRPCURLEnv != "" || account.ContractAddressEnv != "" {
-				return ParsedLiveConfig{}, fmt.Errorf("live Solana account %q requires only sender_url_env", account.ID)
+		for _, candidate := range []string{
+			account.PublicAddressEnv,
+			account.SellPreflightAddressEnv,
+			account.SenderURLEnv,
+			account.FanoutRPCURLEnv,
+			account.ContractAddressEnv,
+		} {
+			if candidate != "" && !environmentName.MatchString(candidate) {
+				return ParsedLiveConfig{}, fmt.Errorf(
+					"live account %q has an invalid environment name",
+					account.ID,
+				)
 			}
-		case "evm":
-			if !environmentName.MatchString(account.FanoutRPCURLEnv) || !environmentName.MatchString(account.ContractAddressEnv) ||
-				account.SenderURLEnv != "" {
-				return ParsedLiveConfig{}, fmt.Errorf("live EVM account %q requires fanout and contract environments", account.ID)
-			}
-		default:
-			return ParsedLiveConfig{}, fmt.Errorf("live chain %q has unsupported kind %q", chainID, chain.Kind)
+		}
+		if account.SenderURLEnv == "" && account.FanoutRPCURLEnv == "" {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live account %q requires a broadcast transport",
+				account.ID,
+			)
+		}
+		if account.SellPreflightStateOverride != nil &&
+			account.SellPreflightStateOverride.BalanceSlot ==
+				account.SellPreflightStateOverride.AllowanceSlot {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live account %q requires distinct state override slots",
+				account.ID,
+			)
 		}
 		accounts[chainID] = ResolvedLiveAccount{
 			ID: account.ID, Chain: chainID, PublicAddressEnv: account.PublicAddressEnv,
-			SignerEnv:    account.SignerEnv,
-			SenderURLEnv: account.SenderURLEnv, FanoutRPCURLEnv: account.FanoutRPCURLEnv,
+			SignerEnv:                  account.SignerEnv,
+			SellPreflightAddressEnv:    account.SellPreflightAddressEnv,
+			SellPreflightStateOverride: account.SellPreflightStateOverride,
+			SenderURLEnv:               account.SenderURLEnv, FanoutRPCURLEnv: account.FanoutRPCURLEnv,
 			ContractAddressEnv: account.ContractAddressEnv,
 		}
 	}
@@ -866,9 +1054,16 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		})
 	}
 	for _, configuredMarket := range markets {
-		account := accounts[configuredMarket.Venue.Chain]
-		for _, token := range []market.Token{configuredMarket.Base.Token, configuredMarket.Quote.Token} {
-			key := configuredMarket.Venue.Chain + "/" + account.ID + "/" + string(token.ID)
+		account := accounts[configuredMarket.Chain]
+		requiredTokens := []market.Token{
+			configuredMarket.Base.Token,
+			configuredMarket.Quote.Token,
+		}
+		if sequential {
+			requiredTokens = []market.Token{configuredMarket.Quote.Token}
+		}
+		for _, token := range requiredTokens {
+			key := configuredMarket.Chain + "/" + account.ID + "/" + string(token.ID)
 			if !covered[key] {
 				return ParsedLiveConfig{}, fmt.Errorf("live inventory is missing prefunded token %q", token.ID)
 			}
@@ -886,12 +1081,26 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	sum := sha256.Sum256(canonical)
 	return ParsedLiveConfig{
 		Hash: hex.EncodeToString(sum[:]), LiveID: manifest.ActiveLive, RunID: config.RunID,
-		SetupID: config.Setup, Assets: assets, Chains: chains, Markets: markets, QuoteSources: quoteSources,
-		Notional: notional, ExecutionCost: executionCost,
+		SetupID: config.Setup, Assets: assets, Chains: chains, Markets: markets,
+		QuoteSources: quoteSources, TransferSources: transferSources,
+		ExecutionMode: executionMode, Notional: notional, CanaryInput: canaryInput,
+		ExecutionInput:       executionInput,
+		MaxOperationsPerRun:  config.MaxOperationsPerRun,
+		BaseTransferSource:   baseTransfer,
+		QuoteTransferSource:  quoteTransfer,
+		ConfirmationTimeout:  time.Duration(config.ConfirmationTimeoutSeconds) * time.Second,
+		ExecutionCost:        executionCost,
 		MaximumExecutionCost: maximumExecutionCost, MaximumBaseExposure: maximumBaseExposure,
-		MinimumNet:     minimumNet,
-		FeeCacheMaxAge: time.Duration(config.FeeCacheMaxAgeMS) * time.Millisecond,
-		SlippageBPS:    config.SlippageBPS, TipLamports: config.TipLamports,
+		MinimumNet:               minimumNet,
+		ReturnBridgeSafetyMargin: returnSafetyMargin,
+		FeeCacheMaxAge:           time.Duration(config.FeeCacheMaxAgeMS) * time.Millisecond,
+		CostRefreshInterval:      time.Duration(config.CostRefreshIntervalMS) * time.Millisecond,
+		CostCacheTTL:             time.Duration(config.CostCacheTTLMS) * time.Millisecond,
+		CostCalibrationStore:     strings.TrimSpace(config.CostCalibrationStore),
+		QuoteTransferCalibrationStore: strings.TrimSpace(
+			config.QuoteTransferCalibrationStore,
+		),
+		SlippageBPS: config.SlippageBPS, TipLamports: config.TipLamports,
 		ComputeUnitPricePercentile: config.ComputeUnitPricePercentile, ComputeUnitLimit: config.ComputeUnitLimit,
 		BlockhashSlotsToExpiry:  config.BlockhashSlotsToExpiry,
 		BuildToBroadcastTimeout: time.Duration(config.BuildToBroadcastTimeoutMS) * time.Millisecond,
@@ -1291,6 +1500,39 @@ func resolveQuoteSource(id string, config QuoteSourceConfig) (ResolvedQuoteSourc
 		BroadcastFeeType: config.BroadcastFeeType, UseWSOL: config.UseWSOL,
 		ExcludeDexes: config.ExcludeDexes, ExcludeRouters: config.ExcludeRouters,
 		ClientPlatform: config.ClientPlatform,
+	}, nil
+}
+
+func resolveTransferSource(
+	id string,
+	config TransferSourceConfig,
+) (ResolvedTransferSource, error) {
+	id = strings.TrimSpace(id)
+	config.Kind = strings.TrimSpace(config.Kind)
+	config.BaseURL = strings.TrimSpace(config.BaseURL)
+	config.Profile = strings.TrimSpace(config.Profile)
+	config.APIKeyEnv = strings.TrimSpace(config.APIKeyEnv)
+	config.IntegratorIDEnv = strings.TrimSpace(config.IntegratorIDEnv)
+	if id == "" || config.Kind == "" {
+		return ResolvedTransferSource{}, fmt.Errorf(
+			"transfer sources require an ID and adapter kind",
+		)
+	}
+	for _, candidate := range []string{
+		config.APIKeyEnv,
+		config.IntegratorIDEnv,
+	} {
+		if candidate != "" && !environmentName.MatchString(candidate) {
+			return ResolvedTransferSource{}, fmt.Errorf(
+				"transfer source %q has an invalid environment name",
+				id,
+			)
+		}
+	}
+	return ResolvedTransferSource{
+		ID: id, Kind: config.Kind, BaseURL: config.BaseURL,
+		Profile: config.Profile, APIKeyEnv: config.APIKeyEnv,
+		IntegratorIDEnv: config.IntegratorIDEnv,
 	}, nil
 }
 
