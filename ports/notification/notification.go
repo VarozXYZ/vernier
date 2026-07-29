@@ -41,3 +41,56 @@ type ConfigurationWarning struct {
 type ConfigurationWarningSender interface {
 	SendConfigurationWarning(context.Context, ConfigurationWarning) error
 }
+
+type LiveExecutionEventKind string
+
+const (
+	LiveExecutionStarted        LiveExecutionEventKind = "started"
+	LiveExecutionStageStarted   LiveExecutionEventKind = "stage_started"
+	LiveExecutionStageCompleted LiveExecutionEventKind = "stage_completed"
+	LiveExecutionExitSelected   LiveExecutionEventKind = "exit_selected"
+	LiveExecutionCompleted      LiveExecutionEventKind = "completed"
+	LiveExecutionFailed         LiveExecutionEventKind = "failed"
+)
+
+// LiveExecutionEvent contains only concise operational evidence suitable for
+// external alerts. It never carries signed payloads, calldata, credentials, or
+// private route configuration.
+type LiveExecutionEvent struct {
+	Kind              LiveExecutionEventKind
+	Operation         string
+	State             string
+	Direction         string
+	Stage             string
+	Ordinal           int
+	TotalStages       int
+	SourceChain       string
+	DestinationChain  string
+	Input             string
+	Output            string
+	BuyProvider       string
+	SellProvider      string
+	ExpectedBase      string
+	ExpectedOutput    string
+	ExpectedNetPnL    string
+	Trigger           string
+	TriggerURL        string
+	AlternativeOutput string
+	DestinationValue  string
+	ReturnValue       string
+	SafetyMargin      string
+	ExecutionCost     string
+	NetPnL            string
+	SourceTransaction string
+	SourceURL         string
+	DestinationTx     string
+	DestinationURL    string
+	Evidence          string
+	Detail            string
+	Duration          time.Duration
+	OccurredAt        time.Time
+}
+
+type LiveExecutionSender interface {
+	SendLiveExecution(context.Context, LiveExecutionEvent) error
+}

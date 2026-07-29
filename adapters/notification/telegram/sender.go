@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	notificationport "github.com/VarozXYZ/vernier/ports/notification"
@@ -32,9 +33,13 @@ type Config struct {
 }
 
 type Sender struct {
-	endpoint string
-	chatID   string
-	client   Client
+	sendEndpoint string
+	editEndpoint string
+	chatID       string
+	client       Client
+
+	liveMu       sync.Mutex
+	liveMessages map[string]*liveMessageState
 }
 
 func New(config Config) (*Sender, error) {
@@ -53,8 +58,10 @@ func New(config Config) (*Sender, error) {
 		config.Client = &http.Client{Timeout: 5 * time.Second}
 	}
 	return &Sender{
-		endpoint: strings.TrimRight(base.String(), "/") + "/bot" + token + "/sendMessage",
-		chatID:   strings.TrimSpace(config.ChatID), client: config.Client,
+		sendEndpoint: strings.TrimRight(base.String(), "/") + "/bot" + token + "/sendMessage",
+		editEndpoint: strings.TrimRight(base.String(), "/") + "/bot" + token + "/editMessageText",
+		chatID:       strings.TrimSpace(config.ChatID), client: config.Client,
+		liveMessages: make(map[string]*liveMessageState),
 	}, nil
 }
 
@@ -93,7 +100,365 @@ func (s *Sender) SendConfigurationWarning(ctx context.Context, warning notificat
 	}, "\n"))
 }
 
+func (s *Sender) SendLiveExecution(
+	ctx context.Context,
+	event notificationport.LiveExecutionEvent,
+) error {
+	if strings.TrimSpace(event.Operation) == "" {
+		return fmt.Errorf("live Telegram event requires an operation")
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	state, ok := s.liveMessages[event.Operation]
+	if !ok {
+		state = newLiveMessageState(event.Operation)
+		s.liveMessages[event.Operation] = state
+	}
+	state.apply(event)
+	text := strings.Join(liveSummaryLines(state), "\n")
+	if state.messageID == 0 {
+		messageID, err := s.sendWithID(ctx, text)
+		if err != nil {
+			return err
+		}
+		state.messageID = messageID
+		return nil
+	}
+	return s.edit(ctx, state.messageID, text)
+}
+
+type liveMessageState struct {
+	operation string
+	messageID int64
+	started   *notificationport.LiveExecutionEvent
+	starting  map[int]notificationport.LiveExecutionEvent
+	completed map[int]notificationport.LiveExecutionEvent
+	exit      *notificationport.LiveExecutionEvent
+	terminal  *notificationport.LiveExecutionEvent
+}
+
+func newLiveMessageState(operation string) *liveMessageState {
+	return &liveMessageState{
+		operation: operation,
+		starting:  make(map[int]notificationport.LiveExecutionEvent, 4),
+		completed: make(map[int]notificationport.LiveExecutionEvent, 4),
+	}
+}
+
+func (s *liveMessageState) apply(event notificationport.LiveExecutionEvent) {
+	copyOf := event
+	switch event.Kind {
+	case notificationport.LiveExecutionStarted:
+		s.started = &copyOf
+	case notificationport.LiveExecutionStageStarted:
+		s.starting[event.Ordinal] = event
+	case notificationport.LiveExecutionStageCompleted:
+		s.completed[event.Ordinal] = event
+		delete(s.starting, event.Ordinal)
+	case notificationport.LiveExecutionExitSelected:
+		s.exit = &copyOf
+	case notificationport.LiveExecutionCompleted, notificationport.LiveExecutionFailed:
+		s.terminal = &copyOf
+	}
+}
+
+func liveSummaryLines(state *liveMessageState) []string {
+	title := "\U0001f7e1 <b>LIVE · RUNNING</b>"
+	forcedCanary := state.started != nil &&
+		state.started.State == "forced_canary"
+	if forcedCanary {
+		title = "\U0001f9ea <b>CANARY · FORCED</b>"
+	}
+	if state.terminal != nil {
+		switch state.terminal.Kind {
+		case notificationport.LiveExecutionCompleted:
+			title = "\U0001f3c1 <b>LIVE · COMPLETE</b>"
+			if forcedCanary {
+				title = "\U0001f3c1 <b>CANARY · COMPLETE</b>"
+			}
+		case notificationport.LiveExecutionFailed:
+			title = "\U0001f6a8 <b>LIVE · MANUAL ACTION</b>"
+			if forcedCanary {
+				title = "\U0001f6a8 <b>CANARY · MANUAL ACTION</b>"
+			}
+			if state.terminal.State == "aborted" ||
+				state.terminal.State == "aborted_retrying" {
+				title = "\u26d4 <b>LIVE · ABORTED</b>"
+				if forcedCanary {
+					title = "\u26d4 <b>CANARY · ABORTED</b>"
+				}
+			}
+		}
+	}
+	lines := []string{title}
+	if state.started != nil {
+		event := *state.started
+		lines = append(lines,
+			"\U0001f4cd "+escape(strings.ReplaceAll(event.Direction, "->", "\u2192")),
+		)
+		expected := compactLines(
+			escape(compactAmount(event.Input)),
+			escape(compactAmount(event.ExpectedBase)),
+			escape(compactAmount(event.ExpectedOutput)),
+		)
+		if len(expected) > 0 {
+			lines = append(
+				lines,
+				"\U0001f3af <b>"+strings.Join(expected, " \u2192 ")+"</b>",
+			)
+		}
+		providers := compactLines(
+			escape(event.BuyProvider),
+			escape(event.SellProvider),
+		)
+		providerLine := ""
+		if len(providers) > 0 {
+			providerLine = "\U0001f50c " + strings.Join(providers, " \u2192 ")
+		}
+		if event.ExpectedNetPnL != "" {
+			providerLine += " · expected <b>" +
+				escape(signedAmount(event.ExpectedNetPnL)) + "</b>"
+		}
+		if providerLine != "" {
+			lines = append(lines, providerLine)
+		}
+		if trigger := liveTriggerLine(event); trigger != "" {
+			lines = append(lines, trigger)
+		}
+	}
+	for ordinal := 1; ordinal <= 4; ordinal++ {
+		if event, ok := state.completed[ordinal]; ok {
+			lines = append(lines, completedStageLines(event)...)
+			continue
+		}
+		if event, ok := state.starting[ordinal]; ok {
+			lines = append(lines,
+				"\u23f3 <b>"+escape(stageHeading(event))+"</b> · "+
+					escape(chainPath(event))+" · "+
+					escape(compactLiveAmount(event.Input)),
+			)
+		}
+	}
+	if state.exit != nil &&
+		(state.terminal == nil ||
+			state.terminal.Kind != notificationport.LiveExecutionCompleted) {
+		lines = append(lines, exitDecisionLine(*state.exit))
+	}
+	if state.terminal != nil {
+		lines = append(lines, terminalLines(*state.terminal)...)
+	}
+	if state.terminal == nil ||
+		state.terminal.Kind == notificationport.LiveExecutionFailed {
+		lines = append(
+			lines,
+			"\U0001f194 <code>"+escape(shortIdentity(state.operation))+"</code>",
+		)
+	}
+	return compactLines(lines...)
+}
+
+func liveTriggerLine(event notificationport.LiveExecutionEvent) string {
+	if event.Trigger == "" && event.TriggerURL == "" {
+		return ""
+	}
+	lower := strings.ToLower(event.Trigger)
+	if strings.Contains(lower, "bootstrap") {
+		return ""
+	}
+	if strings.Contains(lower, "idle") {
+		return "\u23f1\ufe0f Timer"
+	}
+	if event.TriggerURL != "" {
+		return "\U0001f517 <a href=\"" + escape(event.TriggerURL) + `">` +
+			"Trigger transaction</a>"
+	}
+	return "\u2699\ufe0f " + escape(compactDetail(event.Trigger))
+}
+
+func completedStageLines(event notificationport.LiveExecutionEvent) []string {
+	heading := "\u2705 <b>" + escape(stageHeading(event)) + "</b> · " +
+		escape(chainPath(event))
+	result := []string{heading}
+	switch event.Stage {
+	case "bridge_base":
+		result[0] += " · " + compactDuration(event.Duration)
+	case "bridge_quote_return":
+		result[0] += " · " + compactDuration(event.Duration)
+		if output := compactLiveAmount(event.Output); output != "" {
+			result = append(
+				result,
+				"   \U0001f4b1 <b>"+escape(output)+"</b> received",
+			)
+		}
+	default:
+		result = append(
+			result,
+			"   \U0001f4b1 "+escape(compactLiveAmount(event.Input))+
+				" \u2192 <b>"+escape(compactLiveAmount(event.Output))+"</b> · "+
+				compactDuration(event.Duration),
+		)
+	}
+	if transaction := transactionLine(event); transaction != "" {
+		result = append(result, "   "+transaction)
+	}
+	return result
+}
+
+func exitDecisionLine(event notificationport.LiveExecutionEvent) string {
+	decision := "Sell at destination"
+	if event.Stage == "return_to_origin" {
+		decision = "Return to origin"
+	}
+	values := compactLines(
+		escape(compactLiveAmount(event.DestinationValue)),
+		escape(compactLiveAmount(event.ReturnValue)),
+	)
+	if len(values) == 0 {
+		return "\U0001f500 <b>" + escape(decision) + "</b>"
+	}
+	return "\U0001f500 <b>" + escape(decision) + "</b> · " +
+		strings.Join(values, " vs ")
+}
+
+func terminalLines(event notificationport.LiveExecutionEvent) []string {
+	if event.Kind == notificationport.LiveExecutionFailed {
+		return compactLines(
+			"\U0001f4cd "+escape(stageHeading(event))+" · "+
+				escape(chainPath(event)),
+			"\u26a0\ufe0f "+escape(compactDetail(event.Detail)),
+			"\u26a1 "+compactDuration(event.Duration),
+		)
+	}
+	result := []string{"\U0001f4ca <b>RESULT</b>"}
+	if output := compactLiveAmount(event.Output); output != "" {
+		result = append(
+			result,
+			"   \U0001f4b0 Return   <b>"+escape(output)+"</b>",
+		)
+	}
+	if cost := compactLiveMoney(event.ExecutionCost); cost != "" {
+		result = append(result, "   \U0001f4b8 Costs    "+escape(cost))
+	}
+	if pnl := compactLiveMoney(event.NetPnL); pnl != "" {
+		icon := "\U0001f4c8"
+		if strings.HasPrefix(strings.TrimSpace(pnl), "-") {
+			icon = "\U0001f4c9"
+		}
+		result = append(result, "   "+icon+" Net PnL  <b>"+escape(pnl)+"</b>")
+	}
+	result = append(result, "\u23f1\ufe0f Total · "+compactDuration(event.Duration))
+	return compactLines(result...)
+}
+
+func compactLines(lines ...string) []string {
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
+func stageHeading(event notificationport.LiveExecutionEvent) string {
+	label := friendlyStageLabel(event)
+	if event.Ordinal > 0 && event.TotalStages > 0 {
+		return fmt.Sprintf("%d/%d \u00b7 %s", event.Ordinal, event.TotalStages, label)
+	}
+	return label
+}
+
+func friendlyStageLabel(event notificationport.LiveExecutionEvent) string {
+	switch event.Stage {
+	case "bridge_base":
+		if asset := amountAsset(event.Input); asset != "" {
+			return "BRIDGE " + asset
+		}
+		return "BRIDGE"
+	case "bridge_quote_return":
+		if asset := amountAsset(event.Output); asset != "" {
+			return "RETURN " + asset
+		}
+		return "RETURN"
+	default:
+		return strings.ToUpper(strings.ReplaceAll(event.Stage, "_", " "))
+	}
+}
+
+func chainPath(event notificationport.LiveExecutionEvent) string {
+	if event.DestinationChain == "" {
+		return event.SourceChain
+	}
+	return event.SourceChain + " \u2192 " + event.DestinationChain
+}
+
+func transactionLine(event notificationport.LiveExecutionEvent) string {
+	sourceLabel := "Transaction"
+	destinationLabel := "Receipt"
+	switch event.Stage {
+	case "buy", "sell":
+		sourceLabel = "Swap on " + event.SourceChain
+	case "bridge_base", "bridge_quote_return":
+		sourceLabel = "Departure from " + event.SourceChain
+		destinationLabel = "Receipt on " + event.DestinationChain
+	}
+	source := transactionLink(event.SourceTransaction, event.SourceURL, sourceLabel)
+	destination := transactionLink(
+		event.DestinationTx, event.DestinationURL, destinationLabel,
+	)
+	switch {
+	case source != "" && destination != "":
+		return "\U0001f517 " + source + " \u2192 " + destination
+	case source != "":
+		return "\U0001f517 " + source
+	default:
+		return ""
+	}
+}
+
+func transactionLink(identity, target, label string) string {
+	if strings.TrimSpace(identity) == "" {
+		return ""
+	}
+	if strings.TrimSpace(target) == "" {
+		return "<code>" + escape(shortIdentity(identity)) + "</code>"
+	}
+	return `<a href="` + escape(target) + `">` + escape(label) + `</a>`
+}
+
+func shortIdentity(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 16 {
+		return value
+	}
+	return value[:8] + "\u2026" + value[len(value)-6:]
+}
+
+func compactDetail(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	const maximum = 180
+	if len(value) > maximum {
+		return value[:maximum] + "\u2026"
+	}
+	return value
+}
+
+type telegramResponse struct {
+	OK     bool `json:"ok"`
+	Result struct {
+		MessageID int64 `json:"message_id"`
+	} `json:"result"`
+}
+
 func (s *Sender) send(ctx context.Context, text string) error {
+	_, err := s.sendWithID(ctx, text)
+	return err
+}
+
+func (s *Sender) sendWithID(
+	ctx context.Context,
+	text string,
+) (int64, error) {
 	payload := struct {
 		ChatID                string `json:"chat_id"`
 		Text                  string `json:"text"`
@@ -105,35 +470,81 @@ func (s *Sender) send(ctx context.Context, text string) error {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(body))
+	result, err := s.post(ctx, s.sendEndpoint, "sendMessage", body)
+	if err != nil {
+		return 0, err
+	}
+	if result.Result.MessageID <= 0 {
+		return 0, fmt.Errorf("telegram sendMessage response omitted message_id")
+	}
+	return result.Result.MessageID, nil
+}
+
+func (s *Sender) edit(ctx context.Context, messageID int64, text string) error {
+	payload := struct {
+		ChatID                string `json:"chat_id"`
+		MessageID             int64  `json:"message_id"`
+		Text                  string `json:"text"`
+		ParseMode             string `json:"parse_mode"`
+		DisableWebPagePreview bool   `json:"disable_web_page_preview"`
+	}{
+		ChatID: s.chatID, MessageID: messageID, Text: text, ParseMode: "HTML",
+		DisableWebPagePreview: true,
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
+	}
+	_, err = s.post(ctx, s.editEndpoint, "editMessageText", body)
+	return err
+}
+
+func (s *Sender) post(
+	ctx context.Context,
+	endpoint string,
+	operation string,
+	body []byte,
+) (telegramResponse, error) {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		endpoint,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return telegramResponse{}, err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response, err := s.client.Do(request)
 	if err != nil {
-		return err
+		return telegramResponse{}, err
 	}
 	if response == nil || response.Body == nil {
-		return fmt.Errorf("telegram returned an empty response")
+		return telegramResponse{}, fmt.Errorf("telegram returned an empty response")
 	}
 	defer response.Body.Close()
 	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if readErr != nil {
-		return readErr
+		return telegramResponse{}, readErr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("telegram sendMessage failed with HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
+		return telegramResponse{}, fmt.Errorf(
+			"telegram %s failed with HTTP %d: %s",
+			operation,
+			response.StatusCode,
+			strings.TrimSpace(string(responseBody)),
+		)
 	}
-	var result struct {
-		OK bool `json:"ok"`
-	}
+	var result telegramResponse
 	if err := json.Unmarshal(responseBody, &result); err != nil || !result.OK {
-		return fmt.Errorf("telegram sendMessage returned an unsuccessful response")
+		return telegramResponse{}, fmt.Errorf(
+			"telegram %s returned an unsuccessful response",
+			operation,
+		)
 	}
-	return nil
+	return result, nil
 }
 
 func triggerLine(trigger string) string {
@@ -151,19 +562,42 @@ func triggerLine(trigger string) string {
 }
 
 func compactAmount(value string) string {
+	return compactAmountPrecision(value, 6)
+}
+
+func compactLiveAmount(value string) string {
+	return compactAmountPrecision(value, 3)
+}
+
+func compactLiveMoney(value string) string {
+	return compactAmountPrecision(value, 4)
+}
+
+func compactAmountPrecision(value string, decimals int) string {
 	fields := strings.Fields(strings.TrimSpace(value))
 	if len(fields) == 0 {
 		return ""
 	}
 	number := fields[0]
 	if parsed, ok := new(big.Rat).SetString(number); ok {
-		number = strings.TrimRight(strings.TrimRight(parsed.FloatString(6), "0"), ".")
+		number = strings.TrimRight(
+			strings.TrimRight(parsed.FloatString(decimals), "0"),
+			".",
+		)
 	}
 	number = groupThousands(number)
 	if len(fields) == 1 {
 		return number
 	}
 	return number + " " + strings.Join(fields[1:], " ")
+}
+
+func amountAsset(value string) string {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) < 2 {
+		return ""
+	}
+	return strings.Join(fields[1:], " ")
 }
 
 func signedAmount(value string) string {
@@ -193,6 +627,8 @@ func groupThousands(value string) string {
 
 func compactDuration(duration time.Duration) string {
 	switch {
+	case duration >= time.Second:
+		return fmt.Sprintf("%.3f s", duration.Seconds())
 	case duration >= time.Millisecond:
 		return fmt.Sprintf("%.0f ms", float64(duration)/float64(time.Millisecond))
 	case duration >= time.Microsecond:
@@ -206,3 +642,4 @@ func escape(value string) string { return html.EscapeString(value) }
 
 var _ notificationport.OpeningSender = (*Sender)(nil)
 var _ notificationport.ConfigurationWarningSender = (*Sender)(nil)
+var _ notificationport.LiveExecutionSender = (*Sender)(nil)
