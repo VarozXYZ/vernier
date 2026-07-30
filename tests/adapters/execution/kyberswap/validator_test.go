@@ -176,7 +176,7 @@ func newValidatorWithSimulatorForTest(
 	t.Helper()
 	validator, err := kyberswapadapter.New(kyberswapadapter.Config{
 		ID:        "kyberswap/live",
-		ChainSlug: "chain-b",
+		ChainSlug: "polygon",
 		Sender:    common.HexToAddress(validatorSender),
 		TokenAddresses: map[market.TokenID]string{
 			"base":  validatorTokenIn,
@@ -221,7 +221,7 @@ func validationRequest(t *testing.T) executionport.ValidationRequest {
 		Operation: "operation",
 		Leg: domainexecution.Leg{
 			ID: "sell", Side: domainexecution.LegSell,
-			Chain: "chain-b", Account: "account", Market: "market",
+			Chain: "polygon", Account: "account", Market: "market",
 			Input: input, ExpectedOutput: output,
 		},
 		Discovery: discovery,

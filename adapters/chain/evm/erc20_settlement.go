@@ -65,11 +65,15 @@ func (d *ERC20TransferReceiptDecoder) DecodeReceipt(
 	if receipt == nil {
 		return execution.Settlement{}, fmt.Errorf("EVM settlement receipt is required")
 	}
+	costs, err := d.receiptCosts(step.Leg.Chain, receipt)
+	if err != nil {
+		return execution.Settlement{}, err
+	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
 		return execution.Settlement{
 			Identity: step.Identity, Technical: execution.StateConfirmedRevert,
-			Economic: execution.EconomicReserved, ObservedAt: d.clock().UTC(),
-			Evidence: "evm_receipt",
+			Economic: execution.EconomicReserved, Costs: costs,
+			ObservedAt: d.clock().UTC(), Evidence: "evm_receipt_revert",
 		}, nil
 	}
 	inputAddress, inputOK := d.tokens[step.Leg.Input.Token()]
@@ -120,6 +124,19 @@ func (d *ERC20TransferReceiptDecoder) DecodeReceipt(
 	if err != nil {
 		return execution.Settlement{}, err
 	}
+	return execution.Settlement{
+		Identity: step.Identity, Technical: execution.StateConfirmedSuccess,
+		Economic: execution.EconomicEffectVerified,
+		ActualIn: actualInput, ActualOut: actualOutput,
+		Costs:      costs,
+		ObservedAt: d.clock().UTC(), Evidence: "evm_erc20_transfer_receipt",
+	}, nil
+}
+
+func (d *ERC20TransferReceiptDecoder) receiptCosts(
+	chain market.ChainID,
+	receipt *types.Receipt,
+) ([]execution.CostComponent, error) {
 	costs := make([]execution.CostComponent, 0, 1)
 	if receipt.GasUsed > 0 && receipt.EffectiveGasPrice != nil &&
 		receipt.EffectiveGasPrice.Sign() > 0 {
@@ -135,20 +152,14 @@ func (d *ERC20TransferReceiptDecoder) DecodeReceipt(
 			),
 		)
 		if amountErr != nil {
-			return execution.Settlement{}, amountErr
+			return nil, amountErr
 		}
 		costs = append(costs, execution.CostComponent{
-			Kind: "network_fee", Chain: step.Leg.Chain, Amount: amount,
+			Kind: "network_fee", Chain: chain, Amount: amount,
 			Evidence: "evm_receipt_gas",
 		})
 	}
-	return execution.Settlement{
-		Identity: step.Identity, Technical: execution.StateConfirmedSuccess,
-		Economic: execution.EconomicEffectVerified,
-		ActualIn: actualInput, ActualOut: actualOutput,
-		Costs:      costs,
-		ObservedAt: d.clock().UTC(), Evidence: "evm_erc20_transfer_receipt",
-	}, nil
+	return costs, nil
 }
 
 var _ ReceiptSettlementDecoder = (*ERC20TransferReceiptDecoder)(nil)

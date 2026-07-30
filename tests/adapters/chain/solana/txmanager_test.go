@@ -97,7 +97,7 @@ func TestSolanaTxManagerBuildsSignsAndSendsWithoutPreBroadcastRPC(t *testing.T) 
 		Chain: "solana", Account: "wallet", PrivateKey: privateKey,
 		SenderEndpoint: server.URL + "/fast", PingEndpoint: server.URL + "/ping",
 		Client: server.Client(), Reconciliation: reconciliation, Clock: time.Now,
-		WarmInterval: time.Hour,
+		WarmInterval: time.Hour, MaxPriorityFeeLamports: 500_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -133,8 +133,16 @@ func TestSolanaTxManagerBuildsSignsAndSendsWithoutPreBroadcastRPC(t *testing.T) 
 		"accounts":  []any{},
 		"data":      base64.StdEncoding.EncodeToString(providerLimit),
 	}
+	providerPrice := make([]byte, 9)
+	providerPrice[0] = 3
+	binary.LittleEndian.PutUint64(providerPrice[1:], 2_000_000)
+	providerComputePrice := map[string]any{
+		"programId": "ComputeBudget111111111111111111111111111111",
+		"accounts":  []any{},
+		"data":      base64.StdEncoding.EncodeToString(providerPrice),
+	}
 	payload, _ := json.Marshal(map[string]any{
-		"computeBudgetInstructions": []any{providerComputeLimit}, "setupInstructions": []any{},
+		"computeBudgetInstructions": []any{providerComputeLimit, providerComputePrice}, "setupInstructions": []any{},
 		"swapInstruction": instruction, "cleanupInstruction": nil, "otherInstructions": []any{},
 		"tipInstruction": instruction, "addressesByLookupTableAddress": map[string]any{},
 		"blockhashWithMetadata": map[string]any{"blockhash": blockhash, "lastValidBlockHeight": 500},
@@ -161,6 +169,7 @@ func TestSolanaTxManagerBuildsSignsAndSendsWithoutPreBroadcastRPC(t *testing.T) 
 		t.Fatal(err)
 	}
 	computeLimits := 0
+	computePrices := 0
 	senderTips := 0
 	for _, compiled := range transaction.Message.Instructions {
 		program, programErr := transaction.Message.ResolveProgramIDIndex(compiled.ProgramIDIndex)
@@ -172,6 +181,13 @@ func TestSolanaTxManagerBuildsSignsAndSendsWithoutPreBroadcastRPC(t *testing.T) 
 			computeLimits++
 			if binary.LittleEndian.Uint32(compiled.Data[1:]) != 900_000 {
 				t.Fatalf("compute unit limit = %d", binary.LittleEndian.Uint32(compiled.Data[1:]))
+			}
+		}
+		if program.String() == "ComputeBudget111111111111111111111111111111" &&
+			len(compiled.Data) == 9 && compiled.Data[0] == 3 {
+			computePrices++
+			if price := binary.LittleEndian.Uint64(compiled.Data[1:]); price != 555_555 {
+				t.Fatalf("compute unit price = %d", price)
 			}
 		}
 		if program.Equals(solanago.SystemProgramID) &&
@@ -194,6 +210,9 @@ func TestSolanaTxManagerBuildsSignsAndSendsWithoutPreBroadcastRPC(t *testing.T) 
 	}
 	if computeLimits != 1 {
 		t.Fatalf("compiled transaction contains %d compute-unit-limit instructions", computeLimits)
+	}
+	if computePrices != 1 {
+		t.Fatalf("compiled transaction contains %d compute-unit-price instructions", computePrices)
 	}
 	if senderTips != 1 {
 		t.Fatalf("compiled transaction contains %d Helius Sender tips", senderTips)

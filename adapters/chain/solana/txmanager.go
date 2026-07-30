@@ -41,42 +41,57 @@ type MessageFeeEstimator interface {
 	FeeForMessage(context.Context, string) (uint64, error)
 }
 
+type ArtifactNetworkCostEstimate struct {
+	NetworkFeeLamports          uint64
+	BaseFeeLamports             uint64
+	PriorityFeeLamports         uint64
+	SenderTipLamports           uint64
+	ComputeUnitLimit            uint32
+	ProviderPriceMicroLamports  uint64
+	EffectivePriceMicroLamports uint64
+	PriorityFeeCapped           bool
+	TotalLamports               *big.Int
+	CapturedAt                  time.Time
+}
+
 type TxManagerConfig struct {
-	Chain             market.ChainID
-	Account           execution.AccountID
-	PrivateKey        solanago.PrivateKey
-	SenderEndpoint    string
-	PingEndpoint      string
-	SenderTipAccount  solanago.PublicKey
-	SenderTipLamports uint64
-	ComputeUnitLimit  uint32
-	Client            *http.Client
-	Reconciliation    ReconciliationRPC
-	Simulator         SignedTransactionSimulator
-	FeeEstimator      MessageFeeEstimator
-	Clock             func() time.Time
-	WarmInterval      time.Duration
-	SettlementDecoder TransactionSettlementDecoder
+	Chain                  market.ChainID
+	Account                execution.AccountID
+	PrivateKey             solanago.PrivateKey
+	SenderEndpoint         string
+	PingEndpoint           string
+	SenderTipAccount       solanago.PublicKey
+	SenderTipLamports      uint64
+	ComputeUnitLimit       uint32
+	MaxPriorityFeeLamports uint64
+	Client                 *http.Client
+	Reconciliation         ReconciliationRPC
+	Simulator              SignedTransactionSimulator
+	FeeEstimator           MessageFeeEstimator
+	Clock                  func() time.Time
+	WarmInterval           time.Duration
+	SettlementDecoder      TransactionSettlementDecoder
 }
 
 type TxManager struct {
-	chain             market.ChainID
-	account           execution.AccountID
-	privateKey        solanago.PrivateKey
-	senderEndpoint    string
-	pingEndpoint      string
-	senderTipAccount  solanago.PublicKey
-	senderTipLamports uint64
-	computeLimit      uint32
-	client            *http.Client
-	reconciliation    ReconciliationRPC
-	simulator         SignedTransactionSimulator
-	feeEstimator      MessageFeeEstimator
-	clock             func() time.Time
-	warmInterval      time.Duration
-	settlementDecoder TransactionSettlementDecoder
-	requestID         atomic.Uint64
-	warmOnce          sync.Once
+	chain                  market.ChainID
+	account                execution.AccountID
+	privateKey             solanago.PrivateKey
+	senderEndpoint         string
+	pingEndpoint           string
+	senderTipAccount       solanago.PublicKey
+	senderTipLamports      uint64
+	computeLimit           uint32
+	maxPriorityFeeLamports uint64
+	client                 *http.Client
+	reconciliation         ReconciliationRPC
+	simulator              SignedTransactionSimulator
+	feeEstimator           MessageFeeEstimator
+	clock                  func() time.Time
+	warmInterval           time.Duration
+	settlementDecoder      TransactionSettlementDecoder
+	requestID              atomic.Uint64
+	warmOnce               sync.Once
 }
 
 func NewTxManager(config TxManagerConfig) (*TxManager, error) {
@@ -123,7 +138,8 @@ func NewTxManager(config TxManagerConfig) (*TxManager, error) {
 		chain: config.Chain, account: config.Account, privateKey: append(solanago.PrivateKey(nil), config.PrivateKey...),
 		senderEndpoint: endpoint.String(), pingEndpoint: ping.String(), computeLimit: config.ComputeUnitLimit,
 		senderTipAccount: config.SenderTipAccount, senderTipLamports: config.SenderTipLamports,
-		client: config.Client, reconciliation: config.Reconciliation, clock: config.Clock,
+		maxPriorityFeeLamports: config.MaxPriorityFeeLamports,
+		client:                 config.Client, reconciliation: config.Reconciliation, clock: config.Clock,
 		simulator: config.Simulator, feeEstimator: config.FeeEstimator, warmInterval: config.WarmInterval,
 		settlementDecoder: config.SettlementDecoder,
 	}, nil
@@ -182,6 +198,7 @@ func (m *TxManager) Prepare(_ context.Context, artifact executionport.Artifact) 
 		m.computeLimit,
 		m.senderTipAccount,
 		m.senderTipLamports,
+		m.maxPriorityFeeLamports,
 	)
 	if err != nil {
 		return chainport.PreparedTransaction{}, err
@@ -229,24 +246,55 @@ func (m *TxManager) EstimateArtifactNetworkCost(
 	ctx context.Context,
 	artifact executionport.Artifact,
 ) (*big.Int, time.Time, error) {
+	estimate, err := m.EstimateArtifactNetworkCostDetails(ctx, artifact)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	return new(big.Int).Set(estimate.TotalLamports), estimate.CapturedAt, nil
+}
+
+func (m *TxManager) EstimateArtifactNetworkCostDetails(
+	ctx context.Context,
+	artifact executionport.Artifact,
+) (ArtifactNetworkCostEstimate, error) {
 	if m.feeEstimator == nil {
-		return nil, time.Time{}, fmt.Errorf("solana message fee estimator is unavailable")
+		return ArtifactNetworkCostEstimate{}, fmt.Errorf("solana message fee estimator is unavailable")
 	}
 	prepared, err := m.Prepare(ctx, artifact)
 	if err != nil {
-		return nil, time.Time{}, err
+		return ArtifactNetworkCostEstimate{}, err
 	}
 	transaction, err := solanago.TransactionFromBytes(prepared.SignedPayload)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("decode Solana transaction for fee estimate: %w", err)
+		return ArtifactNetworkCostEstimate{}, fmt.Errorf("decode Solana transaction for fee estimate: %w", err)
 	}
 	fee, err := m.feeEstimator.FeeForMessage(ctx, transaction.Message.ToBase64())
 	if err != nil {
-		return nil, time.Time{}, err
+		return ArtifactNetworkCostEstimate{}, err
 	}
+	computeLimit, effectivePrice := compiledComputeBudget(transaction)
+	priorityFee := priorityFeeLamports(computeLimit, effectivePrice)
+	baseFee := uint64(0)
+	if fee >= priorityFee {
+		baseFee = fee - priorityFee
+	}
+	providerPrice := providerComputeUnitPrice(artifact.Payload)
 	total := new(big.Int).SetUint64(fee)
 	total.Add(total, new(big.Int).SetUint64(m.senderTipLamports))
-	return total, m.clock().UTC(), nil
+	return ArtifactNetworkCostEstimate{
+		NetworkFeeLamports:          fee,
+		BaseFeeLamports:             baseFee,
+		PriorityFeeLamports:         priorityFee,
+		SenderTipLamports:           m.senderTipLamports,
+		ComputeUnitLimit:            computeLimit,
+		ProviderPriceMicroLamports:  providerPrice,
+		EffectivePriceMicroLamports: effectivePrice,
+		PriorityFeeCapped: providerPrice > 0 &&
+			effectivePrice > 0 &&
+			effectivePrice < providerPrice,
+		TotalLamports: total,
+		CapturedAt:    m.clock().UTC(),
+	}, nil
 }
 
 func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTransaction) (chainport.BroadcastResult, error) {
@@ -474,6 +522,7 @@ func AssembleJupiterBuild(payload []byte, privateKey solanago.PrivateKey, comput
 		computeLimit,
 		solanago.PublicKey{},
 		0,
+		0,
 		false,
 	)
 }
@@ -487,6 +536,7 @@ func AssembleJupiterBuildForSender(
 	computeLimit uint32,
 	tipAccount solanago.PublicKey,
 	tipLamports uint64,
+	maxPriorityFeeLamports ...uint64,
 ) ([]byte, string, string, error) {
 	if !IsHeliusSenderTipAccount(tipAccount) {
 		return nil, "", "", fmt.Errorf("invalid Helius Sender tip account")
@@ -494,12 +544,17 @@ func AssembleJupiterBuildForSender(
 	if tipLamports == 0 {
 		return nil, "", "", fmt.Errorf("helius Sender tip must be positive")
 	}
+	priorityCap := uint64(0)
+	if len(maxPriorityFeeLamports) > 0 {
+		priorityCap = maxPriorityFeeLamports[0]
+	}
 	return assembleJupiterBuildWithTip(
 		payload,
 		privateKey,
 		computeLimit,
 		tipAccount,
 		tipLamports,
+		priorityCap,
 		false,
 	)
 }
@@ -514,6 +569,7 @@ func AssembleJupiterBuildForSimulation(
 	computeLimit uint32,
 	tipAccount solanago.PublicKey,
 	tipLamports uint64,
+	maxPriorityFeeLamports ...uint64,
 ) ([]byte, string, error) {
 	if !IsHeliusSenderTipAccount(tipAccount) {
 		return nil, "", fmt.Errorf("invalid Helius Sender tip account")
@@ -521,12 +577,17 @@ func AssembleJupiterBuildForSimulation(
 	if tipLamports == 0 {
 		return nil, "", fmt.Errorf("helius Sender tip must be positive")
 	}
+	priorityCap := uint64(0)
+	if len(maxPriorityFeeLamports) > 0 {
+		priorityCap = maxPriorityFeeLamports[0]
+	}
 	raw, _, blockhash, err := assembleJupiterBuildWithTip(
 		payload,
 		payer,
 		computeLimit,
 		tipAccount,
 		tipLamports,
+		priorityCap,
 		true,
 	)
 	return raw, blockhash, err
@@ -538,6 +599,7 @@ func assembleJupiterBuildWithTip(
 	computeLimit uint32,
 	senderTipAccount solanago.PublicKey,
 	senderTipLamports uint64,
+	maxPriorityFeeLamports uint64,
 	partial bool,
 ) ([]byte, string, string, error) {
 	var build buildTransactionResponse
@@ -557,18 +619,44 @@ func assembleJupiterBuildWithTip(
 		instructions = append(instructions, instruction)
 		return nil
 	}
-	hasComputeLimit := false
+	selectedComputeLimit := computeLimit
 	for _, instruction := range build.ComputeBudgetInstructions {
 		if providerLimit, ok := computeUnitLimit(instruction); ok {
+			selectedComputeLimit = providerLimit
+			if computeLimit > 0 && selectedComputeLimit > computeLimit {
+				selectedComputeLimit = computeLimit
+			}
+			break
+		}
+	}
+	if selectedComputeLimit == 0 {
+		return nil, "", "", fmt.Errorf("jupiter build has no usable compute-unit limit")
+	}
+	hasComputeLimit := false
+	hasComputePrice := false
+	for _, instruction := range build.ComputeBudgetInstructions {
+		if _, ok := computeUnitLimit(instruction); ok {
 			if hasComputeLimit {
 				continue
 			}
-			selectedLimit := providerLimit
-			if computeLimit > 0 && selectedLimit > computeLimit {
-				selectedLimit = computeLimit
-			}
-			instructions = append(instructions, setComputeUnitLimit(selectedLimit))
+			instructions = append(instructions, setComputeUnitLimit(selectedComputeLimit))
 			hasComputeLimit = true
+			continue
+		}
+		if providerPrice, ok := computeUnitPrice(instruction); ok {
+			if hasComputePrice {
+				continue
+			}
+			selectedPrice, err := capComputeUnitPrice(
+				providerPrice,
+				selectedComputeLimit,
+				maxPriorityFeeLamports,
+			)
+			if err != nil {
+				return nil, "", "", err
+			}
+			instructions = append(instructions, setComputeUnitPrice(selectedPrice))
+			hasComputePrice = true
 			continue
 		}
 		if err := appendWire(instruction); err != nil {
@@ -577,7 +665,7 @@ func assembleJupiterBuildWithTip(
 	}
 	if !hasComputeLimit {
 		instructions = append(
-			[]solanago.Instruction{setComputeUnitLimit(computeLimit)},
+			[]solanago.Instruction{setComputeUnitLimit(selectedComputeLimit)},
 			instructions...,
 		)
 	}
@@ -714,6 +802,107 @@ func setComputeUnitLimit(limit uint32) solanago.Instruction {
 		nil,
 		data,
 	)
+}
+
+func computeUnitPrice(candidate wireInstruction) (uint64, bool) {
+	if candidate.ProgramID != "ComputeBudget111111111111111111111111111111" {
+		return 0, false
+	}
+	data, err := base64.StdEncoding.DecodeString(candidate.Data)
+	if err != nil || len(data) != 9 || data[0] != 3 {
+		return 0, false
+	}
+	price := binary.LittleEndian.Uint64(data[1:])
+	return price, price > 0
+}
+
+func setComputeUnitPrice(microLamports uint64) solanago.Instruction {
+	data := make([]byte, 9)
+	data[0] = 3
+	binary.LittleEndian.PutUint64(data[1:], microLamports)
+	return solanago.NewInstruction(
+		solanago.MustPublicKeyFromBase58("ComputeBudget111111111111111111111111111111"),
+		nil,
+		data,
+	)
+}
+
+func capComputeUnitPrice(
+	providerMicroLamports uint64,
+	computeUnits uint32,
+	maxPriorityFeeLamports uint64,
+) (uint64, error) {
+	if maxPriorityFeeLamports == 0 {
+		return providerMicroLamports, nil
+	}
+	numerator := new(big.Int).SetUint64(maxPriorityFeeLamports)
+	numerator.Mul(numerator, big.NewInt(1_000_000))
+	maxPrice := numerator.Div(
+		numerator,
+		new(big.Int).SetUint64(uint64(computeUnits)),
+	)
+	if maxPrice.Sign() <= 0 {
+		return 0, fmt.Errorf(
+			"max priority fee %d lamports is too low for %d compute units",
+			maxPriorityFeeLamports,
+			computeUnits,
+		)
+	}
+	if !maxPrice.IsUint64() || providerMicroLamports <= maxPrice.Uint64() {
+		return providerMicroLamports, nil
+	}
+	return maxPrice.Uint64(), nil
+}
+
+func providerComputeUnitPrice(payload []byte) uint64 {
+	var build buildTransactionResponse
+	if json.Unmarshal(payload, &build) != nil {
+		return 0
+	}
+	for _, instruction := range build.ComputeBudgetInstructions {
+		if price, ok := computeUnitPrice(instruction); ok {
+			return price
+		}
+	}
+	return 0
+}
+
+func compiledComputeBudget(transaction *solanago.Transaction) (uint32, uint64) {
+	if transaction == nil {
+		return 0, 0
+	}
+	var limit uint32
+	var price uint64
+	for _, instruction := range transaction.Message.Instructions {
+		program, err := transaction.Message.ResolveProgramIDIndex(
+			instruction.ProgramIDIndex,
+		)
+		if err != nil ||
+			program.String() != "ComputeBudget111111111111111111111111111111" {
+			continue
+		}
+		switch {
+		case len(instruction.Data) == 5 && instruction.Data[0] == 2:
+			limit = binary.LittleEndian.Uint32(instruction.Data[1:])
+		case len(instruction.Data) == 9 && instruction.Data[0] == 3:
+			price = binary.LittleEndian.Uint64(instruction.Data[1:])
+		}
+	}
+	return limit, price
+}
+
+func priorityFeeLamports(computeUnits uint32, microLamports uint64) uint64 {
+	if computeUnits == 0 || microLamports == 0 {
+		return 0
+	}
+	product := new(big.Int).SetUint64(uint64(computeUnits))
+	product.Mul(product, new(big.Int).SetUint64(microLamports))
+	product.Add(product, big.NewInt(999_999))
+	product.Div(product, big.NewInt(1_000_000))
+	if !product.IsUint64() {
+		return ^uint64(0)
+	}
+	return product.Uint64()
 }
 
 func decodeWireInstruction(candidate wireInstruction) (solanago.Instruction, error) {

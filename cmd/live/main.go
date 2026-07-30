@@ -13,8 +13,12 @@ import (
 	"strings"
 	"syscall"
 
+	sqlitestore "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
+	"github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/internal/buildinfo"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
+	"github.com/VarozXYZ/vernier/runtime/livecanary"
+	"github.com/VarozXYZ/vernier/runtime/observability"
 )
 
 type armedRuntime interface {
@@ -25,8 +29,9 @@ type armedRuntime interface {
 type runMode string
 
 const (
-	modeDryRun runMode = "dry-run"
-	modeArmed  runMode = "armed"
+	modeDryRun      runMode = "dry-run"
+	modeArmed       runMode = "armed"
+	modeCostObserve runMode = "cost-observe"
 )
 
 type privateFactory func(context.Context, configuration.ParsedLiveConfig, configuration.LookupEnv, runMode) (armedRuntime, error)
@@ -55,6 +60,31 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	envPath := flags.String("env-file", ".env.test", "local environment file")
 	arm := flags.Bool("arm", false, "enable signer and broadcast capabilities")
 	dryRun := flags.Bool("dry-run", false, "validate executable artifacts without signer, persistence, or broadcast")
+	costObserve := flags.Bool(
+		"cost-observe",
+		false,
+		"run Research and warm complete-flow costs without alerts or broadcast",
+	)
+	confirmCanary := flags.String(
+		"confirm-canary-input",
+		"",
+		"must exactly match the configured sequential canary input when armed",
+	)
+	confirmLive := flags.String(
+		"confirm-live-input",
+		"",
+		"must exactly match the configured sequential Live input when armed",
+	)
+	forceCanaryDirection := flags.String(
+		"force-canary-direction",
+		"",
+		"execute one forced canary cycle: solana-to-evm or evm-to-solana",
+	)
+	acknowledgeReconciled := flags.String(
+		"acknowledge-reconciled-operation",
+		"",
+		"close one manually reconciled operation barrier by exact operation ID",
+	)
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -62,8 +92,46 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "live: positional arguments are not supported")
 		return 2
 	}
-	if *arm && *dryRun {
-		fmt.Fprintln(stderr, "live: -arm and -dry-run are mutually exclusive")
+	if boolCount(*arm, *dryRun, *costObserve) > 1 {
+		fmt.Fprintln(stderr, "live: -arm, -dry-run, and -cost-observe are mutually exclusive")
+		return 2
+	}
+	if strings.TrimSpace(*acknowledgeReconciled) != "" &&
+		(*arm || *dryRun || *costObserve ||
+			strings.TrimSpace(*confirmCanary) != "" ||
+			strings.TrimSpace(*confirmLive) != "" ||
+			strings.TrimSpace(*forceCanaryDirection) != "") {
+		fmt.Fprintln(
+			stderr,
+			"live: -acknowledge-reconciled-operation cannot be combined with execution flags",
+		)
+		return 2
+	}
+	if !*arm && strings.TrimSpace(*confirmCanary) != "" {
+		fmt.Fprintln(stderr, "live: -confirm-canary-input requires -arm")
+		return 2
+	}
+	if !*arm && strings.TrimSpace(*confirmLive) != "" {
+		fmt.Fprintln(stderr, "live: -confirm-live-input requires -arm")
+		return 2
+	}
+	if strings.TrimSpace(*confirmCanary) != "" &&
+		strings.TrimSpace(*confirmLive) != "" {
+		fmt.Fprintln(
+			stderr,
+			"live: -confirm-canary-input and -confirm-live-input are mutually exclusive",
+		)
+		return 2
+	}
+	forcedDirection, err := livecanary.ParseForcedCanaryDirection(
+		*forceCanaryDirection,
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "live: %v\n", err)
+		return 2
+	}
+	if forcedDirection != "" && !*arm {
+		fmt.Fprintln(stderr, "live: -force-canary-direction requires -arm")
 		return 2
 	}
 	if err := configuration.LoadEnvFile(*envPath, os.LookupEnv, os.Setenv); err != nil {
@@ -75,9 +143,70 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "live: %v\n", err)
 		return 2
 	}
+	if operationID := strings.TrimSpace(*acknowledgeReconciled); operationID != "" {
+		store, openErr := sqlitestore.OpenSequentialLive(config.OperationalStorePath)
+		if openErr != nil {
+			fmt.Fprintf(stderr, "live: open operational journal: %v\n", openErr)
+			return 1
+		}
+		defer store.Close()
+		if acknowledgeErr := store.AcknowledgeManualReconciliation(
+			ctx,
+			execution.OperationID(operationID),
+		); acknowledgeErr != nil {
+			fmt.Fprintf(stderr, "live: %v\n", acknowledgeErr)
+			return 1
+		}
+		fmt.Fprintf(
+			stdout,
+			"live_reconciliation operation=%s state=%s journal=%s\n",
+			operationID,
+			execution.SequentialReconciledManually,
+			config.OperationalStorePath,
+		)
+		return 0
+	}
+	if *arm && config.ExecutionMode == "sequential_bridge_canary" {
+		expected := ""
+		if config.CanaryInput != nil {
+			expected = config.CanaryInput.RatString()
+		}
+		if strings.TrimSpace(*confirmCanary) != expected || expected == "" {
+			fmt.Fprintf(
+				stderr,
+				"live: -arm requires -confirm-canary-input %s\n",
+				expected,
+			)
+			return 2
+		}
+	}
+	if *arm && config.ExecutionMode == "sequential_bridge_live" {
+		expected := ""
+		if config.ExecutionInput != nil {
+			expected = config.ExecutionInput.RatString()
+		}
+		if strings.TrimSpace(*confirmLive) != expected || expected == "" {
+			fmt.Fprintf(
+				stderr,
+				"live: -arm requires -confirm-live-input %s\n",
+				expected,
+			)
+			return 2
+		}
+	}
+	if forcedDirection != "" &&
+		config.ExecutionMode != "sequential_bridge_canary" {
+		fmt.Fprintln(
+			stderr,
+			"live: -force-canary-direction is only available for sequential_bridge_canary",
+		)
+		return 2
+	}
 	mode := runMode("")
 	if *arm {
 		mode = modeArmed
+	} else if *costObserve {
+		mode = modeCostObserve
 	} else if *dryRun {
 		mode = modeDryRun
 	}
@@ -89,11 +218,43 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "Live configuration and environment are valid; broadcast remains disarmed.")
 		return 0
 	}
-	if composePrivate == nil {
-		fmt.Fprintln(stderr, "live: private setup composition is not installed")
-		return 2
+	var runtime armedRuntime
+	if config.ExecutionMode == "sequential_bridge_canary" ||
+		config.ExecutionMode == "sequential_bridge_live" {
+		if mode == modeDryRun {
+			fmt.Fprintln(
+				stdout,
+				"Sequential Live configuration is valid; artifact construction requires an armed qualified opportunity and remains disabled.",
+			)
+			return 0
+		}
+		researchConfig, loadErr := configuration.LoadConfig(*configPath)
+		if loadErr != nil {
+			fmt.Fprintf(stderr, "live: %v\n", loadErr)
+			return 2
+		}
+		logger, loggerErr := observability.NewLogger(stderr, "info")
+		if loggerErr != nil {
+			fmt.Fprintf(stderr, "live: create logger: %v\n", loggerErr)
+			return 1
+		}
+		runtime, err = livecanary.ComposeArmed(ctx, livecanary.ComposeConfig{
+			ManifestPath:     *configPath,
+			Research:         researchConfig,
+			Live:             config,
+			LookupEnv:        os.LookupEnv,
+			Logger:           logger,
+			Output:           stdout,
+			ObserveCostsOnly: mode == modeCostObserve,
+			ForcedCanary:     forcedDirection,
+		})
+	} else {
+		if composePrivate == nil {
+			fmt.Fprintln(stderr, "live: private setup composition is not installed")
+			return 2
+		}
+		runtime, err = composePrivate(ctx, config, os.LookupEnv, mode)
 	}
-	runtime, err := composePrivate(ctx, config, os.LookupEnv, mode)
 	if err != nil {
 		fmt.Fprintf(stderr, "live: compose runtime: %v\n", err)
 		return 1
@@ -111,14 +272,17 @@ func validateEnvironment(config configuration.ParsedLiveConfig, lookup configura
 		return err
 	}
 	for chainID, account := range config.Accounts {
-		required := []string{account.PublicAddressEnv}
-		if mode == modeArmed {
+		required := make([]string, 0, 4)
+		if account.PublicAddressEnv != "" {
+			required = append(required, account.PublicAddressEnv)
+		}
+		if mode == modeArmed || mode == modeCostObserve {
 			required = append(required, account.SignerEnv)
 		}
-		if mode == modeArmed && account.SenderURLEnv != "" {
+		if (mode == modeArmed || mode == modeCostObserve) && account.SenderURLEnv != "" {
 			required = append(required, account.SenderURLEnv)
 		}
-		if mode == modeArmed && account.FanoutRPCURLEnv != "" {
+		if (mode == modeArmed || mode == modeCostObserve) && account.FanoutRPCURLEnv != "" {
 			required = append(required, account.FanoutRPCURLEnv)
 		}
 		if account.ContractAddressEnv != "" {
@@ -132,4 +296,14 @@ func validateEnvironment(config configuration.ParsedLiveConfig, lookup configura
 		}
 	}
 	return nil
+}
+
+func boolCount(values ...bool) int {
+	count := 0
+	for _, value := range values {
+		if value {
+			count++
+		}
+	}
+	return count
 }

@@ -45,12 +45,12 @@ func TestERC20TransferReceiptDecoderUsesNetWalletDeltas(t *testing.T) {
 	output, _ := market.NewTokenAmount("output", big.NewInt(4_000_000))
 	step := execution.OperationStep{
 		Leg: execution.Leg{
-			ID: "swap", Side: execution.LegBuy, Chain: "chain-b",
+			ID: "swap", Side: execution.LegBuy, Chain: "polygon",
 			Account: "wallet", Market: "market", Input: input,
 			ExpectedOutput: output,
 		},
 		Identity: execution.TransactionIdentity{
-			Chain: "chain-b", Account: "wallet", Hash: "0x01",
+			Chain: "polygon", Account: "wallet", Hash: "0x01",
 		},
 	}
 	receipt := &types.Receipt{
@@ -76,5 +76,52 @@ func TestERC20TransferReceiptDecoderUsesNetWalletDeltas(t *testing.T) {
 		settlement.Costs[0].Amount.Asset() != "evm_native" ||
 		settlement.Costs[0].Amount.Rat().Cmp(big.NewRat(1, 100)) != 0 {
 		t.Fatalf("unexpected receipt cost: %+v", settlement.Costs)
+	}
+}
+
+func TestERC20TransferReceiptDecoderRetainsGasCostOnConfirmedRevert(t *testing.T) {
+	owner := common.HexToAddress("0x0000000000000000000000000000000000000011")
+	inputToken := common.HexToAddress("0x0000000000000000000000000000000000000033")
+	outputToken := common.HexToAddress("0x0000000000000000000000000000000000000044")
+	decoder, err := evmadapter.NewERC20TransferReceiptDecoder(
+		owner,
+		map[market.TokenID]string{
+			"input": inputToken.Hex(), "output": outputToken.Hex(),
+		},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := market.NewTokenAmount("input", big.NewInt(1_000_000))
+	output, _ := market.NewTokenAmount("output", big.NewInt(4_000_000))
+	settlement, err := decoder.DecodeReceipt(
+		execution.OperationStep{
+			Leg: execution.Leg{
+				ID: "swap", Side: execution.LegSell, Chain: "polygon",
+				Account: "wallet", Market: "market", Input: input,
+				ExpectedOutput: output,
+			},
+			Identity: execution.TransactionIdentity{
+				Chain: "polygon", Account: "wallet", Hash: "0x02",
+			},
+		},
+		&types.Receipt{
+			Status:  types.ReceiptStatusFailed,
+			GasUsed: 250_000, EffectiveGasPrice: big.NewInt(40_000_000_000),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settlement.Technical != execution.StateConfirmedRevert ||
+		settlement.Economic != execution.EconomicReserved ||
+		!settlement.ActualIn.IsZero() ||
+		!settlement.ActualOut.IsZero() {
+		t.Fatalf("unexpected revert settlement: %+v", settlement)
+	}
+	if len(settlement.Costs) != 1 ||
+		settlement.Costs[0].Amount.Rat().Cmp(big.NewRat(1, 100)) != 0 {
+		t.Fatalf("unexpected revert costs: %+v", settlement.Costs)
 	}
 }
