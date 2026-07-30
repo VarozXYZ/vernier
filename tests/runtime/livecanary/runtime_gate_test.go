@@ -46,6 +46,77 @@ func TestRuntimeGateSerializesOperationalStates(t *testing.T) {
 	}
 }
 
+func TestRuntimeGateAllowsStartupRefuelReconciliation(t *testing.T) {
+	gate := livecanary.NewRuntimeGate()
+	if err := gate.Transition(
+		livecanary.RuntimeGateStarting,
+		livecanary.RuntimeGateRefueling,
+	); err != nil {
+		t.Fatalf("starting refuel transition: %v", err)
+	}
+	if gate.EvaluationAllowed() {
+		t.Fatal("startup refuel gate admitted an evaluation")
+	}
+	if err := gate.Transition(
+		livecanary.RuntimeGateRefueling,
+		livecanary.RuntimeGateRecovering,
+	); err != nil {
+		t.Fatalf("refuel to recovery transition: %v", err)
+	}
+	if err := gate.Transition(
+		livecanary.RuntimeGateRecovering,
+		livecanary.RuntimeGateIdle,
+	); err != nil {
+		t.Fatalf("recovery to idle transition: %v", err)
+	}
+	if !gate.EvaluationAllowed() {
+		t.Fatal("idle gate must admit evaluations after startup reconciliation")
+	}
+}
+
+func TestRuntimeGateAllowsPostExecutionRefuelWithoutOpeningIdleWindow(t *testing.T) {
+	gate := livecanary.NewRuntimeGate()
+	if err := gate.Transition(
+		livecanary.RuntimeGateStarting,
+		livecanary.RuntimeGateIdle,
+	); err != nil {
+		t.Fatalf("starting to idle transition: %v", err)
+	}
+	if err := gate.Transition(
+		livecanary.RuntimeGateIdle,
+		livecanary.RuntimeGateExecuting,
+	); err != nil {
+		t.Fatalf("execution lease transition: %v", err)
+	}
+	if err := gate.Transition(
+		livecanary.RuntimeGateExecuting,
+		livecanary.RuntimeGateRefueling,
+	); err != nil {
+		t.Fatalf("execution to refuel transition: %v", err)
+	}
+	if gate.EvaluationAllowed() {
+		t.Fatal("refueling gate admitted an evaluation")
+	}
+	if err := gate.Transition(
+		livecanary.RuntimeGateRefueling,
+		livecanary.RuntimeGateExecuting,
+	); err != nil {
+		t.Fatalf("refuel to execution transition: %v", err)
+	}
+	if gate.EvaluationAllowed() {
+		t.Fatal("execution gate admitted an evaluation after refueling")
+	}
+	if err := gate.Transition(
+		livecanary.RuntimeGateExecuting,
+		livecanary.RuntimeGateIdle,
+	); err != nil {
+		t.Fatalf("execution to idle transition: %v", err)
+	}
+	if !gate.EvaluationAllowed() {
+		t.Fatal("idle gate must admit evaluations after post-operation refueling")
+	}
+}
+
 func TestRuntimeGateConcurrentLeaseHasSingleWinner(t *testing.T) {
 	gate := livecanary.NewRuntimeGate()
 	if err := gate.Transition(

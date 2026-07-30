@@ -64,6 +64,25 @@ type fakeNetwork struct {
 	subscriptions int
 }
 
+type initialFailureNetwork struct {
+	attempts int
+}
+
+func (*initialFailureNetwork) CurrentSlot(context.Context) (uint64, error) {
+	return 10, nil
+}
+
+func (n *initialFailureNetwork) SubscribeLogs(
+	context.Context,
+	string,
+) (solana.LogsSubscription, error) {
+	n.attempts++
+	if n.attempts == 1 {
+		return nil, errors.New("synthetic handshake failure")
+	}
+	return newFakeSubscription(), nil
+}
+
 type accountDecoder struct{ decoded int }
 
 func (d *accountDecoder) Bootstrap(context.Context, solanalogs.Network, uint64) (market.EventData, error) {
@@ -250,6 +269,37 @@ func TestFeedReconnectBootstrapsWithReset(t *testing.T) {
 	}
 	if len(s.resets) != 2 {
 		t.Fatalf("reset count = %d, want 2", len(s.resets))
+	}
+}
+
+func TestFeedRetriesInitialWebSocketFailureUntilBootstrap(t *testing.T) {
+	network := &initialFailureNetwork{}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &sink{cancel: cancel, cancelHealthy: 1}
+	feed, err := solanalogs.New(solanalogs.Config{
+		Market: "pool", Source: "solana", Pool: "pool-account",
+		Network: network, Decoder: decoder{},
+		Retry: solanalogs.RetryPolicy{
+			Initial: time.Millisecond,
+			Maximum: time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := feed.Run(ctx, s); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v", err)
+	}
+	if network.attempts != 2 {
+		t.Fatalf("subscription attempts = %d, want 2", network.attempts)
+	}
+	if len(s.resets) != 1 {
+		t.Fatalf("reset count = %d, want 1", len(s.resets))
+	}
+	if len(s.health) != 2 ||
+		s.health[0].Health != market.HealthDegraded ||
+		s.health[1].Health != market.HealthHealthy {
+		t.Fatalf("unexpected health transitions: %+v", s.health)
 	}
 }
 

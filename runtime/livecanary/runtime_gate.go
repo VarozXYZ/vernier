@@ -87,6 +87,7 @@ func validRuntimeGateTransition(from, to RuntimeGateState) bool {
 	case RuntimeGateStarting:
 		return to == RuntimeGateIdle ||
 			to == RuntimeGateRecovering ||
+			to == RuntimeGateRefueling ||
 			to == RuntimeGateRecoveryBlocked ||
 			to == RuntimeGateStopping
 	case RuntimeGateIdle:
@@ -98,6 +99,7 @@ func validRuntimeGateTransition(from, to RuntimeGateState) bool {
 	case RuntimeGateExecuting:
 		return to == RuntimeGateIdle ||
 			to == RuntimeGateRecovering ||
+			to == RuntimeGateRefueling ||
 			to == RuntimeGateRecoveryBlocked ||
 			to == RuntimeGateStopping
 	case RuntimeGateRecovering:
@@ -107,6 +109,7 @@ func validRuntimeGateTransition(from, to RuntimeGateState) bool {
 			to == RuntimeGateStopping
 	case RuntimeGateRefueling:
 		return to == RuntimeGateIdle ||
+			to == RuntimeGateExecuting ||
 			to == RuntimeGateRecovering ||
 			to == RuntimeGateRecoveryBlocked ||
 			to == RuntimeGateStopping

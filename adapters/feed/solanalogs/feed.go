@@ -110,7 +110,6 @@ func (f *Feed) Run(ctx context.Context, sink feedport.Sink) error {
 	if sink == nil {
 		return fmt.Errorf("feed sink is required")
 	}
-	established := false
 	delay := f.retry.Initial
 	f.logger.Info("feed run started", "market", f.market, "source", f.source)
 	for {
@@ -120,17 +119,19 @@ func (f *Feed) Run(ctx context.Context, sink feedport.Sink) error {
 			f.logger.Debug("feed run stopped", "market", f.market, "reason", ctx.Err())
 			return ctx.Err()
 		}
-		if !established && !bootstrapped {
-			return err
-		}
 		if bootstrapped {
-			established = true
 			delay = f.retry.Initial
 		}
 		if !disconnected {
 			return err
 		}
-		f.logger.Warn("feed WebSocket disconnected", "market", f.market, "error", err)
+		f.logger.Warn(
+			"feed WebSocket unavailable",
+			"market", f.market,
+			"bootstrapped", bootstrapped,
+			"error", err,
+			"retry_delay", delay,
+		)
 		if healthErr := sink.SetHealth(ctx, feedport.HealthUpdate{Health: market.HealthDegraded, Reason: "websocket_disconnected", ObservedAt: f.clock().UTC()}); healthErr != nil {
 			return healthErr
 		}
