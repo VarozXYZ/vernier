@@ -44,11 +44,20 @@ type DestinationWatcher interface {
 	Close()
 }
 
-func destinationChainForDirection(selected direction) string {
+func destinationChainForDirection(
+	config configuration.ParsedConfig,
+	selected direction,
+) string {
+	destinationKind := "evm"
 	if selected == evmToSolana {
-		return "solana"
+		destinationKind = "solana"
 	}
-	return "polygon"
+	for _, candidate := range config.Markets {
+		if config.Chains[candidate.Chain].Kind == destinationKind {
+			return candidate.Chain
+		}
+	}
+	return "unknown"
 }
 
 type liveExecutionResult struct {
@@ -245,7 +254,7 @@ func resumeArmedWithWatcher(
 	}
 	watcher := sharedWatcher
 	var current *big.Int
-	destinationChain := destinationChainForDirection(selected)
+	destinationChain := destinationChainForDirection(config, selected)
 	if watcher == nil {
 		watcher, current, destinationChain, err =
 			openDestinationWatcher(ctx, config, selected, endpoints)
@@ -385,7 +394,7 @@ func executeArmedWithWatcher(
 	minimumOutput, _ := new(big.Int).SetString(approval.MinimumOutputAmount, 10)
 	watcher := sharedWatcher
 	var before *big.Int
-	destinationChain := destinationChainForDirection(selected)
+	destinationChain := destinationChainForDirection(config, selected)
 	if watcher == nil {
 		watcher, before, destinationChain, err =
 			openDestinationWatcher(ctx, config, selected, endpoints)
@@ -838,7 +847,7 @@ func openDestinationWatcher(
 			done:     make(chan struct{}),
 		}
 		go watcher.run()
-		return watcher, before, "solana", nil
+		return watcher, before, destinationChainForDirection(config, selected), nil
 	}
 	privateText, err := requiredEnv("POLYGON_PRIVATE_KEY")
 	if err != nil {
@@ -894,7 +903,7 @@ func openDestinationWatcher(
 		done:   make(chan struct{}),
 	}
 	go watcher.run()
-	return watcher, before, "polygon", nil
+	return watcher, before, destinationChainForDirection(config, selected), nil
 }
 
 type solanaDestinationWatcher struct {

@@ -74,13 +74,13 @@ func (s *LiveService) Warm(ctx context.Context) error {
 			}
 			return fmt.Errorf(
 				"warm Across %s destination tracker: %w",
-				destinationChainForDirection(selected),
+				destinationChainForDirection(s.config.Configuration, selected),
 				openErr,
 			)
 		}
 		opened[selected] = watcher
 		stream := "spl_account_websocket"
-		if destination == "polygon" {
+		if selected == solanaToEVM {
 			stream = "erc20_transfer_websocket"
 		}
 		fmt.Fprintf(
@@ -116,7 +116,7 @@ func (s *LiveService) tracker(selected direction) (DestinationWatcher, error) {
 	if watcher == nil {
 		return nil, fmt.Errorf(
 			"across %s destination tracker is not initialized",
-			destinationChainForDirection(selected),
+			destinationChainForDirection(s.config.Configuration, selected),
 		)
 	}
 	return watcher, nil
