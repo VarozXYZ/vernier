@@ -162,6 +162,11 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			sell_output_token TEXT NOT NULL,
 			sell_output_units TEXT NOT NULL,
 			forced_canary INTEGER NOT NULL,
+			execution_policy_kind TEXT NOT NULL DEFAULT 'transported_sequential',
+			admission_cost_id TEXT NOT NULL DEFAULT '',
+			admission_cost_asset TEXT NOT NULL DEFAULT '',
+			admission_cost_value TEXT NOT NULL DEFAULT '',
+			admission_cost_captured_at TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS sequential_live_plan_stages (
@@ -173,6 +178,9 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			input_token TEXT NOT NULL,
 			output_token TEXT NOT NULL,
 			market_id TEXT NOT NULL DEFAULT '',
+			branch TEXT NOT NULL DEFAULT 'main',
+			depends_on TEXT NOT NULL DEFAULT '',
+			input_from_ordinal INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(operation_id, ordinal)
 		)`,
 		`CREATE TABLE IF NOT EXISTS sequential_live_recovery_attempts (
@@ -217,6 +225,26 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			return nil, fmt.Errorf("configure sequential Live SQLite: %w", err)
 		}
 	}
+	migrationRequired, err := sequentialMigrationRequired(db)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("inspect sequential Live schema: %w", err)
+	}
+	if migrationRequired {
+		var active int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sequential_live_operations
+			WHERE state IN ('running', 'recovering', 'recovery_blocked',
+				'manual_intervention_required')`).Scan(&active); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("inspect active sequential operations: %w", err)
+		}
+		if active != 0 {
+			_ = db.Close()
+			return nil, fmt.Errorf(
+				"cannot migrate sequential Live schema while an operation is active",
+			)
+		}
+	}
 	for _, migration := range []string{
 		`ALTER TABLE sequential_live_transactions
 			ADD COLUMN first_uncertain_at TEXT NOT NULL DEFAULT ''`,
@@ -230,6 +258,23 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			ADD COLUMN destination_balance_before TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sequential_live_settlements
 			ADD COLUMN destination_balance_after TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN execution_policy_kind TEXT NOT NULL
+			DEFAULT 'transported_sequential'`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN admission_cost_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN admission_cost_asset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN admission_cost_value TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN admission_cost_captured_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_stages
+			ADD COLUMN branch TEXT NOT NULL DEFAULT 'main'`,
+		`ALTER TABLE sequential_live_plan_stages
+			ADD COLUMN depends_on TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_stages
+			ADD COLUMN input_from_ordinal INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(migration); err != nil &&
 			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -254,6 +299,47 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 		return nil, err
 	}
 	return &SequentialLiveStore{db: db}, nil
+}
+
+func sequentialMigrationRequired(db *sql.DB) (bool, error) {
+	for table, columns := range map[string][]string{
+		"sequential_live_plan_snapshots": {
+			"execution_policy_kind", "admission_cost_id",
+			"admission_cost_asset", "admission_cost_value",
+			"admission_cost_captured_at",
+		},
+		"sequential_live_plan_stages": {
+			"branch", "depends_on", "input_from_ordinal",
+		},
+	} {
+		rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+		if err != nil {
+			return false, err
+		}
+		found := make(map[string]bool)
+		for rows.Next() {
+			var cid int
+			var name, kind string
+			var notNull, primaryKey int
+			var defaultValue any
+			if err := rows.Scan(
+				&cid, &name, &kind, &notNull, &defaultValue, &primaryKey,
+			); err != nil {
+				_ = rows.Close()
+				return false, err
+			}
+			found[name] = true
+		}
+		if err := rows.Close(); err != nil {
+			return false, err
+		}
+		for _, column := range columns {
+			if !found[column] {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func (s *SequentialLiveStore) RecordSequentialExitDecision(
@@ -293,7 +379,7 @@ func (s *SequentialLiveStore) RecordSequentialExitDecision(
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
 			WHERE operation_id=? AND state IN ('running', 'recovering')
-				AND current_stage=2
+				AND current_stage IN (1, 2)
 			)`,
 		decision.Operation, decision.Route,
 		destinationToken,
@@ -323,7 +409,7 @@ func (s *SequentialLiveStore) RecordSequentialResult(
 	result executionport.SequentialResult,
 ) error {
 	if result.Operation == "" || result.FinalAmount.IsZero() ||
-		len(result.Settlements) != 4 ||
+		(len(result.Settlements) != 4 && len(result.Settlements) != 2) ||
 		result.ExecutionCost.Asset() == "" ||
 		result.ExternalCost.Asset() != result.ExecutionCost.Asset() ||
 		result.RealizedGross.Asset() != result.ExecutionCost.Asset() ||
@@ -337,7 +423,7 @@ func (s *SequentialLiveStore) RecordSequentialResult(
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
 			WHERE operation_id=? AND state IN ('running', 'recovering')
-				AND current_stage=4
+				AND current_stage IN (4, 5)
 			)`,
 		result.Operation, result.FinalAmount.Token(),
 		result.FinalAmount.Units().String(), result.ExecutionCost.Asset(),
@@ -544,11 +630,9 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 	if err != nil {
 		return err
 	}
-	if state != string(domainexecution.SequentialRunning) &&
-		state != string(domainexecution.SequentialRecovering) ||
-		currentStage+1 != settlement.Request.Stage.Ordinal ||
-		currentToken != string(settlement.Request.Input.Token()) ||
-		currentUnits != settlement.Request.Input.Units().String() {
+	if err := validateSettlementExtension(
+		ctx, tx, settlement, state, currentStage, currentToken, currentUnits,
+	); err != nil {
 		return fmt.Errorf("sequential settlement does not extend the durable operation state")
 	}
 	destination := ""
@@ -612,6 +696,112 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 		return err
 	}
 	return tx.Commit()
+}
+
+func validateSettlementExtension(
+	ctx context.Context,
+	tx *sql.Tx,
+	settlement domainexecution.SequentialStageSettlement,
+	state string,
+	currentStage int,
+	currentToken, currentUnits string,
+) error {
+	if state != string(domainexecution.SequentialRunning) &&
+		state != string(domainexecution.SequentialRecovering) {
+		return fmt.Errorf("operation is not executable")
+	}
+	var policy domainexecution.ExecutionPolicyKind
+	err := tx.QueryRowContext(ctx, `SELECT execution_policy_kind
+		FROM sequential_live_plan_snapshots WHERE operation_id=?`,
+		settlement.Request.Operation,
+	).Scan(&policy)
+	if errors.Is(err, sql.ErrNoRows) ||
+		policy == "" ||
+		policy == domainexecution.PolicyTransportedSequential {
+		if currentStage+1 != settlement.Request.Stage.Ordinal ||
+			currentToken != string(settlement.Request.Input.Token()) ||
+			currentUnits != settlement.Request.Input.Units().String() {
+			return fmt.Errorf("settlement is not predecessor-linked")
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if policy != domainexecution.PolicyPrefundedSequential {
+		return fmt.Errorf("unsupported dependent execution policy")
+	}
+
+	var (
+		stage, branch, inputToken, dependencies string
+		inputFrom                               int
+	)
+	err = tx.QueryRowContext(ctx, `SELECT stage, branch, input_token,
+		depends_on, input_from_ordinal
+		FROM sequential_live_plan_stages
+		WHERE operation_id=? AND ordinal=?`,
+		settlement.Request.Operation,
+		settlement.Request.Stage.Ordinal,
+	).Scan(&stage, &branch, &inputToken, &dependencies, &inputFrom)
+	if err != nil {
+		return err
+	}
+	if stage != string(settlement.Request.Stage.Stage) ||
+		inputToken != string(settlement.Request.Input.Token()) {
+		return fmt.Errorf("settlement does not match its durable stage")
+	}
+	if settlement.Request.Stage.Ordinal == 1 {
+		if currentStage != 0 ||
+			currentToken != string(settlement.Request.Input.Token()) ||
+			currentUnits != settlement.Request.Input.Units().String() {
+			return fmt.Errorf("buy settlement does not extend initial input")
+		}
+		return nil
+	}
+	for _, dependency := range strings.Split(dependencies, ",") {
+		dependency = strings.TrimSpace(dependency)
+		if dependency == "" {
+			continue
+		}
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+			FROM sequential_live_settlements
+			WHERE operation_id=? AND ordinal=?`,
+			settlement.Request.Operation, dependency,
+		).Scan(&exists); err != nil || exists != 1 {
+			return fmt.Errorf("durable dependency is unsettled")
+		}
+	}
+	if inputFrom < 1 {
+		return fmt.Errorf("dependent settlement has no input reference")
+	}
+	var sourceExists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM sequential_live_settlements
+		WHERE operation_id=? AND ordinal=?`,
+		settlement.Request.Operation, inputFrom,
+	).Scan(&sourceExists); err != nil || sourceExists != 1 {
+		return fmt.Errorf("durable input settlement is missing")
+	}
+	switch domainexecution.SequentialBranch(branch) {
+	case domainexecution.BranchMain:
+		if currentStage+1 != settlement.Request.Stage.Ordinal {
+			return fmt.Errorf("main settlement is out of order")
+		}
+	case domainexecution.BranchCircuitBreaker:
+		var route string
+		if currentStage != 1 ||
+			tx.QueryRowContext(ctx, `SELECT route
+				FROM sequential_live_exit_decisions WHERE operation_id=?`,
+				settlement.Request.Operation,
+			).Scan(&route) != nil ||
+			route != string(domainexecution.ExitSellAtOrigin) {
+			return fmt.Errorf("circuit-breaker settlement is not authorized")
+		}
+	default:
+		return fmt.Errorf("settlement branch is invalid")
+	}
+	return nil
 }
 
 func (s *SequentialLiveStore) FinishSequentialOperation(
@@ -723,6 +913,45 @@ func (s *SequentialLiveStore) AcknowledgeManualReconciliation(
 	if affected != 1 {
 		return fmt.Errorf(
 			"operation %s is not awaiting manual reconciliation or recovery unblock",
+			operationID,
+		)
+	}
+	return nil
+}
+
+// RetryBlockedSequentialRecovery reopens one explicitly selected recovery
+// barrier without discarding its transaction identities or audit history.
+// The next recovery pass must reconcile those identities before doing work.
+func (s *SequentialLiveStore) RetryBlockedSequentialRecovery(
+	ctx context.Context,
+	operationID domainexecution.OperationID,
+) error {
+	if strings.TrimSpace(string(operationID)) == "" {
+		return fmt.Errorf("blocked recovery operation ID is required")
+	}
+	const note = "blocked recovery retry authorized by operator"
+	result, err := s.db.ExecContext(ctx, `UPDATE sequential_live_operations
+		SET state=?,
+			last_error=CASE
+				WHEN last_error='' THEN ?
+				ELSE last_error || ' | ' || ?
+			END,
+			updated_at=?
+		WHERE operation_id=? AND state=?`,
+		domainexecution.SequentialRecovering,
+		note,
+		note,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		operationID,
+		domainexecution.SequentialRecoveryBlocked,
+	)
+	if err != nil {
+		return fmt.Errorf("authorize blocked recovery retry: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return fmt.Errorf(
+			"operation %s is not blocked awaiting an explicit recovery retry",
 			operationID,
 		)
 	}
