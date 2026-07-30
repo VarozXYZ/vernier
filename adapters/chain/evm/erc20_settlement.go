@@ -133,6 +133,57 @@ func (d *ERC20TransferReceiptDecoder) DecodeReceipt(
 	}, nil
 }
 
+// Filter subscribes only to inbound transfers of configured tokens. A matching
+// log is inclusion evidence and wakes receipt reconciliation; it is not by
+// itself sufficient economic settlement evidence.
+func (d *ERC20TransferReceiptDecoder) Filter() LogFilter {
+	addresses := make([]common.Address, 0, len(d.tokens))
+	for _, address := range d.tokens {
+		addresses = append(addresses, address)
+	}
+	return LogFilter{
+		Addresses: addresses,
+		Topics:    []common.Hash{erc20TransferTopic},
+		IndexedTopics: [][]common.Hash{
+			nil,
+			{common.BytesToHash(d.owner.Bytes())},
+		},
+	}
+}
+
+func (d *ERC20TransferReceiptDecoder) DecodeLog(
+	step execution.OperationStep,
+	observed types.Log,
+) (execution.Settlement, bool, error) {
+	outputAddress, ok := d.tokens[step.Leg.ExpectedOutput.Token()]
+	if !ok || observed.Address != outputAddress ||
+		len(observed.Topics) != 3 ||
+		observed.Topics[0] != erc20TransferTopic ||
+		common.BytesToAddress(observed.Topics[2].Bytes()[12:]) != d.owner ||
+		len(observed.Data) != 32 {
+		return execution.Settlement{}, false, nil
+	}
+	units := new(big.Int).SetBytes(observed.Data)
+	if units.Sign() <= 0 {
+		return execution.Settlement{}, false, nil
+	}
+	output, err := market.NewTokenAmount(
+		step.Leg.ExpectedOutput.Token(),
+		units,
+	)
+	if err != nil {
+		return execution.Settlement{}, false, err
+	}
+	return execution.Settlement{
+		Identity:   step.Identity,
+		Technical:  execution.StateConfirmedSuccess,
+		Economic:   execution.EconomicReserved,
+		ActualOut:  output,
+		ObservedAt: d.clock().UTC(),
+		Evidence:   "evm_erc20_transfer_log",
+	}, true, nil
+}
+
 func (d *ERC20TransferReceiptDecoder) receiptCosts(
 	chain market.ChainID,
 	receipt *types.Receipt,
@@ -163,3 +214,4 @@ func (d *ERC20TransferReceiptDecoder) receiptCosts(
 }
 
 var _ ReceiptSettlementDecoder = (*ERC20TransferReceiptDecoder)(nil)
+var _ SettlementLogDecoder = (*ERC20TransferReceiptDecoder)(nil)

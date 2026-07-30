@@ -125,3 +125,53 @@ func TestERC20TransferReceiptDecoderRetainsGasCostOnConfirmedRevert(t *testing.T
 		t.Fatalf("unexpected revert costs: %+v", settlement.Costs)
 	}
 }
+
+func TestERC20TransferReceiptDecoderUsesInboundLogAsInclusionEvidence(t *testing.T) {
+	owner := common.HexToAddress("0x0000000000000000000000000000000000000011")
+	router := common.HexToAddress("0x0000000000000000000000000000000000000022")
+	inputToken := common.HexToAddress("0x0000000000000000000000000000000000000033")
+	outputToken := common.HexToAddress("0x0000000000000000000000000000000000000044")
+	decoder, err := evmadapter.NewERC20TransferReceiptDecoder(
+		owner,
+		map[market.TokenID]string{
+			"input": inputToken.Hex(), "output": outputToken.Hex(),
+		},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filter := decoder.Filter().Query(nil)
+	if len(filter.Addresses) != 2 ||
+		len(filter.Topics) != 3 ||
+		len(filter.Topics[2]) != 1 ||
+		common.BytesToAddress(filter.Topics[2][0].Bytes()) != owner {
+		t.Fatalf("unexpected inbound transfer filter: %+v", filter)
+	}
+	input, _ := market.NewTokenAmount("input", big.NewInt(1_000_000))
+	output, _ := market.NewTokenAmount("output", big.NewInt(4_000_000))
+	step := execution.OperationStep{
+		Leg: execution.Leg{
+			ID: "swap", Side: execution.LegSell, Chain: "polygon",
+			Account: "wallet", Market: "market",
+			Input: input, ExpectedOutput: output,
+		},
+		Identity: execution.TransactionIdentity{
+			Chain: "polygon", Account: "wallet",
+			Hash: common.HexToHash("0x01").Hex(),
+		},
+	}
+	log := transferLog(outputToken, router, owner, 4_100_000)
+	log.TxHash = common.HexToHash(step.Identity.Hash)
+	settlement, matched, err := decoder.DecodeLog(step, *log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched ||
+		settlement.Technical != execution.StateConfirmedSuccess ||
+		settlement.Economic != execution.EconomicReserved ||
+		settlement.ActualOut.Units().Cmp(big.NewInt(4_100_000)) != 0 ||
+		settlement.Evidence != "evm_erc20_transfer_log" {
+		t.Fatalf("unexpected websocket settlement: %+v matched=%t", settlement, matched)
+	}
+}

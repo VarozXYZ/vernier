@@ -36,43 +36,60 @@ type TransactionSimulator interface {
 }
 
 type TxManagerConfig struct {
-	Chain              market.ChainID
-	Account            execution.AccountID
-	ChainID            *big.Int
-	PrivateKey         *ecdsa.PrivateKey
-	Primary            TxClient
-	Simulator          TransactionSimulator
-	Fanout             map[string]TxClient
-	DefaultGasLimit    uint64
-	Clock              func() time.Time
-	OnFanoutResult     func(FanoutAttempt)
-	ReceiptDecoder     ReceiptSettlementDecoder
-	FeeRefreshInterval time.Duration
+	Chain                market.ChainID
+	Account              execution.AccountID
+	ChainID              *big.Int
+	PrivateKey           *ecdsa.PrivateKey
+	Primary              TxClient
+	Simulator            TransactionSimulator
+	Fanout               map[string]TxClient
+	DefaultGasLimit      uint64
+	Clock                func() time.Time
+	OnFanoutResult       func(FanoutAttempt)
+	ReceiptDecoder       ReceiptSettlementDecoder
+	FeeRefreshInterval   time.Duration
+	FanoutRequestTimeout time.Duration
 }
 
 type FanoutAttempt struct {
 	Endpoint     string
 	Accepted     bool
 	AlreadyKnown bool
+	ErrorClass   string
 	Err          error
+	StartedAt    time.Time
 	CompletedAt  time.Time
+	Latency      time.Duration
 }
 
+type fanoutFailure struct {
+	endpoint string
+	class    string
+	cause    error
+}
+
+func (f fanoutFailure) Error() string {
+	return fmt.Sprintf("EVM fanout endpoint %q: %s", f.endpoint, f.class)
+}
+
+func (f fanoutFailure) Unwrap() error { return f.cause }
+
 type TxManager struct {
-	chain              market.ChainID
-	account            execution.AccountID
-	chainID            *big.Int
-	privateKey         *ecdsa.PrivateKey
-	address            common.Address
-	primary            TxClient
-	simulator          TransactionSimulator
-	fanout             map[string]TxClient
-	gasLimit           uint64
-	clock              func() time.Time
-	onFanout           func(FanoutAttempt)
-	receiptDecoder     ReceiptSettlementDecoder
-	feeRefreshInterval time.Duration
-	warmOnce           sync.Once
+	chain                market.ChainID
+	account              execution.AccountID
+	chainID              *big.Int
+	privateKey           *ecdsa.PrivateKey
+	address              common.Address
+	primary              TxClient
+	simulator            TransactionSimulator
+	fanout               map[string]TxClient
+	gasLimit             uint64
+	clock                func() time.Time
+	onFanout             func(FanoutAttempt)
+	receiptDecoder       ReceiptSettlementDecoder
+	feeRefreshInterval   time.Duration
+	fanoutRequestTimeout time.Duration
+	warmOnce             sync.Once
 
 	mu      sync.Mutex
 	warmed  bool
@@ -111,13 +128,20 @@ func NewTxManager(config TxManagerConfig) (*TxManager, error) {
 	if config.FeeRefreshInterval < time.Second {
 		return nil, fmt.Errorf("EVM fee refresh interval must be at least one second")
 	}
+	if config.FanoutRequestTimeout == 0 {
+		config.FanoutRequestTimeout = time.Second
+	}
+	if config.FanoutRequestTimeout < 100*time.Millisecond {
+		return nil, fmt.Errorf("EVM fanout request timeout must be at least 100ms")
+	}
 	return &TxManager{
 		chain: config.Chain, account: config.Account, chainID: new(big.Int).Set(config.ChainID),
 		privateKey: config.PrivateKey, address: crypto.PubkeyToAddress(config.PrivateKey.PublicKey),
 		primary: config.Primary, simulator: config.Simulator,
 		fanout: fanout, gasLimit: config.DefaultGasLimit, clock: config.Clock,
 		onFanout: config.OnFanoutResult, receiptDecoder: config.ReceiptDecoder,
-		feeRefreshInterval: config.FeeRefreshInterval,
+		feeRefreshInterval:   config.FeeRefreshInterval,
+		fanoutRequestTimeout: config.FanoutRequestTimeout,
 	}, nil
 }
 
@@ -158,8 +182,17 @@ func (m *TxManager) Warm(ctx context.Context) error {
 	}
 	for name, client := range m.fanout {
 		candidate, candidateErr := client.ChainID(ctx)
-		if candidateErr != nil || candidate == nil || candidate.Cmp(m.chainID) != 0 {
-			return fmt.Errorf("validate EVM fanout endpoint %q chain ID", name)
+		if candidateErr != nil {
+			return fmt.Errorf(
+				"validate EVM fanout endpoint %q chain ID: unavailable",
+				name,
+			)
+		}
+		if candidate == nil || candidate.Cmp(m.chainID) != 0 {
+			return fmt.Errorf(
+				"validate EVM fanout endpoint %q chain ID: mismatch",
+				name,
+			)
 		}
 	}
 	nonce, err := m.primary.PendingNonceAt(ctx, m.address)
@@ -383,13 +416,26 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 	for name, client := range m.fanout {
 		name, client := name, client
 		go func() {
-			sendErr := client.SendTransaction(ctx, &transaction)
+			measurementStarted := time.Now()
+			startedAt := m.clock().UTC()
+			sendCtx, cancel := context.WithTimeout(
+				ctx,
+				m.fanoutRequestTimeout,
+			)
+			defer cancel()
+			sendErr := client.SendTransaction(sendCtx, &transaction)
 			known := isKnownTransaction(sendErr)
+			completedAt := m.clock().UTC()
 			results <- response{name: name, err: sendErr}
 			if m.onFanout != nil {
 				m.onFanout(FanoutAttempt{
 					Endpoint: name, Accepted: sendErr == nil || known,
-					AlreadyKnown: known, Err: sendErr, CompletedAt: m.clock().UTC(),
+					AlreadyKnown: known,
+					ErrorClass:   fanoutErrorClass(sendErr),
+					Err:          sendErr,
+					StartedAt:    startedAt,
+					CompletedAt:  completedAt,
+					Latency:      time.Since(measurementStarted),
 				})
 			}
 		}()
@@ -405,7 +451,11 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 				Attempts: attempt, AcceptedAt: m.clock().UTC(),
 			}, nil
 		}
-		failures = append(failures, fmt.Errorf("%s: %w", result.name, result.err))
+		failures = append(failures, fanoutFailure{
+			endpoint: result.name,
+			class:    fanoutErrorClass(result.err),
+			cause:    result.err,
+		})
 	}
 	disposition := chainport.BroadcastRejected
 	for _, failure := range failures {
@@ -428,16 +478,51 @@ func (m *TxManager) Reconcile(ctx context.Context, step execution.OperationStep)
 		return execution.Settlement{}, fmt.Errorf("EVM reconciliation identity is invalid")
 	}
 	hash := common.HexToHash(identity.Hash)
-	var unavailable []error
+	type receiptResult struct {
+		name    string
+		receipt *types.Receipt
+		err     error
+	}
+	results := make(chan receiptResult, len(m.fanout))
+	lookupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	for name, client := range m.fanout {
-		receipt, err := client.TransactionReceipt(ctx, hash)
-		if errors.Is(err, geth.NotFound) {
+		name, client := name, client
+		go func() {
+			receiptCtx, receiptCancel := context.WithTimeout(
+				lookupCtx,
+				m.fanoutRequestTimeout,
+			)
+			defer receiptCancel()
+			receipt, err := client.TransactionReceipt(receiptCtx, hash)
+			results <- receiptResult{name: name, receipt: receipt, err: err}
+		}()
+	}
+	var unavailable []error
+	notFound := 0
+	for range m.fanout {
+		result := <-results
+		if errors.Is(result.err, geth.NotFound) {
+			notFound++
 			continue
 		}
-		if err != nil {
-			unavailable = append(unavailable, fmt.Errorf("%s: %w", name, err))
+		if result.err != nil {
+			unavailable = append(
+				unavailable,
+				fanoutFailure{
+					endpoint: result.name,
+					class:    fanoutErrorClass(result.err),
+					cause:    result.err,
+				},
+			)
 			continue
 		}
+		receipt := result.receipt
+		if receipt == nil {
+			notFound++
+			continue
+		}
+		cancel()
 		state := execution.StateConfirmedSuccess
 		if receipt.Status != types.ReceiptStatusSuccessful {
 			state = execution.StateConfirmedRevert
@@ -464,10 +549,50 @@ func (m *TxManager) Reconcile(ctx context.Context, step execution.OperationStep)
 	if len(unavailable) == len(m.fanout) {
 		return execution.Settlement{}, errors.Join(unavailable...)
 	}
+	if notFound == 0 && len(unavailable) > 0 {
+		return execution.Settlement{}, errors.Join(unavailable...)
+	}
 	return execution.Settlement{
 		Identity: identity, Technical: execution.StateOutcomeUnknown,
-		Economic: execution.EconomicReserved, ObservedAt: m.clock().UTC(), Evidence: "receipt_not_found",
+		Economic: execution.EconomicReserved, ObservedAt: m.clock().UTC(),
+		Evidence: "receipt_not_found",
 	}, nil
+}
+
+func fanoutErrorClass(err error) string {
+	if err == nil {
+		return "accepted"
+	}
+	if isKnownTransaction(err) {
+		return "already_known"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	text := strings.ToLower(err.Error())
+	for _, candidate := range []struct {
+		fragment string
+		class    string
+	}{
+		{"nonce too low", "nonce_too_low"},
+		{"insufficient funds", "insufficient_funds"},
+		{"underpriced", "underpriced"},
+		{"rate limit", "rate_limited"},
+		{"too many requests", "rate_limited"},
+		{"status 429", "rate_limited"},
+		{"unauthorized", "unauthorized"},
+		{"status 401", "unauthorized"},
+		{"forbidden", "forbidden"},
+		{"status 403", "forbidden"},
+		{"method not found", "method_unavailable"},
+		{"invalid request", "invalid_request"},
+		{"unknown transaction", "unknown_transaction"},
+	} {
+		if strings.Contains(text, candidate.fragment) {
+			return candidate.class
+		}
+	}
+	return "rejected_or_transport_error"
 }
 
 func isKnownTransaction(err error) bool {
@@ -475,7 +600,12 @@ func isKnownTransaction(err error) bool {
 		return false
 	}
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "already known") || strings.Contains(text, "known transaction")
+	if strings.Contains(text, "unknown transaction") {
+		return false
+	}
+	return strings.Contains(text, "already known") ||
+		strings.Contains(text, "already imported") ||
+		strings.Contains(text, "known transaction")
 }
 
 func broadcastMayHaveSucceeded(err error) bool {

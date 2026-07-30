@@ -98,7 +98,7 @@ func (n *ReadOnlyNetwork) CurrentBlock(ctx context.Context) (BlockReference, err
 }
 
 func (n *ReadOnlyNetwork) SubscribeLogs(ctx context.Context, filter LogFilter, output chan<- types.Log) (Subscription, error) {
-	if filter.Address == (common.Address{}) || output == nil {
+	if len(filter.Query(nil).Addresses) == 0 || output == nil {
 		return nil, fmt.Errorf("%s log subscription requires an address and output channel", n.label)
 	}
 	subscription, err := n.websocket.SubscribeFilterLogs(ctx, filter.Query(nil), output)
