@@ -21,13 +21,17 @@ import (
 )
 
 type txClientStub struct {
-	chainID   *big.Int
-	sendErr   error
-	delay     time.Duration
-	calls     atomic.Int32
-	sentMu    sync.Mutex
-	sent      []*types.Transaction
-	simulated atomic.Int32
+	chainID      *big.Int
+	sendErr      error
+	delay        time.Duration
+	receipt      *types.Receipt
+	receiptErr   error
+	receiptDelay time.Duration
+	receiptCalls atomic.Int32
+	calls        atomic.Int32
+	sentMu       sync.Mutex
+	sent         []*types.Transaction
+	simulated    atomic.Int32
 }
 
 func (c *txClientStub) ChainID(context.Context) (*big.Int, error) {
@@ -62,8 +66,18 @@ func (c *txClientStub) SendTransaction(ctx context.Context, tx *types.Transactio
 	c.sentMu.Unlock()
 	return c.sendErr
 }
-func (*txClientStub) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
-	return nil, errors.New("not used")
+func (c *txClientStub) TransactionReceipt(ctx context.Context, _ common.Hash) (*types.Receipt, error) {
+	c.receiptCalls.Add(1)
+	if c.receiptDelay > 0 {
+		timer := time.NewTimer(c.receiptDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return c.receipt, c.receiptErr
 }
 func (c *txClientStub) CallContract(
 	context.Context,
@@ -83,19 +97,28 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 	primary := &txClientStub{chainID: chainID}
 	failed := &txClientStub{chainID: chainID, sendErr: errors.New("unavailable")}
 	accepted := &txClientStub{chainID: chainID, delay: time.Millisecond}
-	telemetry := make(chan evmadapter.FanoutAttempt, 2)
+	slow := &txClientStub{chainID: chainID, delay: time.Second}
+	telemetry := make(chan evmadapter.FanoutAttempt, 3)
 	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
 		Chain: "evm", Account: "executor", ChainID: chainID, PrivateKey: key, Primary: primary,
-		Simulator:       primary,
-		Fanout:          map[string]evmadapter.TxClient{"failed": failed, "accepted": accepted},
+		Simulator: primary,
+		Fanout: map[string]evmadapter.TxClient{
+			"failed": failed, "accepted": accepted, "slow": slow,
+		},
 		DefaultGasLimit: 100_000, Clock: time.Now,
-		OnFanoutResult: func(attempt evmadapter.FanoutAttempt) { telemetry <- attempt },
+		FanoutRequestTimeout: 100 * time.Millisecond,
+		OnFanoutResult:       func(attempt evmadapter.FanoutAttempt) { telemetry <- attempt },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Warm(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if failed.calls.Load() != 1 ||
+		accepted.calls.Load() != 1 ||
+		slow.calls.Load() != 1 {
+		t.Fatal("Warm did not validate every fanout endpoint")
 	}
 	warmCalls := primary.calls.Load()
 	input, _ := market.NewTokenAmount("base", big.NewInt(100))
@@ -149,7 +172,7 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 		t.Fatalf("broadcast result = %+v", result)
 	}
 	observed := map[string]evmadapter.FanoutAttempt{}
-	for len(observed) < 2 {
+	for len(observed) < 3 {
 		select {
 		case attempt := <-telemetry:
 			observed[attempt.Endpoint] = attempt
@@ -159,6 +182,15 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 	}
 	if observed["accepted"].Accepted != true || observed["failed"].Err == nil {
 		t.Fatalf("fanout telemetry = %+v", observed)
+	}
+	if !errors.Is(observed["slow"].Err, context.DeadlineExceeded) {
+		t.Fatalf("slow endpoint was not bounded: %+v", observed["slow"])
+	}
+	if observed["accepted"].ErrorClass != "accepted" ||
+		observed["failed"].ErrorClass != "rejected_or_transport_error" ||
+		observed["slow"].ErrorClass != "timeout" ||
+		observed["accepted"].Latency <= 0 {
+		t.Fatalf("fanout classifications = %+v", observed)
 	}
 	failed.sentMu.Lock()
 	accepted.sentMu.Lock()
@@ -204,5 +236,138 @@ func TestEVMTxManagerValuesExpectedGasInsteadOfTransactionLimit(t *testing.T) {
 	// The stub warms a base fee of 10 and a tip of 2.
 	if cost.Cmp(big.NewInt(12_000_000)) != 0 {
 		t.Fatalf("estimated network cost = %s; want 12000000", cost)
+	}
+}
+
+func TestEVMTxManagerReconcilesFromFirstFanoutReceipt(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainID := big.NewInt(12345)
+	slow := &txClientStub{
+		chainID: chainID, receiptDelay: time.Second,
+		receiptErr: geth.NotFound,
+	}
+	fast := &txClientStub{
+		chainID: chainID,
+		receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful},
+	}
+	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
+		Chain: "evm", Account: "executor", ChainID: chainID,
+		PrivateKey: key, Primary: slow, Simulator: slow,
+		Fanout: map[string]evmadapter.TxClient{
+			"slow": slow,
+			"fast": fast,
+		},
+		Clock: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	settlement, err := manager.Reconcile(
+		context.Background(),
+		execution.OperationStep{
+			Identity: execution.TransactionIdentity{
+				Chain: "evm", Account: "executor",
+				Hash: common.HexToHash("0x01").Hex(),
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settlement.Technical != execution.StateConfirmedSuccess {
+		t.Fatalf("settlement = %+v", settlement)
+	}
+	if fast.receiptCalls.Load() != 1 {
+		t.Fatalf("fast receipt calls=%d", fast.receiptCalls.Load())
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("parallel receipt reconciliation took %s", elapsed)
+	}
+}
+
+func TestEVMTxManagerAcceptsOnlySameTransactionEvidence(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainID := big.NewInt(12345)
+	primary := &txClientStub{chainID: chainID}
+	imported := &txClientStub{
+		chainID: chainID, sendErr: errors.New("already imported"),
+	}
+	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
+		Chain: "evm", Account: "executor", ChainID: chainID,
+		PrivateKey: key, Primary: primary, Simulator: primary,
+		Fanout: map[string]evmadapter.TxClient{"imported": imported},
+		Clock:  time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Warm(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	input, _ := market.NewTokenAmount("base", big.NewInt(100))
+	output, _ := market.NewTokenAmount("quote", big.NewInt(101))
+	quote, _ := market.NewQuote(market.Quote{
+		Source: "local", Market: "local-market", SnapshotVersion: 1,
+		Purpose: market.QuotePurposeLiveValidation,
+		Mode:    market.QuoteModeExactInput, Quality: market.QuoteQualityExact,
+		AmountIn: input, AmountOut: output, QuotedAt: time.Now(),
+	})
+	prepared, err := manager.Prepare(context.Background(), executionport.Artifact{
+		Leg: execution.Leg{
+			ID: "sell", Side: execution.LegSell, Chain: "evm",
+			Account: "executor", Market: "local-market",
+			Input: input, ExpectedOutput: output,
+		},
+		ValidatedQuote: quote,
+		Metadata: map[string]string{
+			"to": "0x1111111111111111111111111111111111111111",
+		},
+		BuiltAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.Broadcast(context.Background(), prepared)
+	if err != nil || !result.Accepted {
+		t.Fatalf("already-imported broadcast result=%+v err=%v", result, err)
+	}
+
+	nonceTooLow := &txClientStub{
+		chainID: chainID, sendErr: errors.New("nonce too low"),
+	}
+	second, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
+		Chain: "evm", Account: "executor", ChainID: chainID,
+		PrivateKey: key, Primary: primary, Simulator: primary,
+		Fanout: map[string]evmadapter.TxClient{"nonce": nonceTooLow},
+		Clock:  time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Broadcast(context.Background(), prepared); err == nil {
+		t.Fatal("nonce too low was incorrectly accepted as same-transaction evidence")
+	}
+
+	unknown := &txClientStub{
+		chainID: chainID, sendErr: errors.New("unknown transaction"),
+	}
+	third, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
+		Chain: "evm", Account: "executor", ChainID: chainID,
+		PrivateKey: key, Primary: primary, Simulator: primary,
+		Fanout: map[string]evmadapter.TxClient{"unknown": unknown},
+		Clock:  time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := third.Broadcast(context.Background(), prepared); err == nil {
+		t.Fatal("unknown transaction was incorrectly accepted as known")
 	}
 }

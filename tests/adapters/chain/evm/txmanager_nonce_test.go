@@ -55,8 +55,9 @@ func newNonceTestManager(
 	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
 		Chain: "polygon", Account: "polygon-executor",
 		ChainID: big.NewInt(137), PrivateKey: key,
-		Primary: client, Fanout: map[string]evmadapter.TxClient{"test": client},
-		Clock: time.Now,
+		Primary: client,
+		Fanout:  map[string]evmadapter.TxClient{"test": client},
+		Clock:   time.Now,
 	})
 	if err != nil {
 		t.Fatal(err)
