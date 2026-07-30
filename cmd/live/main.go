@@ -36,6 +36,10 @@ type refuelRuntime interface {
 	) (executionport.RefuelRecord, error)
 }
 
+type recoveryOnlyRuntime interface {
+	RecoverOnly(context.Context) error
+}
+
 type runMode string
 
 const (
@@ -47,6 +51,24 @@ const (
 type privateFactory func(context.Context, configuration.ParsedLiveConfig, configuration.LookupEnv, runMode) (armedRuntime, error)
 
 var composePrivate privateFactory
+
+type compiledFactory func(
+	context.Context,
+	string,
+	configuration.ParsedLiveConfig,
+	configuration.LookupEnv,
+	runMode,
+	livecanary.ForcedCanaryDirection,
+	bool,
+	io.Writer,
+	io.Writer,
+) (armedRuntime, error)
+
+var executionFactories = map[string]compiledFactory{
+	string(execution.PolicyTransportedSequential): composeSequentialRuntime,
+	string(execution.PolicyPrefundedSequential):   composeSequentialRuntime,
+	string(execution.PolicyPrefundedParallel):     composeParallelRuntime,
+}
 
 // An ignored setup-specific Go file assigns composePrivate from init. Keeping
 // the hook package-private prevents it becoming a public plugin API while
@@ -95,6 +117,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		"",
 		"close one manually reconciled operation barrier by exact operation ID",
 	)
+	recoverOnly := flags.Bool(
+		"recover-only",
+		false,
+		"resume one durable operation and exit before admitting new work",
+	)
+	retryBlockedRecovery := flags.String(
+		"retry-blocked-recovery",
+		"",
+		"authorize recovery retry for one exact recovery-blocked operation ID",
+	)
 	refuelOnce := flags.String(
 		"refuel-once",
 		"",
@@ -113,6 +145,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*acknowledgeReconciled) != "" &&
 		(*arm || *dryRun || *costObserve ||
+			*recoverOnly || strings.TrimSpace(*retryBlockedRecovery) != "" ||
 			strings.TrimSpace(*confirmCanary) != "" ||
 			strings.TrimSpace(*confirmLive) != "" ||
 			strings.TrimSpace(*forceCanaryDirection) != "" ||
@@ -120,6 +153,30 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(
 			stderr,
 			"live: -acknowledge-reconciled-operation cannot be combined with execution flags",
+		)
+		return 2
+	}
+	if *recoverOnly && !*arm {
+		fmt.Fprintln(stderr, "live: -recover-only requires -arm")
+		return 2
+	}
+	if strings.TrimSpace(*retryBlockedRecovery) != "" &&
+		(!*recoverOnly || !*arm) {
+		fmt.Fprintln(
+			stderr,
+			"live: -retry-blocked-recovery requires -recover-only and -arm",
+		)
+		return 2
+	}
+	if *recoverOnly &&
+		(*dryRun || *costObserve ||
+			strings.TrimSpace(*confirmCanary) != "" ||
+			strings.TrimSpace(*confirmLive) != "" ||
+			strings.TrimSpace(*forceCanaryDirection) != "" ||
+			strings.TrimSpace(*refuelOnce) != "") {
+		fmt.Fprintln(
+			stderr,
+			"live: -recover-only cannot be combined with execution, observation, confirmation, or refuel flags",
 		)
 		return 2
 	}
@@ -199,6 +256,29 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		)
 		return 0
 	}
+	if operationID := strings.TrimSpace(*retryBlockedRecovery); operationID != "" {
+		store, openErr := sqlitestore.OpenSequentialLive(
+			config.OperationalStorePath,
+		)
+		if openErr != nil {
+			fmt.Fprintf(stderr, "live: open operational journal: %v\n", openErr)
+			return 1
+		}
+		retryErr := store.RetryBlockedSequentialRecovery(
+			ctx,
+			execution.OperationID(operationID),
+		)
+		_ = store.Close()
+		if retryErr != nil {
+			fmt.Fprintf(stderr, "live: %v\n", retryErr)
+			return 1
+		}
+		fmt.Fprintf(
+			stdout,
+			"live_recovery operation=%s status=retry_authorized\n",
+			operationID,
+		)
+	}
 	if refuelChain != "" {
 		store, openErr := sqlitestore.OpenSequentialLive(
 			config.OperationalStorePath,
@@ -223,8 +303,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	if *arm && refuelChain == "" &&
-		config.ExecutionMode == "sequential_bridge_canary" {
+	if *arm && !*recoverOnly && refuelChain == "" &&
+		config.RunTier == "canary" {
 		expected := ""
 		if config.CanaryInput != nil {
 			expected = config.CanaryInput.RatString()
@@ -238,8 +318,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if *arm && refuelChain == "" &&
-		config.ExecutionMode == "sequential_bridge_live" {
+	if *arm && !*recoverOnly && refuelChain == "" &&
+		config.RunTier == "live" &&
+		config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) {
 		expected := ""
 		if config.ExecutionInput != nil {
 			expected = config.ExecutionInput.RatString()
@@ -254,7 +335,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if forcedDirection != "" &&
-		config.ExecutionMode != "sequential_bridge_canary" {
+		config.RunTier != "canary" {
 		fmt.Fprintln(
 			stderr,
 			"live: -force-canary-direction is only available for sequential_bridge_canary",
@@ -281,9 +362,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "Live configuration and environment are valid; broadcast remains disarmed.")
 		return 0
 	}
-	var runtime armedRuntime
-	if config.ExecutionMode == "sequential_bridge_canary" ||
-		config.ExecutionMode == "sequential_bridge_live" {
+	factory, ok := executionFactories[config.ExecutionPolicyKind]
+	if !ok {
+		fmt.Fprintf(
+			stderr, "live: no compiled factory for execution policy %q\n",
+			config.ExecutionPolicyKind,
+		)
+		return 2
+	}
+	if config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) {
 		if mode == modeDryRun {
 			fmt.Fprintln(
 				stdout,
@@ -291,39 +378,29 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			)
 			return 0
 		}
-		researchConfig, loadErr := configuration.LoadConfig(*configPath)
-		if loadErr != nil {
-			fmt.Fprintf(stderr, "live: %v\n", loadErr)
-			return 2
-		}
-		logger, loggerErr := observability.NewLogger(stderr, "info")
-		if loggerErr != nil {
-			fmt.Fprintf(stderr, "live: create logger: %v\n", loggerErr)
-			return 1
-		}
-		runtime, err = livecanary.ComposeArmed(ctx, livecanary.ComposeConfig{
-			ManifestPath:     *configPath,
-			Research:         researchConfig,
-			Live:             config,
-			LookupEnv:        os.LookupEnv,
-			Logger:           logger,
-			Output:           stdout,
-			ObserveCostsOnly: mode == modeCostObserve,
-			RefuelOnly:       refuelChain != "",
-			ForcedCanary:     forcedDirection,
-		})
-	} else {
-		if composePrivate == nil {
-			fmt.Fprintln(stderr, "live: private setup composition is not installed")
-			return 2
-		}
-		runtime, err = composePrivate(ctx, config, os.LookupEnv, mode)
 	}
+	runtime, err := factory(
+		ctx, *configPath, config, os.LookupEnv, mode, forcedDirection,
+		refuelChain != "",
+		stdout, stderr,
+	)
 	if err != nil {
 		fmt.Fprintf(stderr, "live: compose runtime: %v\n", err)
 		return 1
 	}
 	defer runtime.Close()
+	if *recoverOnly {
+		recoveryRuntime, ok := runtime.(recoveryOnlyRuntime)
+		if !ok {
+			fmt.Fprintln(stderr, "live: runtime does not support recovery-only")
+			return 1
+		}
+		if err := recoveryRuntime.RecoverOnly(ctx); err != nil {
+			fmt.Fprintf(stderr, "live: recovery-only: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if refuelChain != "" {
 		refueler, ok := runtime.(refuelRuntime)
 		if !ok {
@@ -353,6 +430,50 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func composeSequentialRuntime(
+	ctx context.Context,
+	manifestPath string,
+	config configuration.ParsedLiveConfig,
+	lookup configuration.LookupEnv,
+	mode runMode,
+	forced livecanary.ForcedCanaryDirection,
+	refuelOnly bool,
+	stdout io.Writer,
+	stderr io.Writer,
+) (armedRuntime, error) {
+	researchConfig, err := configuration.LoadConfig(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	logger, err := observability.NewLogger(stderr, "info")
+	if err != nil {
+		return nil, fmt.Errorf("create logger: %w", err)
+	}
+	return livecanary.ComposeArmed(ctx, livecanary.ComposeConfig{
+		ManifestPath: manifestPath, Research: researchConfig, Live: config,
+		LookupEnv: lookup, Logger: logger, Output: stdout,
+		ObserveCostsOnly: mode == modeCostObserve,
+		RefuelOnly:       refuelOnly, ForcedCanary: forced,
+	})
+}
+
+func composeParallelRuntime(
+	ctx context.Context,
+	_ string,
+	config configuration.ParsedLiveConfig,
+	lookup configuration.LookupEnv,
+	mode runMode,
+	_ livecanary.ForcedCanaryDirection,
+	_ bool,
+	_ io.Writer,
+	_ io.Writer,
+) (armedRuntime, error) {
+	if composePrivate == nil {
+		return nil, fmt.Errorf("private setup composition is not installed")
+	}
+	return composePrivate(ctx, config, lookup, mode)
 }
 
 func validateEnvironment(config configuration.ParsedLiveConfig, lookup configuration.LookupEnv, mode runMode) error {

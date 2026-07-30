@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math/big"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,15 +79,18 @@ func (*durableJournal) ActiveSequentialOperation(context.Context) (execution.Seq
 }
 
 type settledTxManager struct {
-	journal        *durableJournal
-	broadcasts     int
-	prepareCalls   int
-	oversizedAt    string
-	simulations    int
-	simulationErr  error
-	actualOutput   market.TokenAmount
-	preparedInput  market.TokenAmount
-	reconciliation *execution.Settlement
+	journal         *durableJournal
+	broadcasts      int
+	prepareCalls    int
+	oversizedAt     string
+	simulations     int
+	simulationErr   error
+	simulationErrs  []error
+	actualOutput    market.TokenAmount
+	preparedInput   market.TokenAmount
+	reconciliation  *execution.Settlement
+	reconcileDelay  time.Duration
+	reconciliations atomic.Int32
 }
 
 func (*settledTxManager) Account() execution.AccountID { return "account" }
@@ -116,6 +120,11 @@ func (m *settledTxManager) SimulatePrepared(
 	chainport.PreparedTransaction,
 ) error {
 	m.simulations++
+	if len(m.simulationErrs) > 0 {
+		err := m.simulationErrs[0]
+		m.simulationErrs = m.simulationErrs[1:]
+		return err
+	}
 	return m.simulationErr
 }
 func (m *settledTxManager) Broadcast(
@@ -132,9 +141,19 @@ func (m *settledTxManager) Broadcast(
 	}, nil
 }
 func (m *settledTxManager) Reconcile(
-	_ context.Context,
+	ctx context.Context,
 	step execution.OperationStep,
 ) (execution.Settlement, error) {
+	m.reconciliations.Add(1)
+	if m.reconcileDelay > 0 {
+		timer := time.NewTimer(m.reconcileDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return execution.Settlement{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	if m.reconciliation != nil {
 		result := *m.reconciliation
 		result.Identity = step.Identity
@@ -146,6 +165,30 @@ func (m *settledTxManager) Reconcile(
 		ActualIn: m.preparedInput, ActualOut: m.actualOutput,
 		ObservedAt: time.Now(), Evidence: "test-receipt",
 	}, nil
+}
+
+type fixedConfirmationSource struct {
+	settlement execution.Settlement
+	delay      time.Duration
+}
+
+func (*fixedConfirmationSource) Warm(context.Context) error { return nil }
+func (s *fixedConfirmationSource) Await(
+	ctx context.Context,
+	step execution.OperationStep,
+) (execution.Settlement, error) {
+	if s.delay > 0 {
+		timer := time.NewTimer(s.delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return execution.Settlement{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	result := s.settlement
+	result.Identity = step.Identity
+	return result, nil
 }
 
 type fixedCostValuator struct {
@@ -393,6 +436,121 @@ func TestSwapDriverRebuildsStaleArtifactBeforeDurableBroadcast(t *testing.T) {
 	}
 	if settlement.ActualOutput.Units().Cmp(output.Units()) != 0 {
 		t.Fatalf("unexpected actual output %s", settlement.ActualOutput)
+	}
+}
+
+func TestSwapDriverUsesEconomicWebSocketSettlementWithoutWaitingForReceipt(t *testing.T) {
+	now := time.Now().UTC()
+	input, _ := market.NewTokenAmount("quote-a", big.NewInt(1_000_000))
+	output, _ := market.NewTokenAmount("base-a", big.NewInt(4_000_000_000))
+	journal := &durableJournal{}
+	manager := &settledTxManager{
+		journal: journal, actualOutput: output,
+		reconcileDelay: time.Second,
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account",
+				Validator: &fixedOutputValidator{
+					now: now, output: output.Units(),
+				},
+				TxManager: manager,
+				Confirmation: &fixedConfirmationSource{
+					delay: 5 * time.Millisecond,
+					settlement: execution.Settlement{
+						Technical: execution.StateConfirmedSuccess,
+						Economic:  execution.EconomicEffectVerified,
+						ActualIn:  input, ActualOut: output,
+						ObservedAt: now, Evidence: "websocket-economic",
+					},
+				},
+			},
+		},
+		Clock:         func() time.Time { return now },
+		FallbackAfter: time.Second,
+	}
+	started := time.Now()
+	settlement, err := driver.ExecuteStage(
+		context.Background(),
+		execution.SequentialStageRequest{
+			Operation: "operation", Plan: "plan",
+			Stage: execution.SequentialStagePlan{
+				Ordinal: 1, Stage: execution.StageBuy,
+				SourceChain: "chain-a", InputToken: "quote-a",
+				OutputToken: "base-a", Market: "market-a",
+			},
+			Input: input,
+		},
+		journal,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settlement.Evidence != "websocket-economic" ||
+		time.Since(started) > 250*time.Millisecond {
+		t.Fatalf("settlement=%+v elapsed=%s", settlement, time.Since(started))
+	}
+}
+
+func TestSwapDriverDoesNotTreatWebSocketInclusionAsEconomicSettlement(t *testing.T) {
+	now := time.Now().UTC()
+	input, _ := market.NewTokenAmount("quote-a", big.NewInt(1_000_000))
+	output, _ := market.NewTokenAmount("base-a", big.NewInt(4_000_000_000))
+	receiptSettlement := execution.Settlement{
+		Technical: execution.StateConfirmedSuccess,
+		Economic:  execution.EconomicEffectVerified,
+		ActualIn:  input, ActualOut: output,
+		ObservedAt: now, Evidence: "receipt-economic",
+	}
+	journal := &durableJournal{}
+	manager := &settledTxManager{
+		journal: journal, reconciliation: &receiptSettlement,
+		reconcileDelay: 10 * time.Millisecond,
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account",
+				Validator: &fixedOutputValidator{
+					now: now, output: output.Units(),
+				},
+				TxManager: manager,
+				Confirmation: &fixedConfirmationSource{
+					settlement: execution.Settlement{
+						Technical: execution.StateConfirmedSuccess,
+						Economic:  execution.EconomicReserved,
+						ActualOut: output, ObservedAt: now,
+						Evidence: "websocket-inclusion",
+					},
+				},
+			},
+		},
+		Clock:         func() time.Time { return now },
+		FallbackAfter: time.Second,
+	}
+	settlement, err := driver.ExecuteStage(
+		context.Background(),
+		execution.SequentialStageRequest{
+			Operation: "operation", Plan: "plan",
+			Stage: execution.SequentialStagePlan{
+				Ordinal: 1, Stage: execution.StageBuy,
+				SourceChain: "chain-a", InputToken: "quote-a",
+				OutputToken: "base-a", Market: "market-a",
+			},
+			Input: input,
+		},
+		journal,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settlement.Evidence != "receipt-economic" ||
+		manager.reconciliations.Load() == 0 {
+		t.Fatalf(
+			"inclusion-only websocket evidence settled swap: %+v",
+			settlement,
+		)
 	}
 }
 
@@ -911,6 +1069,181 @@ func TestSwapDriverRejectsWhenSecondTransactionSimulationFails(t *testing.T) {
 	}
 }
 
+func TestPrefundedPreflightRetriesFreshDestinationAfterSimulationFailure(t *testing.T) {
+	now := time.Now().UTC()
+	plan := prefundedPreflightPlan(t, now)
+	journal := &durableJournal{}
+	buyManager := &settledTxManager{journal: journal}
+	sellManager := &settledTxManager{
+		journal: journal,
+		simulationErrs: []error{
+			errors.New("Jupiter 6001 slippage exceeded"),
+			nil,
+		},
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account",
+				Validator: &fixedOutputValidator{
+					now: now, output: big.NewInt(4_052_168_781),
+				},
+				TxManager: buyManager,
+			},
+			"market-b": {
+				Account: "account",
+				Validator: &fixedOutputValidator{
+					now: now, output: big.NewInt(1_010_000),
+				},
+				TxManager: sellManager,
+				SpendableBalance: livecanary.SpendableBalanceReaderFunc(
+					func(
+						context.Context,
+						market.TokenID,
+					) (*big.Int, error) {
+						return new(big.Int).Exp(
+							big.NewInt(10),
+							big.NewInt(30),
+							nil,
+						), nil
+					},
+				),
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9,
+			"base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision:          8,
+		Clock:                    func() time.Time { return now },
+		ExitValidationAttempts:   2,
+		ExitValidationRetryDelay: time.Nanosecond,
+	}
+	if err := driver.Preflight(
+		context.Background(),
+		"operation",
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if sellManager.simulations != 2 ||
+		buyManager.simulations != 1 ||
+		buyManager.broadcasts != 0 ||
+		sellManager.broadcasts != 0 {
+		t.Fatalf(
+			"simulations buy=%d sell=%d broadcasts=%d/%d",
+			buyManager.simulations,
+			sellManager.simulations,
+			buyManager.broadcasts,
+			sellManager.broadcasts,
+		)
+	}
+}
+
+func TestPrefundedPreflightRejectsInsufficientPhysicalDestinationInventory(t *testing.T) {
+	now := time.Now().UTC()
+	plan := prefundedPreflightPlan(t, now)
+	buyValidator := &fixedOutputValidator{
+		now: now, output: big.NewInt(4_052_168_781),
+	}
+	sellValidator := &fixedOutputValidator{
+		now: now, output: big.NewInt(1_010_000),
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account", Validator: buyValidator,
+				TxManager: &settledTxManager{},
+			},
+			"market-b": {
+				Account: "account", Validator: sellValidator,
+				TxManager: &settledTxManager{},
+				SpendableBalance: livecanary.SpendableBalanceReaderFunc(
+					func(
+						context.Context,
+						market.TokenID,
+					) (*big.Int, error) {
+						return big.NewInt(1), nil
+					},
+				),
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9,
+			"base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8,
+		Clock:           func() time.Time { return now },
+	}
+	err := driver.Preflight(
+		context.Background(),
+		"operation",
+		plan,
+	)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"prefunded destination inventory is insufficient",
+		) ||
+		sellValidator.calls != 0 {
+		t.Fatalf(
+			"inventory preflight error=%v sell_validations=%d",
+			err,
+			sellValidator.calls,
+		)
+	}
+}
+
+func TestForcedPrefundedExitReportsFixedSlippageEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	plan := prefundedPreflightPlan(t, now)
+	plan.Opportunity.Reasons = []string{"forced_canary_direction"}
+	cost, _ := market.NewAssetQuantity("quote", big.NewRat(1, 100))
+	candidate := plan.Opportunity.Candidates[plan.Opportunity.SelectedIndex]
+	candidate.Cost = arbitrage.CostSnapshot{
+		ID: "admission-cost", Amount: cost, CapturedAt: now,
+	}
+	plan.Opportunity.Candidates[plan.Opportunity.SelectedIndex] = candidate
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-b": {
+				Account: "account",
+				Validator: &fixedOutputValidator{
+					now: now, output: big.NewInt(1_004_573),
+				},
+				TxManager: &settledTxManager{},
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9,
+			"base-b": 18, "quote-b": 6,
+		},
+		QuoteAsset: "quote",
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{
+			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+		},
+		Clock: func() time.Time { return now },
+	}
+	bought, _ := market.NewTokenAmount(
+		"base-a",
+		big.NewInt(4_836_579_243),
+	)
+	decision, err := driver.SelectPrefundedExit(
+		context.Background(),
+		"operation",
+		plan,
+		bought,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(decision.Evidence, "fixed_slippage") ||
+		strings.Contains(decision.Evidence, "dynamic_slippage") {
+		t.Fatalf("misleading exit evidence: %s", decision.Evidence)
+	}
+}
+
 func TestSwapDriverKeepsFreshProfitableDestinationExitAndReusesIt(t *testing.T) {
 	now := time.Now().UTC()
 	plan := preflightPlan(t, now)
@@ -1169,8 +1502,10 @@ func TestSwapDriverReturnsToOriginWhenDestinationLiquidationIsUnavailable(t *tes
 				execution.ExitReturnToOrigin: returnCost,
 			},
 		},
-		Clock:  func() time.Time { return now },
-		Output: &output,
+		Clock:                    func() time.Time { return now },
+		Output:                   &output,
+		ExitValidationAttempts:   15,
+		ExitValidationRetryDelay: time.Nanosecond,
 	}
 	bridged, _ := market.NewTokenAmount(
 		"base-b", big.NewInt(4_000_000_000_000_000_000),
@@ -1187,9 +1522,9 @@ func TestSwapDriverReturnsToOriginWhenDestinationLiquidationIsUnavailable(t *tes
 		t.Fatalf("unexpected forced-return decision: %+v", decision)
 	}
 	logged := output.String()
-	if strings.Count(logged, "status=failed") != 2 ||
+	if strings.Count(logged, "status=failed") != 15 ||
 		!strings.Contains(logged, "quote/build preparation: route unavailable") ||
-		!strings.Contains(logged, "status=unavailable attempts=2") {
+		!strings.Contains(logged, "status=unavailable attempts=15") {
 		t.Fatalf("destination failure detail was not logged:\n%s", logged)
 	}
 }
@@ -1232,8 +1567,10 @@ func TestSwapDriverRetriesDestinationQuoteBeforeReturningToOrigin(t *testing.T) 
 				execution.ExitReturnToOrigin:    cost,
 			},
 		},
-		Clock:  func() time.Time { return now },
-		Output: &output,
+		Clock:                    func() time.Time { return now },
+		Output:                   &output,
+		ExitValidationAttempts:   15,
+		ExitValidationRetryDelay: time.Nanosecond,
 	}
 	bridged, _ := market.NewTokenAmount(
 		"base-b", big.NewInt(4_000_000_000_000_000_000),
@@ -1257,9 +1594,9 @@ func TestSwapDriverRetriesDestinationQuoteBeforeReturningToOrigin(t *testing.T) 
 	logged := output.String()
 	if !strings.Contains(
 		logged,
-		`status=failed attempt=1/2 error="quote/build preparation: temporary quote failure"`,
+		`status=failed attempt=1/15 error="quote/build preparation: temporary quote failure"`,
 	) ||
-		!strings.Contains(logged, "status=ready attempt=2/2") {
+		!strings.Contains(logged, "status=ready attempt=2/15") {
 		t.Fatalf("retry detail was not logged:\n%s", logged)
 	}
 }
@@ -1443,6 +1780,26 @@ func preflightPlan(
 		"chain-a",
 		"chain-b",
 		now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func prefundedPreflightPlan(
+	t *testing.T,
+	now time.Time,
+) execution.SequentialPlan {
+	t.Helper()
+	transported := preflightPlan(t, now)
+	plan, err := execution.NewPrefundedSequentialPlan(
+		transported.ID,
+		transported.Opportunity,
+		transported.InitialInput,
+		transported.Stages[0].SourceChain,
+		transported.Stages[2].SourceChain,
+		transported.CreatedAt,
 	)
 	if err != nil {
 		t.Fatal(err)

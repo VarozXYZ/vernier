@@ -20,7 +20,7 @@ import (
 	"github.com/VarozXYZ/vernier/domain/market"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 var environmentName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 
@@ -47,10 +47,25 @@ type Topology struct {
 }
 
 type Policy struct {
-	SchemaVersion int                       `yaml:"schema_version"`
-	Setups        map[string]SetupConfig    `yaml:"setups"`
-	Research      map[string]ResearchConfig `yaml:"research"`
-	Live          map[string]LiveConfig     `yaml:"live"`
+	SchemaVersion     int                               `yaml:"schema_version"`
+	Setups            map[string]SetupConfig            `yaml:"setups"`
+	Research          map[string]ResearchConfig         `yaml:"research"`
+	ExecutionPolicies map[string]ExecutionPolicyConfig  `yaml:"execution_policies"`
+	InventoryProfiles map[string]InventoryProfileConfig `yaml:"inventory_profiles"`
+	Live              map[string]LiveConfig             `yaml:"live"`
+}
+
+type ExecutionPolicyConfig struct {
+	Kind                string `yaml:"kind"`
+	ExitPolicy          string `yaml:"exit_policy"`
+	InventoryRestore    string `yaml:"inventory_restore"`
+	BaseTransferSource  string `yaml:"base_transfer_source"`
+	QuoteTransferSource string `yaml:"quote_transfer_source"`
+}
+
+type InventoryProfileConfig struct {
+	Kind     string                   `yaml:"kind"`
+	Balances []InventoryBalanceConfig `yaml:"balances"`
 }
 
 type ChainConfig struct {
@@ -203,6 +218,9 @@ type TelegramConfig struct {
 type LiveConfig struct {
 	RunID                         string                       `yaml:"run_id"`
 	Setup                         string                       `yaml:"setup"`
+	RunTier                       string                       `yaml:"run_tier"`
+	ExecutionPolicy               string                       `yaml:"execution_policy"`
+	InventoryProfile              string                       `yaml:"inventory_profile"`
 	InventoryMode                 string                       `yaml:"inventory_mode"`
 	ExecutionMode                 string                       `yaml:"execution_mode"`
 	Notional                      AmountConfig                 `yaml:"notional"`
@@ -236,6 +254,8 @@ type LiveConfig struct {
 	EVMDeadlineSeconds            int                          `yaml:"evm_deadline_seconds"`
 	EVMGas                        EVMGasConfig                 `yaml:"evm_gas"`
 	DynamicSlippage               DynamicSlippageConfig        `yaml:"dynamic_slippage"`
+	ExitValidationAttempts        int                          `yaml:"exit_validation_attempts"`
+	ExitValidationRetryDelayMS    int                          `yaml:"exit_validation_retry_delay_ms"`
 	OperationalStore              OperationalStoreConfig       `yaml:"operational_store"`
 	Accounts                      map[string]LiveAccountConfig `yaml:"accounts"`
 	Inventory                     []InventoryBalanceConfig     `yaml:"inventory"`
@@ -288,10 +308,13 @@ type ERC20StateOverrideConfig struct {
 }
 
 type InventoryBalanceConfig struct {
-	Chain   string `yaml:"chain"`
-	Account string `yaml:"account"`
-	Token   string `yaml:"token"`
-	Amount  string `yaml:"amount"`
+	Chain         string `yaml:"chain"`
+	Account       string `yaml:"account"`
+	Token         string `yaml:"token"`
+	Amount        string `yaml:"amount"`
+	AllocationCap string `yaml:"allocation_cap"`
+	Target        string `yaml:"target"`
+	Buffer        string `yaml:"buffer"`
 }
 
 type AmountConfig struct {
@@ -446,10 +469,15 @@ type ResolvedLiveAccount struct {
 }
 
 type ResolvedInventoryBalance struct {
-	Chain   string
-	Account string
-	Token   market.Token
-	Amount  *big.Rat
+	Chain         string
+	Account       string
+	Token         market.Token
+	AllocationCap *big.Rat
+	Target        *big.Rat
+	Buffer        *big.Rat
+	// Amount is retained as an immutable alias for AllocationCap while
+	// callers migrate to wallet-backed observations.
+	Amount *big.Rat
 }
 
 type ParsedLiveConfig struct {
@@ -462,6 +490,11 @@ type ParsedLiveConfig struct {
 	Markets                       [2]ResolvedMarket
 	QuoteSources                  map[string]ResolvedQuoteSource
 	TransferSources               map[string]ResolvedTransferSource
+	ExecutionPolicyID             string
+	ExecutionPolicyKind           string
+	InventoryProfileID            string
+	InventoryKind                 string
+	RunTier                       string
 	ExecutionMode                 string
 	Notional                      *big.Rat
 	CanaryInput                   *big.Rat
@@ -494,6 +527,8 @@ type ParsedLiveConfig struct {
 	EVMDeadline                   time.Duration
 	EVMGas                        ResolvedEVMGasPolicy
 	DynamicSlippage               ResolvedDynamicSlippage
+	ExitValidationAttempts        int
+	ExitValidationRetryDelay      time.Duration
 	OperationalStorePath          string
 	SQLiteSynchronous             string
 	Accounts                      map[string]ResolvedLiveAccount
@@ -558,9 +593,15 @@ func loadDocuments(path string) (Manifest, Topology, Policy, error) {
 	if err := decodeYAML(manifestData, &manifest); err != nil {
 		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("decode configuration manifest: %w", err)
 	}
-	if manifest.SchemaVersion != schemaVersion || strings.TrimSpace(manifest.Topology) == "" ||
+	if manifest.SchemaVersion != schemaVersion {
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf(
+			"unsupported configuration schema version %d; schema v2 is required",
+			manifest.SchemaVersion,
+		)
+	}
+	if strings.TrimSpace(manifest.Topology) == "" ||
 		strings.TrimSpace(manifest.Policy) == "" {
-		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("manifest requires schema version, topology, and policy")
+		return Manifest{}, Topology{}, Policy{}, fmt.Errorf("manifest requires topology and policy")
 	}
 	directory := filepath.Dir(path)
 	topologyData, err := os.ReadFile(filepath.Join(directory, manifest.Topology))
@@ -829,18 +870,102 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 
 func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiveConfig, error) {
 	config, ok := policy.Live[manifest.ActiveLive]
-	if !ok || strings.TrimSpace(config.RunID) == "" || config.InventoryMode != "prefunded_live" {
-		return ParsedLiveConfig{}, fmt.Errorf("active live profile requires a run ID and prefunded_live inventory")
+	if !ok || strings.TrimSpace(config.RunID) == "" {
+		return ParsedLiveConfig{}, fmt.Errorf("active live profile requires a run ID")
+	}
+	executionPolicyID := strings.TrimSpace(config.ExecutionPolicy)
+	inventoryProfileID := strings.TrimSpace(config.InventoryProfile)
+	executionPolicy, policyOK := policy.ExecutionPolicies[executionPolicyID]
+	inventoryProfile, inventoryOK := policy.InventoryProfiles[inventoryProfileID]
+	if executionPolicyID != "" || inventoryProfileID != "" {
+		if !policyOK || !inventoryOK {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"active live profile references an unknown execution policy or inventory profile",
+			)
+		}
+		config.ExecutionMode = strings.TrimSpace(executionPolicy.Kind)
+		config.InventoryMode = strings.TrimSpace(inventoryProfile.Kind)
+		config.BaseTransferSource = executionPolicy.BaseTransferSource
+		config.QuoteTransferSource = executionPolicy.QuoteTransferSource
+		config.Inventory = append(
+			[]InventoryBalanceConfig(nil), inventoryProfile.Balances...,
+		)
+		switch config.ExecutionMode {
+		case "transported_sequential":
+			if executionPolicy.ExitPolicy !=
+				"post_bridge_destination_with_return_fallback" {
+				return ParsedLiveConfig{}, fmt.Errorf(
+					"transported execution policy has an invalid exit_policy",
+				)
+			}
+		case "prefunded_sequential":
+			if executionPolicy.ExitPolicy !=
+				"destination_first_origin_circuit_breaker" ||
+				executionPolicy.InventoryRestore != "immediate_ordered" {
+				return ParsedLiveConfig{}, fmt.Errorf(
+					"prefunded sequential policy requires destination-first exit and immediate ordered restoration",
+				)
+			}
+		case "prefunded_parallel":
+		default:
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"unsupported execution policy kind %q", config.ExecutionMode,
+			)
+		}
 	}
 	executionMode := strings.TrimSpace(config.ExecutionMode)
 	if executionMode == "" {
-		executionMode = "prefunded_parallel"
+		if config.InventoryMode == "prefunded_live" {
+			executionMode = "prefunded_parallel"
+		} else {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"active live profile requires an execution_policy",
+			)
+		}
 	}
-	sequentialCanary := executionMode == "sequential_bridge_canary"
-	sequentialLive := executionMode == "sequential_bridge_live"
-	sequential := sequentialCanary || sequentialLive
+	// Old execution names are accepted only inside a schema-v2 document while
+	// private deployments transition their non-public configuration. Schema v1
+	// is rejected before resolution.
+	if executionMode == "sequential_bridge_canary" {
+		executionMode = "transported_sequential"
+		if config.RunTier == "" {
+			config.RunTier = "canary"
+		}
+	}
+	if executionMode == "sequential_bridge_live" {
+		executionMode = "transported_sequential"
+		if config.RunTier == "" {
+			config.RunTier = "live"
+		}
+	}
+	runTier := strings.TrimSpace(config.RunTier)
+	if runTier == "" {
+		runTier = "live"
+	}
+	if runTier != "canary" && runTier != "live" {
+		return ParsedLiveConfig{}, fmt.Errorf("live run_tier must be canary or live")
+	}
+	sequential := executionMode == "transported_sequential" ||
+		executionMode == "prefunded_sequential"
+	sequentialCanary := sequential && runTier == "canary"
+	sequentialLive := sequential && runTier == "live"
 	if executionMode != "prefunded_parallel" && !sequential {
 		return ParsedLiveConfig{}, fmt.Errorf("unsupported live execution mode %q", executionMode)
+	}
+	if executionMode == "transported_sequential" &&
+		config.InventoryMode != "transported" &&
+		config.InventoryMode != "prefunded_live" {
+		return ParsedLiveConfig{}, fmt.Errorf(
+			"transported sequential execution requires transported inventory",
+		)
+	}
+	if (executionMode == "prefunded_sequential" ||
+		executionMode == "prefunded_parallel") &&
+		config.InventoryMode != "prefunded" &&
+		config.InventoryMode != "prefunded_live" {
+		return ParsedLiveConfig{}, fmt.Errorf(
+			"prefunded execution requires prefunded inventory",
+		)
 	}
 	setup, ok := policy.Setups[config.Setup]
 	if !ok || len(setup.Markets) != 2 || setup.Markets[0] == setup.Markets[1] {
@@ -1033,6 +1158,26 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 			"live dynamic slippage max_bps must be <= 2000",
 		)
 	}
+	exitValidationAttempts := config.ExitValidationAttempts
+	if exitValidationAttempts == 0 {
+		exitValidationAttempts = 15
+	}
+	if exitValidationAttempts < 1 || exitValidationAttempts > 30 {
+		return ParsedLiveConfig{}, fmt.Errorf(
+			"live exit_validation_attempts must be between 1 and 30",
+		)
+	}
+	exitValidationRetryDelay := time.Duration(
+		config.ExitValidationRetryDelayMS,
+	) * time.Millisecond
+	if exitValidationRetryDelay == 0 {
+		exitValidationRetryDelay = 100 * time.Millisecond
+	}
+	if exitValidationRetryDelay < 0 || exitValidationRetryDelay > 5*time.Second {
+		return ParsedLiveConfig{}, fmt.Errorf(
+			"live exit_validation_retry_delay_ms must be between 0 and 5000",
+		)
+	}
 	if hasSolana {
 		tip, ok := new(big.Int).SetString(config.TipLamports, 10)
 		if !ok || tip.Sign() <= 0 {
@@ -1188,7 +1333,8 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 				account.ID,
 			)
 		}
-		if legacyTransfers {
+		if legacyTransfers &&
+			executionMode == "transported_sequential" {
 			switch chain.Kind {
 			case "solana":
 				if !environmentName.MatchString(account.SellPreflightAddressEnv) ||
@@ -1253,18 +1399,43 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	for _, balance := range config.Inventory {
 		account, accountOK := accounts[balance.Chain]
 		token, tokenOK := tokenByID[balance.Token]
-		amount, amountOK := new(big.Rat).SetString(balance.Amount)
-		if !accountOK || account.ID != balance.Account || !tokenOK || token.Chain != market.ChainID(balance.Chain) ||
-			!amountOK || amount.Sign() <= 0 {
+		accountID := strings.TrimSpace(balance.Account)
+		if accountID == "" && accountOK {
+			accountID = account.ID
+		}
+		capText := strings.TrimSpace(balance.AllocationCap)
+		if capText == "" {
+			capText = balance.Amount
+		}
+		allocationCap, capOK := new(big.Rat).SetString(capText)
+		target, targetOK := new(big.Rat).SetString(balance.Target)
+		if strings.TrimSpace(balance.Target) == "" {
+			target = new(big.Rat).Set(allocationCap)
+			targetOK = capOK
+		}
+		buffer, bufferOK := new(big.Rat).SetString(balance.Buffer)
+		if strings.TrimSpace(balance.Buffer) == "" {
+			buffer = new(big.Rat)
+			bufferOK = true
+		}
+		if !accountOK || account.ID != accountID || !tokenOK || token.Chain != market.ChainID(balance.Chain) ||
+			!capOK || allocationCap.Sign() <= 0 ||
+			!targetOK || target.Sign() < 0 || target.Cmp(allocationCap) > 0 ||
+			!bufferOK || buffer.Sign() < 0 || buffer.Cmp(allocationCap) >= 0 {
 			return ParsedLiveConfig{}, fmt.Errorf("live inventory balance is invalid")
 		}
-		key := balance.Chain + "/" + balance.Account + "/" + balance.Token
+		if account.ID != accountID {
+			return ParsedLiveConfig{}, fmt.Errorf("live inventory account is invalid")
+		}
+		key := balance.Chain + "/" + accountID + "/" + balance.Token
 		if covered[key] {
 			return ParsedLiveConfig{}, fmt.Errorf("live inventory repeats balance %q", key)
 		}
 		covered[key] = true
 		inventoryBalances = append(inventoryBalances, ResolvedInventoryBalance{
-			Chain: balance.Chain, Account: balance.Account, Token: token, Amount: amount,
+			Chain: balance.Chain, Account: accountID, Token: token,
+			AllocationCap: allocationCap, Target: target, Buffer: buffer,
+			Amount: allocationCap,
 		})
 	}
 	for _, configuredMarket := range markets {
@@ -1273,7 +1444,7 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 			configuredMarket.Base.Token,
 			configuredMarket.Quote.Token,
 		}
-		if sequential {
+		if executionMode == "transported_sequential" {
 			requiredTokens = []market.Token{configuredMarket.Quote.Token}
 		}
 		for _, token := range requiredTokens {
@@ -1297,7 +1468,12 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		Hash: hex.EncodeToString(sum[:]), LiveID: manifest.ActiveLive, RunID: config.RunID,
 		SetupID: config.Setup, Assets: assets, Chains: chains, Markets: markets,
 		QuoteSources: quoteSources, TransferSources: transferSources,
-		ExecutionMode: executionMode, Notional: notional, CanaryInput: canaryInput,
+		ExecutionPolicyID:   executionPolicyID,
+		ExecutionPolicyKind: executionMode,
+		InventoryProfileID:  inventoryProfileID,
+		InventoryKind:       config.InventoryMode,
+		RunTier:             runTier,
+		ExecutionMode:       executionMode, Notional: notional, CanaryInput: canaryInput,
 		ExecutionInput:       executionInput,
 		MaxOperationsPerRun:  config.MaxOperationsPerRun,
 		BaseTransferSource:   baseTransfer,
@@ -1320,13 +1496,15 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		AcrossCostCalibrationStore: strings.TrimSpace(config.AcrossCostCalibrationStore),
 		SlippageBPS:                config.SlippageBPS, TipLamports: config.TipLamports,
 		ComputeUnitPricePercentile: config.ComputeUnitPricePercentile, ComputeUnitLimit: config.ComputeUnitLimit,
-		MaxPriorityFeeLamports:  config.MaxPriorityFeeLamports,
-		BlockhashSlotsToExpiry:  config.BlockhashSlotsToExpiry,
-		BuildToBroadcastTimeout: time.Duration(config.BuildToBroadcastTimeoutMS) * time.Millisecond,
-		EVMDeadline:             time.Duration(config.EVMDeadlineSeconds) * time.Second,
-		EVMGas:                  evmGas,
-		DynamicSlippage:         dynamicSlippage,
-		OperationalStorePath:    config.OperationalStore.Path, SQLiteSynchronous: synchronous,
+		MaxPriorityFeeLamports:   config.MaxPriorityFeeLamports,
+		BlockhashSlotsToExpiry:   config.BlockhashSlotsToExpiry,
+		BuildToBroadcastTimeout:  time.Duration(config.BuildToBroadcastTimeoutMS) * time.Millisecond,
+		EVMDeadline:              time.Duration(config.EVMDeadlineSeconds) * time.Second,
+		EVMGas:                   evmGas,
+		DynamicSlippage:          dynamicSlippage,
+		ExitValidationAttempts:   exitValidationAttempts,
+		ExitValidationRetryDelay: exitValidationRetryDelay,
+		OperationalStorePath:     config.OperationalStore.Path, SQLiteSynchronous: synchronous,
 		Accounts: accounts, Inventory: inventoryBalances,
 		GasRefuel: refuel,
 	}, nil

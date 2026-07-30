@@ -16,9 +16,10 @@ import (
 )
 
 type Planner struct {
-	MarketChains   map[market.MarketID]market.ChainID
-	ExecutionUnits *big.Int
-	Clock          func() time.Time
+	MarketChains    map[market.MarketID]market.ChainID
+	ExecutionUnits  *big.Int
+	ExecutionPolicy execution.ExecutionPolicyKind
+	Clock           func() time.Time
 }
 
 func (p Planner) Plan(
@@ -49,10 +50,22 @@ func (p Planner) Plan(
 	if clock == nil {
 		clock = time.Now
 	}
-	return execution.NewSequentialPlan(
-		execution.PlanID(id), opportunity, initial,
-		buyChain, sellChain, clock().UTC(),
-	)
+	switch p.ExecutionPolicy {
+	case "", execution.PolicyTransportedSequential:
+		return execution.NewSequentialPlan(
+			execution.PlanID(id), opportunity, initial,
+			buyChain, sellChain, clock().UTC(),
+		)
+	case execution.PolicyPrefundedSequential:
+		return execution.NewPrefundedSequentialPlan(
+			execution.PlanID(id), opportunity, initial,
+			buyChain, sellChain, clock().UTC(),
+		)
+	default:
+		return execution.SequentialPlan{}, fmt.Errorf(
+			"unsupported dependent execution policy %q", p.ExecutionPolicy,
+		)
+	}
 }
 
 func newOperationID() (execution.OperationID, error) {

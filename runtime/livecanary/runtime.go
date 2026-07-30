@@ -466,6 +466,64 @@ func (r *Runtime) SetPostFlowRefresh(refresh func(context.Context) error) {
 	r.postFlowRefresh = refresh
 }
 
+// RecoverOnly reconciles and resumes one durable operation, then exits before
+// starting feeds or admitting a new opportunity.
+func (r *Runtime) RecoverOnly(ctx context.Context) error {
+	startupState := RuntimeGateStarting
+	if r.refuel != nil {
+		if err := r.gate.Transition(
+			startupState,
+			RuntimeGateRefueling,
+		); err != nil {
+			return err
+		}
+		startupState = RuntimeGateRefueling
+		if err := r.refuel.ReconcileActive(ctx); err != nil {
+			_ = r.gate.Transition(
+				RuntimeGateRefueling,
+				RuntimeGateRecoveryBlocked,
+			)
+			return err
+		}
+	}
+	if r.recovery == nil {
+		return fmt.Errorf("sequential recovery is unavailable")
+	}
+	if err := r.gate.Transition(
+		startupState,
+		RuntimeGateRecovering,
+	); err != nil {
+		return err
+	}
+	recovered, found, err := r.recovery.RecoverActive(ctx)
+	if err != nil {
+		_ = r.gate.Transition(
+			RuntimeGateRecovering,
+			RuntimeGateRecoveryBlocked,
+		)
+		return err
+	}
+	if found {
+		fmt.Fprintf(
+			r.output,
+			"live_recovery operation=%s status=completed stages=%d final_units=%s\n",
+			recovered.Operation,
+			len(recovered.Settlements),
+			recovered.FinalAmount,
+		)
+	} else {
+		fmt.Fprintln(r.output, "live_recovery status=idle active_operation=false")
+	}
+	if err := r.gate.Transition(
+		RuntimeGateRecovering,
+		RuntimeGateIdle,
+	); err != nil {
+		return err
+	}
+	r.stopGate()
+	return nil
+}
+
 func (r *Runtime) SetRecovery(recovery sequentialRecovery) {
 	r.recovery = recovery
 }

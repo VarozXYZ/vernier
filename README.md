@@ -166,7 +166,7 @@ Both `config/*/` and `.env.*` are ignored by Git.
 `vernier.yaml` is the manifest:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 topology: topology.yaml
 policy: policy.yaml
 active_research: private_research
@@ -188,7 +188,7 @@ active_research: private_research
 The private pair is defined in `policy.yaml` by referencing two market IDs:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 
 setups:
   private_pair:
@@ -209,9 +209,67 @@ research:
       samples: 10
 ```
 
+Live schema v2 composes a compiled execution policy and an inventory profile.
+Switching `active_live` changes both without turning YAML into a workflow
+language:
+
+```yaml
+execution_policies:
+  transported:
+    kind: transported_sequential
+    exit_policy: post_bridge_destination_with_return_fallback
+    base_transfer_source: transfer_base
+    quote_transfer_source: transfer_quote
+  prefunded:
+    kind: prefunded_sequential
+    exit_policy: destination_first_origin_circuit_breaker
+    inventory_restore: immediate_ordered
+    base_transfer_source: transfer_base
+    quote_transfer_source: transfer_quote
+
+inventory_profiles:
+  dual_prefunded:
+    kind: prefunded
+    balances:
+      - {chain: chain_alpha, token: base_alpha, allocation_cap: "10", target: "8", buffer: "1"}
+      - {chain: chain_alpha, token: quote_alpha, allocation_cap: "100", target: "80", buffer: "10"}
+      - {chain: chain_beta, token: base_beta, allocation_cap: "10", target: "8", buffer: "1"}
+      - {chain: chain_beta, token: quote_beta, allocation_cap: "100", target: "80", buffer: "10"}
+
+live:
+  prefunded_live:
+    run_id: private-live
+    setup: private_pair
+    run_tier: canary
+    execution_policy: prefunded
+    inventory_profile: dual_prefunded
+    # transaction, risk, account, and persistence policies omitted
+```
+
 Both markets must resolve to the same base and quote asset IDs. Their tokens,
 chains, protocols, and paths may differ. Endpoints, API keys, and account
 values belong in `.env.my_setup` or another secret provider, not in YAML.
+
+For an EVM Live account, `fanout_rpc_urls_env` names an environment variable
+whose value is a comma-, semicolon-, or newline-separated RPC list. Vernier
+removes exact duplicates, broadcasts the same signed transaction to every
+endpoint concurrently, and accepts the first endpoint that returns success or
+same-transaction evidence such as `already known`. Each fanout request has a
+bounded timeout, so a slow provider cannot block the others. The normal chain
+HTTP endpoint remains the sole source for nonce, fees, simulation, and
+balances. Fanout endpoints are checked for the expected chain ID at startup
+and queried concurrently for receipts after broadcast. The normal HTTP
+endpoint is always included in the fanout and exact duplicates are removed.
+
+Every send attempt emits its opaque endpoint index, acceptance status,
+classified result, same-transaction evidence, and latency. Endpoint labels are
+mapped by their order in the configured list and include only a sanitized
+hostname, never an RPC path or API key.
+
+The chain WebSocket subscription is warmed before broadcast. An inbound ERC-20
+transfer log provides fast inclusion evidence, while the full receipt remains
+the source of gas cost and net wallet deltas. If WebSocket setup or delivery
+fails, parallel receipt polling remains active.
 
 The [public reference setup](examples/setups/virtual/) contains a complete EVM
 example. It is useful as a schema reference; its topology and policy should not
