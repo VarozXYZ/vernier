@@ -31,17 +31,26 @@ type RouteBuilder interface {
 }
 
 type Config struct {
-	ID                  market.SourceID
-	ChainSlug           string
-	Sender              common.Address
-	TokenAddresses      map[market.TokenID]string
-	SlippageBPS         uint16
-	EnableGasEstimation bool
-	GasMultiplierBPS    uint64
-	Source              RouteBuilder
-	Simulator           Simulator
-	Clock               func() time.Time
+	ID                         market.SourceID
+	ChainSlug                  string
+	Sender                     common.Address
+	TokenAddresses             map[market.TokenID]string
+	SlippageBPS                uint16
+	GasExecutionMode           string
+	FixedExecutionGasLimit     uint64
+	GasEstimationMultiplierBPS uint64
+	GasCostMode                string
+	FixedCostGasLimit          uint64
+	Source                     RouteBuilder
+	Simulator                  Simulator
+	Clock                      func() time.Time
 }
+
+const (
+	DefaultSwapGasLimit        uint64 = 1_500_000
+	DefaultSwapExpectedGasUsed uint64 = 1_000_000
+	defaultGasMultiplierBPS    uint64 = 12_000
+)
 
 type Validator struct {
 	config Config
@@ -65,11 +74,46 @@ func New(config Config) (*Validator, error) {
 	if config.SlippageBPS > 2_000 {
 		return nil, fmt.Errorf("KyberSwap validator slippage is invalid")
 	}
-	if config.GasMultiplierBPS == 0 {
-		config.GasMultiplierBPS = 12_000
+	if config.GasExecutionMode == "" {
+		config.GasExecutionMode = "estimate"
 	}
-	if config.GasMultiplierBPS < 10_000 {
-		return nil, fmt.Errorf("KyberSwap gas multiplier cannot reduce simulated gas")
+	if config.GasEstimationMultiplierBPS == 0 {
+		config.GasEstimationMultiplierBPS = defaultGasMultiplierBPS
+	}
+	if config.GasExecutionMode != "estimate" &&
+		config.GasExecutionMode != "fixed" {
+		return nil, fmt.Errorf("KyberSwap gas execution mode is invalid")
+	}
+	if config.GasEstimationMultiplierBPS < 10_000 {
+		return nil, fmt.Errorf(
+			"KyberSwap gas estimation multiplier cannot reduce gas",
+		)
+	}
+	if config.GasExecutionMode == "fixed" &&
+		config.FixedExecutionGasLimit == 0 {
+		return nil, fmt.Errorf(
+			"KyberSwap fixed execution gas limit is required",
+		)
+	}
+	if config.GasCostMode == "" {
+		config.GasCostMode = "estimated"
+	}
+	switch config.GasCostMode {
+	case "estimated":
+		if config.GasExecutionMode != "estimate" {
+			return nil, fmt.Errorf(
+				"KyberSwap estimated cost gas requires estimated execution gas",
+			)
+		}
+	case "transaction_limit":
+	case "fixed":
+		if config.FixedCostGasLimit == 0 {
+			return nil, fmt.Errorf(
+				"KyberSwap fixed cost gas limit is required",
+			)
+		}
+	default:
+		return nil, fmt.Errorf("KyberSwap gas cost mode is invalid")
 	}
 	if config.Clock == nil {
 		config.Clock = time.Now
@@ -116,7 +160,7 @@ func (v *Validator) Validate(
 			Route: route, Sender: v.config.Sender.Hex(),
 			Recipient: v.config.Sender.Hex(), Origin: v.config.Sender.Hex(),
 			SlippageBPS:         v.config.SlippageBPS,
-			EnableGasEstimation: v.config.EnableGasEstimation,
+			EnableGasEstimation: false,
 		})
 		if err == nil {
 			router = common.HexToAddress(built.RouterAddress)
@@ -133,7 +177,7 @@ func (v *Validator) Validate(
 				From: v.config.Sender, To: &router, Value: value, Data: calldata,
 			}
 			validationPhase := "simulate"
-			if _, err = v.config.Simulator.CallContract(ctx, call, nil); err == nil {
+			if _, err = v.config.Simulator.CallContract(ctx, call, nil); err == nil && v.config.GasExecutionMode == "estimate" {
 				validationPhase = "estimate gas for"
 				estimatedGas, err = v.config.Simulator.EstimateGas(ctx, call)
 			}
@@ -169,9 +213,9 @@ func (v *Validator) Validate(
 		}
 		return executionport.Artifact{}, fmt.Errorf("KyberSwap build: %w", err)
 	}
-	gasLimit := estimatedGas * v.config.GasMultiplierBPS / 10_000
-	if gasLimit < estimatedGas || gasLimit == 0 {
-		return executionport.Artifact{}, fmt.Errorf("KyberSwap gas limit overflow")
+	gasLimit, expectedGas, err := v.resolveGas(estimatedGas)
+	if err != nil {
+		return executionport.Artifact{}, err
 	}
 	outputUnits, ok := new(big.Int).SetString(built.AmountOut, 10)
 	if !ok || outputUnits.Sign() <= 0 {
@@ -200,12 +244,104 @@ func (v *Validator) Validate(
 		Metadata: map[string]string{
 			"kind": "kyberswap_route_build",
 			"to":   router.Hex(), "value": value.String(),
-			"gas_limit":      new(big.Int).SetUint64(gasLimit).String(),
-			"estimated_gas":  new(big.Int).SetUint64(estimatedGas).String(),
-			"build_attempts": strconv.Itoa(buildAttempts),
+			"gas_limit":         strconv.FormatUint(gasLimit, 10),
+			"expected_gas_used": strconv.FormatUint(expectedGas, 10),
+			"build_attempts":    strconv.Itoa(buildAttempts),
 		},
 		BuiltAt: now,
 	}, nil
+}
+
+func (v *Validator) resolveGas(estimated uint64) (uint64, uint64, error) {
+	var gasLimit uint64
+	switch v.config.GasExecutionMode {
+	case "fixed":
+		gasLimit = v.config.FixedExecutionGasLimit
+	case "estimate":
+		if estimated == 0 {
+			return 0, 0, fmt.Errorf(
+				"KyberSwap gas estimation returned zero",
+			)
+		}
+		var err error
+		gasLimit, err = scaleGasLimit(
+			estimated,
+			v.config.GasEstimationMultiplierBPS,
+		)
+		if err != nil {
+			return 0, 0, err
+		}
+	default:
+		return 0, 0, fmt.Errorf("KyberSwap gas execution mode is invalid")
+	}
+	var expected uint64
+	switch v.config.GasCostMode {
+	case "estimated":
+		expected = estimated
+	case "transaction_limit":
+		expected = gasLimit
+	case "fixed":
+		expected = v.config.FixedCostGasLimit
+	default:
+		return 0, 0, fmt.Errorf("KyberSwap gas cost mode is invalid")
+	}
+	if expected == 0 {
+		return 0, 0, fmt.Errorf("KyberSwap expected gas usage is zero")
+	}
+	return gasLimit, expected, nil
+}
+
+// EstimateNetworkGas supplies cost probes with policy-consistent gas evidence.
+// Fixed policies perform no provider or RPC request.
+func (v *Validator) EstimateNetworkGas(
+	ctx context.Context,
+	leg market.TokenAmount,
+	outputToken market.TokenID,
+) (uint64, error) {
+	switch v.config.GasCostMode {
+	case "fixed":
+		return v.config.FixedCostGasLimit, nil
+	case "transaction_limit":
+		if v.config.GasExecutionMode == "fixed" {
+			return v.config.FixedExecutionGasLimit, nil
+		}
+	}
+	inputAddress := v.config.TokenAddresses[leg.Token()]
+	outputAddress := v.config.TokenAddresses[outputToken]
+	if inputAddress == "" || outputAddress == "" || leg.IsZero() {
+		return 0, fmt.Errorf("KyberSwap route gas probe tokens are invalid")
+	}
+	route, err := v.config.Source.Route(ctx, quoteadapter.RouteRequest{
+		Chain: v.config.ChainSlug, TokenIn: inputAddress,
+		TokenOut: outputAddress, AmountIn: leg.String(),
+		Origin: v.config.Sender.Hex(),
+	})
+	if err != nil {
+		return 0, err
+	}
+	estimated, err := strconv.ParseUint(strings.TrimSpace(route.Gas), 10, 64)
+	if err != nil || estimated == 0 {
+		return 0, fmt.Errorf("KyberSwap route has no gas estimate")
+	}
+	if v.config.GasCostMode == "transaction_limit" {
+		return scaleGasLimit(
+			estimated,
+			v.config.GasEstimationMultiplierBPS,
+		)
+	}
+	return estimated, nil
+}
+
+func scaleGasLimit(estimated, multiplierBPS uint64) (uint64, error) {
+	if estimated == 0 || multiplierBPS < 10_000 ||
+		estimated > ^uint64(0)/multiplierBPS {
+		return 0, fmt.Errorf("KyberSwap gas limit overflow")
+	}
+	limit := estimated * multiplierBPS / 10_000
+	if limit < estimated || limit == 0 {
+		return 0, fmt.Errorf("KyberSwap gas limit overflow")
+	}
+	return limit, nil
 }
 
 func classifyAllowanceFailure(err error, router common.Address) error {
@@ -220,35 +356,6 @@ func classifyAllowanceFailure(err error, router common.Address) error {
 		Spender: router.Hex(),
 		Err:     err,
 	}
-}
-
-// EstimateNetworkGas uses KyberSwap's route-level gas estimate without
-// constructing or simulating calldata. The complete-flow cost oracle uses it
-// only when a notional probe cannot pass transferFrom because the calibration
-// wallet is temporarily below the configured trading inventory.
-func (v *Validator) EstimateNetworkGas(
-	ctx context.Context,
-	leg market.TokenAmount,
-	outputToken market.TokenID,
-) (uint64, error) {
-	inputAddress := v.config.TokenAddresses[leg.Token()]
-	outputAddress := v.config.TokenAddresses[outputToken]
-	if inputAddress == "" || outputAddress == "" || leg.IsZero() {
-		return 0, fmt.Errorf("KyberSwap route gas probe tokens are invalid")
-	}
-	route, err := v.config.Source.Route(ctx, quoteadapter.RouteRequest{
-		Chain: v.config.ChainSlug, TokenIn: inputAddress,
-		TokenOut: outputAddress, AmountIn: leg.String(),
-		Origin: v.config.Sender.Hex(),
-	})
-	if err != nil {
-		return 0, err
-	}
-	gas, err := strconv.ParseUint(strings.TrimSpace(route.Gas), 10, 64)
-	if err != nil || gas == 0 {
-		return 0, fmt.Errorf("KyberSwap route has no gas estimate")
-	}
-	return gas, nil
 }
 
 func staleRouteBuildError(err error) bool {

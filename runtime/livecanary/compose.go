@@ -970,8 +970,15 @@ func composeEVMSwap(
 	validator, err := kyberexecution.New(kyberexecution.Config{
 		ID: "kyberswap/live-build", ChainSlug: source.ChainSlug,
 		Sender: sender, TokenAddresses: tokens,
-		SlippageBPS: config.Live.SlippageBPS, EnableGasEstimation: true,
-		Source: quoteSource, Simulator: primary, Clock: time.Now,
+		SlippageBPS:                config.Live.SlippageBPS,
+		GasExecutionMode:           config.Live.EVMGas.ExecutionMode,
+		FixedExecutionGasLimit:     config.Live.EVMGas.ExecutionFixedLimit,
+		GasEstimationMultiplierBPS: config.Live.EVMGas.EstimationMultiplierBPS,
+		GasCostMode:                config.Live.EVMGas.CostMode,
+		FixedCostGasLimit:          config.Live.EVMGas.CostFixedLimit,
+		Source:                     quoteSource,
+		Simulator:                  primary,
+		Clock:                      time.Now,
 	})
 	if err != nil {
 		return fail(err)
@@ -981,9 +988,15 @@ func composeEVMSwap(
 		refuelValidator, err = kyberexecution.New(kyberexecution.Config{
 			ID: "kyberswap/gas-refuel", ChainSlug: source.ChainSlug,
 			Sender: sender, TokenAddresses: tokens,
-			SlippageBPS:         config.Live.GasRefuel.SlippageBPS,
-			EnableGasEstimation: true,
-			Source:              quoteSource, Simulator: primary, Clock: time.Now,
+			SlippageBPS:                config.Live.GasRefuel.SlippageBPS,
+			GasExecutionMode:           config.Live.EVMGas.ExecutionMode,
+			FixedExecutionGasLimit:     config.Live.EVMGas.ExecutionFixedLimit,
+			GasEstimationMultiplierBPS: config.Live.EVMGas.EstimationMultiplierBPS,
+			GasCostMode:                config.Live.EVMGas.CostMode,
+			FixedCostGasLimit:          config.Live.EVMGas.CostFixedLimit,
+			Source:                     quoteSource,
+			Simulator:                  primary,
+			Clock:                      time.Now,
 		})
 		if err != nil {
 			return fail(err)
@@ -1201,15 +1214,19 @@ func composeEVMSellPreflight(
 		configured.Quote.Token.ID: configured.Quote.AddressText,
 	}
 	validator, err := kyberexecution.New(kyberexecution.Config{
-		ID:                  "kyberswap/sell-preflight",
-		ChainSlug:           source.ChainSlug,
-		Sender:              reference,
-		TokenAddresses:      tokens,
-		SlippageBPS:         config.Live.SlippageBPS,
-		EnableGasEstimation: false,
-		Source:              quoteSource,
-		Simulator:           simulator,
-		Clock:               time.Now,
+		ID:                         "kyberswap/sell-preflight",
+		ChainSlug:                  source.ChainSlug,
+		Sender:                     reference,
+		TokenAddresses:             tokens,
+		SlippageBPS:                config.Live.SlippageBPS,
+		GasExecutionMode:           config.Live.EVMGas.ExecutionMode,
+		FixedExecutionGasLimit:     config.Live.EVMGas.ExecutionFixedLimit,
+		GasEstimationMultiplierBPS: config.Live.EVMGas.EstimationMultiplierBPS,
+		GasCostMode:                config.Live.EVMGas.CostMode,
+		FixedCostGasLimit:          config.Live.EVMGas.CostFixedLimit,
+		Source:                     quoteSource,
+		Simulator:                  simulator,
+		Clock:                      time.Now,
 	})
 	if err != nil {
 		primary.Close()

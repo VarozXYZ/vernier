@@ -122,6 +122,13 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 	if primary.calls.Load() != warmCalls {
 		t.Fatal("Prepare performed a network call instead of using preloaded nonce and fees")
 	}
+	var signed types.Transaction
+	if err := signed.UnmarshalBinary(prepared.SignedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if signed.Gas() != 90_000 {
+		t.Fatalf("signed transaction gas limit = %d; want 90000", signed.Gas())
+	}
 	if prepared.Identity.Nonce == nil || *prepared.Identity.Nonce != 9 || prepared.Identity.Hash == "" {
 		t.Fatalf("prepared identity = %+v", prepared.Identity)
 	}
@@ -161,5 +168,41 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 		failed.sent[0].Hash() != accepted.sent[0].Hash() ||
 		failed.sent[0].Hash().Hex() != prepared.Identity.Hash {
 		t.Fatal("fanout endpoints did not receive the same signed transaction")
+	}
+}
+
+func TestEVMTxManagerValuesExpectedGasInsteadOfTransactionLimit(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainID := big.NewInt(12345)
+	primary := &txClientStub{chainID: chainID}
+	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
+		Chain: "evm", Account: "executor", ChainID: chainID, PrivateKey: key,
+		Primary: primary, Simulator: primary,
+		Fanout: map[string]evmadapter.TxClient{"primary": primary},
+		Clock:  time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Warm(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	cost, _, err := manager.EstimateArtifactNetworkCost(
+		context.Background(),
+		executionport.Artifact{Metadata: map[string]string{
+			"gas_limit":         "1500000",
+			"expected_gas_used": "1000000",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The stub warms a base fee of 10 and a tip of 2.
+	if cost.Cmp(big.NewInt(12_000_000)) != 0 {
+		t.Fatalf("estimated network cost = %s; want 12000000", cost)
 	}
 }

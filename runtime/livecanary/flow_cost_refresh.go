@@ -39,7 +39,11 @@ type detailedArtifactNetworkCostEstimator interface {
 }
 
 type routeGasEstimator interface {
-	EstimateNetworkGas(context.Context, market.TokenAmount, market.TokenID) (uint64, error)
+	EstimateNetworkGas(
+		context.Context,
+		market.TokenAmount,
+		market.TokenID,
+	) (uint64, error)
 }
 
 type cachedEVMFeeSource interface {
@@ -237,17 +241,21 @@ func estimateObservedSwap(
 			)
 		}
 		gas, fallbackErr := fallback.EstimateNetworkGas(
-			ctx, discovery.AmountIn, discovery.AmountOut.Token(),
+			ctx,
+			discovery.AmountIn,
+			discovery.AmountOut.Token(),
 		)
 		if fallbackErr != nil {
 			return FlowCostComponent{}, fmt.Errorf(
-				"estimate %s swap cost: build=%v route_gas=%w",
-				marketID, err, fallbackErr,
+				"estimate %s swap cost: build=%v gas_fallback=%w",
+				marketID,
+				err,
+				fallbackErr,
 			)
 		}
 		artifact = executionport.Artifact{
 			Metadata: map[string]string{
-				"estimated_gas": strconv.FormatUint(gas, 10),
+				"expected_gas_used": strconv.FormatUint(gas, 10),
 			},
 		}
 	}
