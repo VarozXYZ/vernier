@@ -305,6 +305,38 @@ type SequentialRecoveryExitSelector interface {
 	) (domainexecution.SequentialExitDecision, error)
 }
 
+// SequentialPrefundedExitSelector prepares the destination sale after the buy
+// settlement is known. It may authorize the origin circuit breaker only when
+// destination preparation proves a safe failure or rejects the dynamic
+// economic threshold.
+type SequentialPrefundedExitSelector interface {
+	SelectPrefundedExit(
+		context.Context,
+		domainexecution.OperationID,
+		domainexecution.SequentialPlan,
+		market.TokenAmount,
+		[]domainexecution.CostComponent,
+	) (domainexecution.SequentialExitDecision, error)
+	SelectOriginCircuitBreaker(
+		context.Context,
+		domainexecution.OperationID,
+		domainexecution.SequentialPlan,
+		market.TokenAmount,
+		[]domainexecution.CostComponent,
+		error,
+	) (domainexecution.SequentialExitDecision, error)
+}
+
+// SequentialInputConverter converts an economic settlement into the
+// chain-local token identity consumed by a dependent step. Implementations
+// must round down and must not perform I/O.
+type SequentialInputConverter interface {
+	ConvertStageInput(
+		domainexecution.SequentialStagePlan,
+		market.TokenAmount,
+	) (market.TokenAmount, error)
+}
+
 // CostValuator converts measured native-chain costs into the setup quote
 // asset using a preloaded price snapshot. Implementations must not perform
 // network I/O on the settlement path.

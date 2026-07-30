@@ -28,6 +28,7 @@ type SequentialRecoveryConfig struct {
 	Clock            func() time.Time
 	Sleep            func(context.Context, time.Duration) error
 	UncertainTimeout time.Duration
+	CostValuator     executionport.CostValuator
 }
 
 // SequentialRecoveryCoordinator is the only startup path allowed to resume a
@@ -111,6 +112,28 @@ func (c *SequentialRecoveryCoordinator) RecoverActive(
 		_ = c.block(context.WithoutCancel(ctx), active, blockErr)
 		return executionport.SequentialResult{}, true, blockErr
 	}
+	for index := range snapshot.Costs {
+		if snapshot.Costs[index].QuoteValue.Asset() != "" {
+			continue
+		}
+		if c.config.CostValuator == nil {
+			blockErr := fmt.Errorf(
+				"value durable recovery cost %d: execution cost valuator is unavailable",
+				index,
+			)
+			_ = c.block(context.WithoutCancel(ctx), active, blockErr)
+			return executionport.SequentialResult{}, true, blockErr
+		}
+		valued, valueErr := c.config.CostValuator.Value(snapshot.Costs[index])
+		if valueErr != nil {
+			blockErr := fmt.Errorf(
+				"value durable recovery cost %d: %w", index, valueErr,
+			)
+			_ = c.block(context.WithoutCancel(ctx), active, blockErr)
+			return executionport.SequentialResult{}, true, blockErr
+		}
+		snapshot.Costs[index] = valued
+	}
 	if c.config.Observer != nil {
 		c.config.Observer.RecoveryStarted(snapshot)
 	}
@@ -156,13 +179,36 @@ func (c *SequentialRecoveryCoordinator) resume(
 		_ = c.block(context.WithoutCancel(ctx), operation, err)
 		return result, err
 	}
-	attempts := transactionRecoveryAttempts(
-		snapshot.Transactions,
-		operation.CurrentStage+1,
-	)
+	outputs := make(map[int]market.TokenAmount, len(snapshot.Settlements))
+	settled := make(map[int]bool, len(snapshot.Settlements))
+	for _, settlement := range snapshot.Settlements {
+		ordinal := settlement.Request.Stage.Ordinal
+		outputs[ordinal] = settlement.ActualOutput
+		settled[ordinal] = true
+	}
+	if snapshot.Plan.EffectivePolicy() ==
+		domainexecution.PolicyPrefundedSequential &&
+		settled[1] && snapshot.ExitDecision == nil {
+		selected, selectErr := c.selectPrefundedRecoveryExit(
+			ctx, snapshot.Plan, operation.ID, outputs[1], result.Costs, nil,
+		)
+		if selectErr != nil {
+			_ = c.block(context.WithoutCancel(ctx), operation, selectErr)
+			return result, selectErr
+		}
+		stages = selected.stages
+		result.ExitDecision = &selected.decision
+	}
+	attempts := 0
 	exitRefreshed := operation.CurrentStage < 2
-	for operation.CurrentStage < 4 {
-		if operation.CurrentStage == 2 && !exitRefreshed {
+	for {
+		stage, ok := nextUnsettledRecoveryStage(stages, settled)
+		if !ok {
+			break
+		}
+		if snapshot.Plan.EffectivePolicy() ==
+			domainexecution.PolicyTransportedSequential &&
+			operation.CurrentStage == 2 && !exitRefreshed {
 			selected, selectErr := c.reselectExit(
 				ctx,
 				snapshot.Plan,
@@ -202,21 +248,20 @@ func (c *SequentialRecoveryCoordinator) resume(
 			result.ExitDecision = &selected.decision
 			exitRefreshed = true
 			attempts = 0
+			continue
 		}
-		stage, ok := nextRecoveryStage(stages, operation.CurrentStage+1)
-		if !ok {
-			err := fmt.Errorf(
-				"recovery plan has no stage %d",
-				operation.CurrentStage+1,
-			)
-			_ = c.block(context.WithoutCancel(ctx), operation, err)
-			return result, err
+		input, inputErr := c.resolveRecoveryInput(
+			snapshot.Plan, stage, current, outputs,
+		)
+		if inputErr != nil {
+			_ = c.block(context.WithoutCancel(ctx), operation, inputErr)
+			return result, inputErr
 		}
 		request := domainexecution.SequentialStageRequest{
 			Operation: operation.ID,
 			Plan:      snapshot.Plan.ID,
 			Stage:     stage,
-			Input:     current,
+			Input:     input,
 		}
 		transactions := transactionsForOrdinal(
 			snapshot.Transactions,
@@ -335,6 +380,27 @@ func (c *SequentialRecoveryCoordinator) resume(
 				)
 				return result, blockErr
 			}
+			if snapshot.Plan.EffectivePolicy() ==
+				domainexecution.PolicyPrefundedSequential &&
+				stage.Ordinal == 2 &&
+				executionport.IsDefinitiveFailure(stageErr) {
+				selected, selectErr := c.selectPrefundedRecoveryExit(
+					ctx, snapshot.Plan, operation.ID, outputs[1],
+					result.Costs, stageErr,
+				)
+				if selectErr != nil {
+					blockErr := fmt.Errorf(
+						"%w: origin circuit breaker: %v",
+						ErrSequentialRecoveryBlocked, selectErr,
+					)
+					_ = c.block(context.WithoutCancel(ctx), operation, blockErr)
+					return result, blockErr
+				}
+				stages = selected.stages
+				result.ExitDecision = &selected.decision
+				attempts = 0
+				continue
+			}
 			attempts++
 			delay := recoveryBackoff(attempts)
 			attempt := executionport.SequentialRecoveryAttempt{
@@ -357,7 +423,9 @@ func (c *SequentialRecoveryCoordinator) resume(
 			if c.config.Observer != nil {
 				c.config.Observer.RecoveryAttempt(attempt)
 			}
-			if stage.Stage == domainexecution.StageSell {
+			if snapshot.Plan.EffectivePolicy() ==
+				domainexecution.PolicyTransportedSequential &&
+				stage.Stage == domainexecution.StageSell {
 				reselected, selectErr := c.reselectExit(
 					ctx,
 					snapshot.Plan,
@@ -398,12 +466,16 @@ func (c *SequentialRecoveryCoordinator) resume(
 		}
 		attempts = 0
 		current = settlement.ActualOutput
+		outputs[stage.Ordinal] = settlement.ActualOutput
+		settled[stage.Ordinal] = true
 		operation.CurrentStage = stage.Ordinal
 		operation.CurrentAmount = current
 		operation.UpdatedAt = settlement.ObservedAt
 		result.Settlements = append(result.Settlements, settlement)
 		result.Costs = append(result.Costs, settlement.Costs...)
-		if stage.Ordinal == 2 {
+		if snapshot.Plan.EffectivePolicy() ==
+			domainexecution.PolicyTransportedSequential &&
+			stage.Ordinal == 2 {
 			selected, selectErr := c.reselectExit(
 				ctx,
 				snapshot.Plan,
@@ -505,6 +577,103 @@ func (c *SequentialRecoveryCoordinator) reselectExit(
 	return recoveryExit{stages: stages, decision: decision}, nil
 }
 
+func (c *SequentialRecoveryCoordinator) selectPrefundedRecoveryExit(
+	ctx context.Context,
+	plan domainexecution.SequentialPlan,
+	operation domainexecution.OperationID,
+	bought market.TokenAmount,
+	costs []domainexecution.CostComponent,
+	cause error,
+) (recoveryExit, error) {
+	selector, ok :=
+		c.config.Drivers.ExitSelector.(executionport.SequentialPrefundedExitSelector)
+	if !ok {
+		return recoveryExit{},
+			fmt.Errorf("prefunded recovery selector is unavailable")
+	}
+	var (
+		decision domainexecution.SequentialExitDecision
+		err      error
+	)
+	if cause == nil {
+		decision, err = selector.SelectPrefundedExit(
+			ctx, operation, plan, bought,
+			append([]domainexecution.CostComponent(nil), costs...),
+		)
+	} else {
+		decision, err = selector.SelectOriginCircuitBreaker(
+			ctx, operation, plan, bought,
+			append([]domainexecution.CostComponent(nil), costs...), cause,
+		)
+	}
+	if err != nil {
+		return recoveryExit{}, err
+	}
+	if err := decision.Validate(); err != nil {
+		return recoveryExit{}, err
+	}
+	journal, ok :=
+		c.config.Journal.(executionport.SequentialExitDecisionJournal)
+	if !ok {
+		return recoveryExit{},
+			fmt.Errorf("recovery journal cannot persist an exit decision")
+	}
+	if err := journal.RecordSequentialExitDecision(ctx, decision); err != nil {
+		return recoveryExit{}, err
+	}
+	stages := append(
+		[]domainexecution.SequentialStagePlan(nil), plan.Stages...,
+	)
+	if decision.Route == domainexecution.ExitSellAtOrigin {
+		stages = append(
+			[]domainexecution.SequentialStagePlan{plan.Stages[0]},
+			plan.CircuitBreaker...,
+		)
+	}
+	return recoveryExit{stages: stages, decision: decision}, nil
+}
+
+func (c *SequentialRecoveryCoordinator) resolveRecoveryInput(
+	plan domainexecution.SequentialPlan,
+	stage domainexecution.SequentialStagePlan,
+	legacyCurrent market.TokenAmount,
+	outputs map[int]market.TokenAmount,
+) (market.TokenAmount, error) {
+	for _, dependency := range stage.DependsOn {
+		if _, ok := outputs[dependency]; !ok {
+			return market.TokenAmount{}, fmt.Errorf(
+				"recovery stage %d awaits dependency %d",
+				stage.Ordinal, dependency,
+			)
+		}
+	}
+	var input market.TokenAmount
+	if stage.InputFromOrdinal == 0 && stage.Ordinal > 1 {
+		input = legacyCurrent
+	} else {
+		var err error
+		input, err = plan.InputFor(stage, outputs)
+		if err != nil {
+			return market.TokenAmount{}, err
+		}
+	}
+	if input.Token() == stage.InputToken {
+		return input, nil
+	}
+	driver, err := c.config.Drivers.Driver(stage.Stage)
+	if err != nil {
+		return market.TokenAmount{}, err
+	}
+	converter, ok := driver.(executionport.SequentialInputConverter)
+	if !ok {
+		return market.TokenAmount{}, fmt.Errorf(
+			"recovery stage %d requires a chain-local input converter",
+			stage.Ordinal,
+		)
+	}
+	return converter.ConvertStageInput(stage, input)
+}
+
 func (c *SequentialRecoveryCoordinator) block(
 	ctx context.Context,
 	operation domainexecution.SequentialOperation,
@@ -528,6 +697,13 @@ func recoveryStages(
 ) ([]domainexecution.SequentialStagePlan, error) {
 	stages := append([]domainexecution.SequentialStagePlan(nil), plan.Stages...)
 	if decision != nil &&
+		decision.Route == domainexecution.ExitSellAtOrigin {
+		return append(
+			[]domainexecution.SequentialStagePlan{plan.Stages[0]},
+			plan.CircuitBreaker...,
+		), nil
+	}
+	if decision != nil &&
 		decision.Route == domainexecution.ExitReturnToOrigin {
 		returnStages, err := plan.ReturnExitStages()
 		if err != nil {
@@ -538,12 +714,12 @@ func recoveryStages(
 	return stages, nil
 }
 
-func nextRecoveryStage(
+func nextUnsettledRecoveryStage(
 	stages []domainexecution.SequentialStagePlan,
-	ordinal int,
+	settled map[int]bool,
 ) (domainexecution.SequentialStagePlan, bool) {
 	for _, stage := range stages {
-		if stage.Ordinal == ordinal {
+		if !settled[stage.Ordinal] {
 			return stage, true
 		}
 	}

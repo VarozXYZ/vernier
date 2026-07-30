@@ -94,6 +94,63 @@ type sequentialExitSelector struct {
 	calls    *int
 }
 
+type prefundedExitSelector struct {
+	route domainexecution.SequentialExitRoute
+}
+
+func (s prefundedExitSelector) SelectExit(
+	context.Context,
+	domainexecution.OperationID,
+	domainexecution.SequentialPlan,
+	market.TokenAmount,
+	[]domainexecution.CostComponent,
+) (domainexecution.SequentialExitDecision, error) {
+	return domainexecution.SequentialExitDecision{}, errors.New("not transported")
+}
+
+func (s prefundedExitSelector) SelectPrefundedExit(
+	_ context.Context,
+	operation domainexecution.OperationID,
+	_ domainexecution.SequentialPlan,
+	_ market.TokenAmount,
+	_ []domainexecution.CostComponent,
+) (domainexecution.SequentialExitDecision, error) {
+	return prefundedDecision(operation, s.route), nil
+}
+
+func (s prefundedExitSelector) SelectOriginCircuitBreaker(
+	_ context.Context,
+	operation domainexecution.OperationID,
+	_ domainexecution.SequentialPlan,
+	_ market.TokenAmount,
+	_ []domainexecution.CostComponent,
+	_ error,
+) (domainexecution.SequentialExitDecision, error) {
+	return prefundedDecision(operation, domainexecution.ExitSellAtOrigin), nil
+}
+
+func prefundedDecision(
+	operation domainexecution.OperationID,
+	route domainexecution.SequentialExitRoute,
+) domainexecution.SequentialExitDecision {
+	zero, _ := market.NewAssetQuantity("quote", new(big.Rat))
+	decision := domainexecution.SequentialExitDecision{
+		Operation: operation, Route: route,
+		DestinationRecovery: zero, SafetyMargin: zero,
+		CostEvidenceAvailable: true, DecidedAt: time.Now(),
+		Evidence: "test",
+	}
+	if route == domainexecution.ExitSellAtDestination {
+		decision.DestinationOutput, _ =
+			market.NewTokenAmount("quote-b", big.NewInt(1_010))
+	} else {
+		decision.ReturnOutput, _ =
+			market.NewTokenAmount("quote-a", big.NewInt(990))
+		decision.ReturnRecovery = zero
+	}
+	return decision
+}
+
 func (s sequentialExitSelector) SelectExit(
 	_ context.Context,
 	operation domainexecution.OperationID,
@@ -130,6 +187,13 @@ type sequentialDriver struct {
 	preflightCalls int
 	preflightErr   error
 	discarded      bool
+}
+
+func (d *sequentialDriver) ConvertStageInput(
+	stage domainexecution.SequentialStagePlan,
+	source market.TokenAmount,
+) (market.TokenAmount, error) {
+	return market.NewTokenAmount(stage.InputToken, source.Units())
 }
 
 type sequentialObserver struct {
@@ -362,6 +426,161 @@ func TestSequentialExecutorUsesEveryConfirmedOutputAsTheNextInput(t *testing.T) 
 		len(observer.finished) != 1 ||
 		observer.finished[0] != domainexecution.SequentialCompleted {
 		t.Fatalf("unexpected observer lifecycle: %+v", observer)
+	}
+}
+
+func TestPrefundedSequentialUsesSettlementsByReference(t *testing.T) {
+	transported := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedSequentialPlan(
+		"prefunded-plan", transported.Opportunity, transported.InitialInput,
+		"solana", "polygon", time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &sequentialDriver{outputs: map[int]market.TokenAmount{
+		1: sequentialAmount(t, "base-solana", 4_052),
+		2: sequentialAmount(t, "quote-polygon", 1_010),
+		3: sequentialAmount(t, "base-polygon", 4_050),
+		4: sequentialAmount(t, "quote-solana", 1_009),
+	}}
+	journal := &sequentialJournal{}
+	executor, err := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, Sell: driver, BridgeBase: driver,
+			BridgeQuoteReturn: driver,
+			ExitSelector: prefundedExitSelector{
+				route: domainexecution.ExitSellAtDestination,
+			},
+		},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(
+		context.Background(), "prefunded-operation", plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Settlements) != 4 {
+		t.Fatalf("settlements=%d", len(result.Settlements))
+	}
+	wantTokens := []market.TokenID{
+		"quote-solana", "base-polygon", "base-solana", "quote-polygon",
+	}
+	for index, want := range wantTokens {
+		if driver.inputs[index].Token() != want {
+			t.Fatalf(
+				"input %d token=%s want=%s",
+				index, driver.inputs[index].Token(), want,
+			)
+		}
+	}
+}
+
+func TestPrefundedSequentialDefinitiveDestinationFailureUsesOriginOnly(t *testing.T) {
+	transported := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedSequentialPlan(
+		"prefunded-plan", transported.Opportunity, transported.InitialInput,
+		"solana", "polygon", time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &sequentialDriver{
+		outputs: map[int]market.TokenAmount{
+			1: sequentialAmount(t, "base-solana", 4_052),
+			5: sequentialAmount(t, "quote-solana", 990),
+		},
+		failures: map[int][]error{
+			2: {
+				executionport.NewStageError(
+					executionport.DispositionRejected,
+					errors.New("destination rejected"),
+				),
+			},
+		},
+	}
+	journal := &sequentialJournal{}
+	executor, err := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, Sell: driver, BridgeBase: driver,
+			BridgeQuoteReturn: driver,
+			ExitSelector: prefundedExitSelector{
+				route: domainexecution.ExitSellAtDestination,
+			},
+		},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(
+		context.Background(), "prefunded-operation", plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Settlements) != 2 ||
+		result.Settlements[1].Request.Stage.Ordinal != 5 ||
+		result.ExitDecision == nil ||
+		result.ExitDecision.Route != domainexecution.ExitSellAtOrigin {
+		t.Fatalf("unexpected circuit-breaker result: %+v", result)
+	}
+}
+
+func TestPrefundedSequentialUnknownDestinationOutcomeNeverSellsOrigin(t *testing.T) {
+	transported := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedSequentialPlan(
+		"prefunded-plan", transported.Opportunity, transported.InitialInput,
+		"solana", "polygon", time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &sequentialDriver{
+		outputs: map[int]market.TokenAmount{
+			1: sequentialAmount(t, "base-solana", 4_052),
+			5: sequentialAmount(t, "quote-solana", 990),
+		},
+		failures: map[int][]error{
+			2: {
+				executionport.NewStageError(
+					executionport.DispositionPossible,
+					errors.New("destination outcome unknown"),
+				),
+			},
+		},
+	}
+	journal := &sequentialJournal{}
+	executor, err := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, Sell: driver, BridgeBase: driver,
+			BridgeQuoteReturn: driver,
+			ExitSelector: prefundedExitSelector{
+				route: domainexecution.ExitSellAtDestination,
+			},
+		},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(
+		context.Background(), "prefunded-operation", plan,
+	)
+	if err == nil {
+		t.Fatal("unknown destination outcome was treated as safe")
+	}
+	if len(result.Settlements) != 1 ||
+		journal.finished != domainexecution.SequentialManualIntervention ||
+		len(driver.inputs) != 2 {
+		t.Fatalf("unknown outcome did not preserve the operation: %+v", result)
 	}
 }
 
