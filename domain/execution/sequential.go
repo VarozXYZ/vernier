@@ -2,6 +2,7 @@ package execution
 
 import (
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
@@ -218,6 +219,8 @@ type SequentialOperationState string
 
 const (
 	SequentialRunning            SequentialOperationState = "running"
+	SequentialRecovering         SequentialOperationState = "recovering"
+	SequentialRecoveryBlocked    SequentialOperationState = "recovery_blocked"
 	SequentialCompleted          SequentialOperationState = "completed"
 	SequentialAborted            SequentialOperationState = "aborted"
 	SequentialManualIntervention SequentialOperationState = "manual_intervention_required"
@@ -245,14 +248,16 @@ func (r SequentialStageRequest) Validate() error {
 }
 
 type SequentialStageSettlement struct {
-	Request             SequentialStageRequest
-	ActualInput         market.TokenAmount
-	ActualOutput        market.TokenAmount
-	Costs               []CostComponent
-	SourceIdentity      TransactionIdentity
-	DestinationIdentity *TransactionIdentity
-	ObservedAt          time.Time
-	Evidence            string
+	Request                  SequentialStageRequest
+	ActualInput              market.TokenAmount
+	ActualOutput             market.TokenAmount
+	Costs                    []CostComponent
+	SourceIdentity           TransactionIdentity
+	DestinationIdentity      *TransactionIdentity
+	DestinationBalanceBefore *big.Int
+	DestinationBalanceAfter  *big.Int
+	ObservedAt               time.Time
+	Evidence                 string
 }
 
 func (s SequentialStageSettlement) Validate() error {
@@ -271,6 +276,23 @@ func (s SequentialStageSettlement) Validate() error {
 	if s.Request.Stage.DestinationChain != "" {
 		if s.DestinationIdentity == nil {
 			return fmt.Errorf("bridge stage %d requires destination identity", s.Request.Stage.Ordinal)
+		}
+		if (s.DestinationBalanceBefore == nil) !=
+			(s.DestinationBalanceAfter == nil) {
+			return fmt.Errorf(
+				"bridge stage %d has incomplete destination balance evidence",
+				s.Request.Stage.Ordinal,
+			)
+		}
+		if s.DestinationBalanceBefore != nil &&
+			(s.DestinationBalanceBefore.Sign() < 0 ||
+				s.DestinationBalanceAfter.Cmp(
+					s.DestinationBalanceBefore,
+				) < 0) {
+			return fmt.Errorf(
+				"bridge stage %d has invalid destination balance evidence",
+				s.Request.Stage.Ordinal,
+			)
 		}
 		if err := s.DestinationIdentity.Validate(); err != nil {
 			return fmt.Errorf("stage %d destination identity: %w", s.Request.Stage.Ordinal, err)

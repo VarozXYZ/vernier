@@ -64,7 +64,10 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS one_active_sequential_live_operation
 			ON sequential_live_operations((1))
-			WHERE state IN ('running', 'manual_intervention_required')`,
+			WHERE state IN (
+				'running', 'recovering', 'recovery_blocked',
+				'manual_intervention_required'
+			)`,
 		`CREATE TABLE IF NOT EXISTS sequential_live_transactions (
 			operation_id TEXT NOT NULL REFERENCES sequential_live_operations(operation_id),
 			ordinal INTEGER NOT NULL,
@@ -92,6 +95,8 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			output_units TEXT NOT NULL,
 			source_identity TEXT NOT NULL,
 			destination_identity TEXT NOT NULL DEFAULT '',
+			destination_balance_before TEXT NOT NULL DEFAULT '',
+			destination_balance_after TEXT NOT NULL DEFAULT '',
 			evidence TEXT NOT NULL,
 			observed_at TEXT NOT NULL,
 			PRIMARY KEY(operation_id, ordinal)
@@ -137,11 +142,116 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			evidence TEXT NOT NULL,
 			decided_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS sequential_live_plan_snapshots (
+			operation_id TEXT PRIMARY KEY REFERENCES sequential_live_operations(operation_id),
+			plan_id TEXT NOT NULL,
+			evaluation_id TEXT NOT NULL,
+			config_hash TEXT NOT NULL,
+			buy_market TEXT NOT NULL,
+			sell_market TEXT NOT NULL,
+			initial_token TEXT NOT NULL,
+			initial_units TEXT NOT NULL,
+			discovery_token TEXT NOT NULL,
+			discovery_units TEXT NOT NULL,
+			input_asset TEXT NOT NULL,
+			input_value TEXT NOT NULL,
+			buy_output_token TEXT NOT NULL,
+			buy_output_units TEXT NOT NULL,
+			sell_input_token TEXT NOT NULL,
+			sell_input_units TEXT NOT NULL,
+			sell_output_token TEXT NOT NULL,
+			sell_output_units TEXT NOT NULL,
+			forced_canary INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS sequential_live_plan_stages (
+			operation_id TEXT NOT NULL REFERENCES sequential_live_operations(operation_id),
+			ordinal INTEGER NOT NULL,
+			stage TEXT NOT NULL,
+			source_chain TEXT NOT NULL,
+			destination_chain TEXT NOT NULL DEFAULT '',
+			input_token TEXT NOT NULL,
+			output_token TEXT NOT NULL,
+			market_id TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(operation_id, ordinal)
+		)`,
+		`CREATE TABLE IF NOT EXISTS sequential_live_recovery_attempts (
+			operation_id TEXT NOT NULL REFERENCES sequential_live_operations(operation_id),
+			attempt_index INTEGER NOT NULL,
+			ordinal INTEGER NOT NULL,
+			action TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			detail TEXT NOT NULL DEFAULT '',
+			attempt INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			retry_at TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(operation_id, attempt_index)
+		)`,
+		`CREATE TABLE IF NOT EXISTS live_refuel_operations (
+			refuel_id TEXT PRIMARY KEY,
+			chain_name TEXT NOT NULL,
+			state TEXT NOT NULL,
+			input_token TEXT NOT NULL,
+			input_units TEXT NOT NULL,
+			native_asset TEXT NOT NULL,
+			balance_before TEXT NOT NULL,
+			balance_after TEXT NOT NULL DEFAULT '',
+			native_received TEXT NOT NULL DEFAULT '',
+			fee_value TEXT NOT NULL DEFAULT '',
+			tx_chain TEXT NOT NULL DEFAULT '',
+			tx_account TEXT NOT NULL DEFAULT '',
+			tx_identity TEXT NOT NULL DEFAULT '',
+			tx_nonce TEXT NOT NULL DEFAULT '',
+			tx_blockhash TEXT NOT NULL DEFAULT '',
+			tx_last_valid_height INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS one_active_live_refuel
+			ON live_refuel_operations((1))
+			WHERE state IN ('prepared', 'broadcast', 'outcome_unknown')`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("configure sequential Live SQLite: %w", err)
 		}
+	}
+	for _, migration := range []string{
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN first_uncertain_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN recovery_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN next_recovery_attempt TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_settlements
+			ADD COLUMN destination_balance_before TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_settlements
+			ADD COLUMN destination_balance_after TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(migration); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate sequential Live SQLite: %w", err)
+		}
+	}
+	if _, err := db.Exec(
+		`DROP INDEX IF EXISTS one_active_sequential_live_operation`,
+	); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX
+		one_active_sequential_live_operation
+		ON sequential_live_operations((1))
+		WHERE state IN (
+			'running', 'recovering', 'recovery_blocked',
+			'manual_intervention_required'
+		)`); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return &SequentialLiveStore{db: db}, nil
 }
@@ -182,8 +292,9 @@ func (s *SequentialLiveStore) RecordSequentialExitDecision(
 	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
-			WHERE operation_id=? AND state='running' AND current_stage=2
-		)`,
+			WHERE operation_id=? AND state IN ('running', 'recovering')
+				AND current_stage=2
+			)`,
 		decision.Operation, decision.Route,
 		destinationToken,
 		destinationUnits,
@@ -225,8 +336,9 @@ func (s *SequentialLiveStore) RecordSequentialResult(
 	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
-			WHERE operation_id=? AND state='running' AND current_stage=4
-		)`,
+			WHERE operation_id=? AND state IN ('running', 'recovering')
+				AND current_stage=4
+			)`,
 		result.Operation, result.FinalAmount.Token(),
 		result.FinalAmount.Units().String(), result.ExecutionCost.Asset(),
 		result.ExecutionCost.String(), result.ExternalCost.String(),
@@ -287,8 +399,8 @@ func (s *SequentialLiveStore) RecordPreparedTransaction(
 	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
-			WHERE operation_id=? AND state='running'
-		)`,
+			WHERE operation_id=? AND state IN ('running', 'recovering')
+			)`,
 		prepared.Operation, prepared.Ordinal, prepared.Phase,
 		prepared.Identity.Chain, prepared.Identity.Account,
 		prepared.Identity.Hash, nonce, prepared.Identity.Blockhash,
@@ -316,9 +428,16 @@ func (s *SequentialLiveStore) MarkTransaction(
 		return fmt.Errorf("invalid sequential transaction status %q", status)
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE sequential_live_transactions
-		SET status=?, updated_at=?
+		SET status=?,
+			first_uncertain_at=CASE
+				WHEN ?='outcome_unknown' AND first_uncertain_at=''
+				THEN ?
+				ELSE first_uncertain_at
+			END,
+			updated_at=?
 		WHERE operation_id=? AND ordinal=? AND phase=?`,
-		status, time.Now().UTC().Format(time.RFC3339Nano),
+		status, status, time.Now().UTC().Format(time.RFC3339Nano),
+		time.Now().UTC().Format(time.RFC3339Nano),
 		operationID, ordinal, phase,
 	)
 	if err != nil {
@@ -355,7 +474,8 @@ func (s *SequentialLiveStore) RecordStageFailureCosts(
 	).Scan(&state, &currentStage); err != nil {
 		return err
 	}
-	if state != string(domainexecution.SequentialRunning) ||
+	if state != string(domainexecution.SequentialRunning) &&
+		state != string(domainexecution.SequentialRecovering) ||
 		currentStage+1 != ordinal {
 		return fmt.Errorf(
 			"sequential stage failure does not extend the durable operation state",
@@ -424,7 +544,8 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 	if err != nil {
 		return err
 	}
-	if state != string(domainexecution.SequentialRunning) ||
+	if state != string(domainexecution.SequentialRunning) &&
+		state != string(domainexecution.SequentialRecovering) ||
 		currentStage+1 != settlement.Request.Stage.Ordinal ||
 		currentToken != string(settlement.Request.Input.Token()) ||
 		currentUnits != settlement.Request.Input.Units().String() {
@@ -434,15 +555,22 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 	if settlement.DestinationIdentity != nil {
 		destination = settlement.DestinationIdentity.Hash
 	}
+	balanceBefore, balanceAfter := "", ""
+	if settlement.DestinationBalanceBefore != nil {
+		balanceBefore = settlement.DestinationBalanceBefore.String()
+		balanceAfter = settlement.DestinationBalanceAfter.String()
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO sequential_live_settlements (
 		operation_id, ordinal, stage, input_token, input_units, output_token,
-		output_units, source_identity, destination_identity, evidence, observed_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		output_units, source_identity, destination_identity,
+		destination_balance_before, destination_balance_after,
+		evidence, observed_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		settlement.Request.Operation, settlement.Request.Stage.Ordinal,
 		settlement.Request.Stage.Stage, settlement.ActualInput.Token(),
 		settlement.ActualInput.Units().String(), settlement.ActualOutput.Token(),
 		settlement.ActualOutput.Units().String(), settlement.SourceIdentity.Hash,
-		destination, settlement.Evidence,
+		destination, balanceBefore, balanceAfter, settlement.Evidence,
 		settlement.ObservedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -474,7 +602,7 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE sequential_live_operations
 		SET current_stage=?, current_token=?, current_units=?, updated_at=?
-		WHERE operation_id=? AND state='running'`,
+		WHERE operation_id=? AND state IN ('running', 'recovering')`,
 		settlement.Request.Stage.Ordinal, settlement.ActualOutput.Token(),
 		settlement.ActualOutput.Units().String(),
 		settlement.ObservedAt.UTC().Format(time.RFC3339Nano),
@@ -495,7 +623,8 @@ func (s *SequentialLiveStore) FinishSequentialOperation(
 	switch state {
 	case domainexecution.SequentialCompleted,
 		domainexecution.SequentialAborted,
-		domainexecution.SequentialManualIntervention:
+		domainexecution.SequentialManualIntervention,
+		domainexecution.SequentialRecoveryBlocked:
 	default:
 		return fmt.Errorf("invalid terminal sequential operation state")
 	}
@@ -505,7 +634,9 @@ func (s *SequentialLiveStore) FinishSequentialOperation(
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE sequential_live_operations
 		SET state=?, last_error=?, updated_at=?
-		WHERE operation_id=? AND state='running'`,
+		WHERE operation_id=? AND state IN (
+			'running', 'recovering', 'manual_intervention_required'
+		)`,
 		state, message, time.Now().UTC().Format(time.RFC3339Nano), operationID,
 	)
 	if err != nil {
@@ -527,7 +658,10 @@ func (s *SequentialLiveStore) ActiveSequentialOperation(
 		opportunity_id, config_hash, state, current_stage, current_token,
 		current_units, last_error, started_at, updated_at
 		FROM sequential_live_operations
-		WHERE state IN ('running', 'manual_intervention_required')
+		WHERE state IN (
+			'running', 'recovering', 'recovery_blocked',
+			'manual_intervention_required'
+		)
 		ORDER BY started_at LIMIT 1`,
 	).Scan(
 		&operation.ID, &operation.Plan, &operation.OpportunityID,
@@ -573,13 +707,14 @@ func (s *SequentialLiveStore) AcknowledgeManualReconciliation(
 				ELSE last_error || ' | ' || ?
 			END,
 			updated_at=?
-		WHERE operation_id=? AND state=?`,
+		WHERE operation_id=? AND state IN (?, ?)`,
 		domainexecution.SequentialReconciledManually,
 		note,
 		note,
 		time.Now().UTC().Format(time.RFC3339Nano),
 		operationID,
 		domainexecution.SequentialManualIntervention,
+		domainexecution.SequentialRecoveryBlocked,
 	)
 	if err != nil {
 		return fmt.Errorf("acknowledge manual reconciliation: %w", err)
@@ -587,7 +722,7 @@ func (s *SequentialLiveStore) AcknowledgeManualReconciliation(
 	affected, _ := result.RowsAffected()
 	if affected != 1 {
 		return fmt.Errorf(
-			"operation %s is not awaiting manual reconciliation",
+			"operation %s is not awaiting manual reconciliation or recovery unblock",
 			operationID,
 		)
 	}

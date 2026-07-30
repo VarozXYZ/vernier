@@ -134,6 +134,17 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 		}
 		idle.Reset(idleInterval)
 	}
+	stopIdle := func() {
+		if idle == nil {
+			return
+		}
+		if !idle.Stop() {
+			select {
+			case <-idle.C:
+			default:
+			}
+		}
+	}
 
 	gate := runtimeresearch.NewTriggerGate(10_000)
 	evaluations := 0
@@ -141,6 +152,61 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 	retrySequence := uint64(0)
 	var pending *streamSignal
 	for {
+		if options.EvaluationGate != nil &&
+			!options.EvaluationGate.EvaluationAllowed() {
+			stopIdle()
+			for !options.EvaluationGate.EvaluationAllowed() {
+				select {
+				case <-ctx.Done():
+					return nil
+				case failure := <-failures:
+					if tracker != nil {
+						_ = tracker.FailMarket(
+							runCtx, "", "feed_failed", r.clock().UTC(),
+						)
+					}
+					return failure
+				case signal := <-signals:
+					if gate.Accept(scheduledRemoteTrigger(
+						signal,
+						r.config.Markets,
+					)) {
+						pending = &signal
+					}
+				case at := <-options.ReevaluationRequests:
+					retrySequence++
+					signal := syntheticRetrySignal(
+						r.config.Markets[0].ID,
+						at.UTC(),
+						retrySequence,
+					)
+					pending = &signal
+				case <-options.EvaluationGate.EvaluationChanges():
+				}
+			}
+			latest := drainLatestRemoteSignal(
+				signals,
+				r.config.Markets,
+				gate,
+			)
+			if latest != nil {
+				pending = latest
+			}
+			if pending != nil {
+				// A real trigger is stronger than a synthetic post-flow
+				// request. Drain requests queued before the gate opened so
+				// one completed flow produces exactly one evaluation.
+				for {
+					select {
+					case <-options.ReevaluationRequests:
+					default:
+						goto reevaluationRequestsDrained
+					}
+				}
+			}
+		reevaluationRequestsDrained:
+			resetIdle()
+		}
 		var signal streamSignal
 		if pending != nil {
 			signal = *pending

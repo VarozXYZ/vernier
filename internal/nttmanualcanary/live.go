@@ -2,6 +2,7 @@ package nttmanualcanary
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -10,6 +11,7 @@ import (
 
 	geth "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	solanago "github.com/gagliardetto/solana-go"
@@ -137,6 +139,24 @@ func (s *LiveService) Transfer(
 	request domainexecution.SequentialStageRequest,
 	journal executionport.SequentialJournal,
 ) (crosschainport.LiveTransferResult, error) {
+	return s.transfer(
+		ctx,
+		request,
+		journal,
+		"",
+		nttLiveOperationID(request, "initial"),
+		"",
+	)
+}
+
+func (s *LiveService) transfer(
+	ctx context.Context,
+	request domainexecution.SequentialStageRequest,
+	journal executionport.SequentialJournal,
+	sourceTransaction string,
+	operationID string,
+	phasePrefix string,
+) (crosschainport.LiveTransferResult, error) {
 	if err := request.Validate(); err != nil {
 		return crosschainport.LiveTransferResult{}, err
 	}
@@ -182,15 +202,18 @@ func (s *LiveService) Transfer(
 	result := &nttLiveResult{}
 	hooks := &nttLiveHooks{
 		Request: request, Journal: journal, Accounts: s.config.Accounts,
+		OperationID: operationID, PhasePrefix: phasePrefix,
 		SolanaChain: s.config.SolanaChain, EVMChain: s.config.EVMChain,
-		SolanaNativeAsset: s.config.SolanaNativeAsset,
-		EVMNativeAsset:    s.config.EVMNativeAsset,
-		NonceCoordinator:  s.config.NonceCoordinator,
-		Result:            result,
+		SolanaNativeAsset:        s.config.SolanaNativeAsset,
+		EVMNativeAsset:           s.config.EVMNativeAsset,
+		NonceCoordinator:         s.config.NonceCoordinator,
+		BalanceVisibilityTimeout: s.config.BalanceVisibilityTimeout,
+		BalancePollInterval:      s.config.BalancePollInterval,
+		Result:                   result,
 	}
 	err = executeArmed(
 		ctx, s.config.Output, route, s.profile, s.solanaAdapter, s.evmAdapter,
-		s.solanaPayer, s.evmSender, transferUnits.String(), "",
+		s.solanaPayer, s.evmSender, transferUnits.String(), sourceTransaction,
 		s.config.StorePath, "", hooks,
 	)
 	if err != nil {
@@ -199,7 +222,11 @@ func (s *LiveService) Transfer(
 			disposition = executionport.DispositionPossible
 		}
 		return crosschainport.LiveTransferResult{},
-			executionport.NewStageError(disposition, err)
+			executionport.NewStageErrorWithCosts(
+				disposition,
+				result.Costs,
+				err,
+			)
 	}
 	if result.SourceIdentity.Hash == "" {
 		return crosschainport.LiveTransferResult{},
@@ -262,11 +289,252 @@ func (s *LiveService) Transfer(
 	}
 	return crosschainport.LiveTransferResult{
 		ActualInput: transferInput, ActualOutput: output,
-		Costs:               append([]domainexecution.CostComponent(nil), result.Costs...),
-		SourceIdentity:      result.SourceIdentity,
-		DestinationIdentity: result.DestinationIdentity,
-		ObservedAt:          time.Now().UTC(), Evidence: "wormhole_ntt_destination_balance",
+		Costs:                    append([]domainexecution.CostComponent(nil), result.Costs...),
+		SourceIdentity:           result.SourceIdentity,
+		DestinationIdentity:      result.DestinationIdentity,
+		DestinationBalanceBefore: new(big.Int).Set(before),
+		DestinationBalanceAfter:  new(big.Int).Set(after),
+		ObservedAt:               time.Now().UTC(), Evidence: "wormhole_ntt_destination_balance",
 	}, nil
+}
+
+func (s *LiveService) RecoverTransfer(
+	ctx context.Context,
+	request domainexecution.SequentialStageRequest,
+	transactions []executionport.SequentialTransactionRecord,
+	journal executionport.SequentialJournal,
+) (crosschainport.LiveTransferResult, error) {
+	if err := request.Validate(); err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	var source *executionport.SequentialTransactionRecord
+	var destination *executionport.SequentialTransactionRecord
+	for index := range transactions {
+		record := &transactions[index]
+		switch {
+		case strings.Contains(record.Phase, "source_transfer-"):
+			if source == nil || record.PreparedAt.After(source.PreparedAt) {
+				source = record
+			}
+		case strings.Contains(record.Phase, "destination_redeem-"),
+			strings.Contains(record.Phase, "ntt_redeem_manual-"):
+			if destination == nil ||
+				record.PreparedAt.After(destination.PreparedAt) {
+				destination = record
+			}
+		}
+	}
+	for _, record := range []*executionport.SequentialTransactionRecord{
+		source,
+		destination,
+	} {
+		if record == nil || definitiveNTTStatus(record.Status) {
+			continue
+		}
+		changed, err := s.reconcileOuterTransaction(
+			ctx,
+			request,
+			*record,
+			journal,
+		)
+		if err != nil {
+			return crosschainport.LiveTransferResult{},
+				executionport.NewRecoveryError(
+					executionport.RecoveryFailureTemporary,
+					err,
+				)
+		}
+		if !changed {
+			return crosschainport.LiveTransferResult{},
+				executionport.NewRecoveryError(
+					executionport.RecoveryFailureUncertain,
+					fmt.Errorf(
+						"NTT transaction %s remains uncertain",
+						record.Identity.Hash,
+					),
+				)
+		}
+		return crosschainport.LiveTransferResult{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureTemporary,
+				fmt.Errorf("NTT transaction state was reconciled"),
+			)
+	}
+	if source != nil && source.Status == "confirmed" &&
+		destination != nil && destination.Status == "confirmed" {
+		return s.reconstructedSettlement(request, *source, *destination)
+	}
+	if source == nil || source.Status == "rejected" ||
+		source.Status == "confirmed_revert" {
+		attempt := len(transactions) + 1
+		return s.transfer(
+			ctx,
+			request,
+			journal,
+			"",
+			nttLiveOperationID(request, fmt.Sprintf("source-%d", attempt)),
+			fmt.Sprintf("recovery_%d_", attempt),
+		)
+	}
+	if source.Status != "confirmed" {
+		return crosschainport.LiveTransferResult{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureUncertain,
+				fmt.Errorf("NTT source transaction has no definitive outcome"),
+			)
+	}
+	attempt := len(transactions) + 1
+	return s.transfer(
+		ctx,
+		request,
+		journal,
+		source.Identity.Hash,
+		nttLiveOperationID(request, fmt.Sprintf("destination-%d", attempt)),
+		fmt.Sprintf("recovery_%d_", attempt),
+	)
+}
+
+func (s *LiveService) reconstructedSettlement(
+	request domainexecution.SequentialStageRequest,
+	source executionport.SequentialTransactionRecord,
+	destination executionport.SequentialTransactionRecord,
+) (crosschainport.LiveTransferResult, error) {
+	sourceDecimals := s.config.TokenDecimals[request.Stage.SourceChain]
+	destinationDecimals := s.config.TokenDecimals[request.Stage.DestinationChain]
+	transferUnits, _, _, err := wormholentt.TrimTransferAmount(
+		request.Input.Units(),
+		sourceDecimals,
+		destinationDecimals,
+	)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	outputUnits, err := RebaseTransferUnits(
+		transferUnits,
+		sourceDecimals,
+		destinationDecimals,
+	)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	input, err := market.NewTokenAmount(
+		request.Stage.InputToken,
+		transferUnits,
+	)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	output, err := market.NewTokenAmount(
+		request.Stage.OutputToken,
+		outputUnits,
+	)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	return crosschainport.LiveTransferResult{
+		ActualInput: input, ActualOutput: output,
+		SourceIdentity:      source.Identity,
+		DestinationIdentity: destination.Identity,
+		ObservedAt:          time.Now().UTC(),
+		Evidence:            "wormhole_ntt_durable_transaction_reconciliation",
+	}, nil
+}
+
+func (s *LiveService) reconcileOuterTransaction(
+	ctx context.Context,
+	request domainexecution.SequentialStageRequest,
+	record executionport.SequentialTransactionRecord,
+	journal executionport.SequentialJournal,
+) (bool, error) {
+	chain := record.Identity.Chain
+	switch chain {
+	case s.config.EVMChain:
+		rpcURL, err := requiredEnv(s.profile.EVM.RPCURLEnv)
+		if err != nil {
+			return false, err
+		}
+		client, err := ethclient.DialContext(ctx, rpcURL)
+		if err != nil {
+			return false, err
+		}
+		defer client.Close()
+		receipt, err := client.TransactionReceipt(
+			ctx,
+			common.HexToHash(record.Identity.Hash),
+		)
+		if errors.Is(err, geth.NotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		status := "confirmed"
+		if receipt.Status != types.ReceiptStatusSuccessful {
+			status = "confirmed_revert"
+		}
+		return true, journal.MarkTransaction(
+			ctx,
+			request.Operation,
+			request.Stage.Ordinal,
+			record.Phase,
+			status,
+		)
+	case s.config.SolanaChain:
+		rpcURL, err := requiredEnv(s.profile.Solana.RPCURLEnv)
+		if err != nil {
+			return false, err
+		}
+		signature, err := solanago.SignatureFromBase58(record.Identity.Hash)
+		if err != nil {
+			return false, err
+		}
+		statuses, err := solanarpc.New(rpcURL).GetSignatureStatuses(
+			ctx,
+			true,
+			signature,
+		)
+		if err != nil {
+			return false, err
+		}
+		if statuses == nil || len(statuses.Value) != 1 ||
+			statuses.Value[0] == nil {
+			return false, nil
+		}
+		status := "confirmed"
+		if statuses.Value[0].Err != nil {
+			status = "confirmed_revert"
+		}
+		return true, journal.MarkTransaction(
+			ctx,
+			request.Operation,
+			request.Stage.Ordinal,
+			record.Phase,
+			status,
+		)
+	default:
+		return false, fmt.Errorf("NTT recovery chain %q is unknown", chain)
+	}
+}
+
+func definitiveNTTStatus(status string) bool {
+	switch status {
+	case "confirmed", "confirmed_revert", "rejected":
+		return true
+	default:
+		return false
+	}
+}
+
+func nttLiveOperationID(
+	request domainexecution.SequentialStageRequest,
+	suffix string,
+) string {
+	return fmt.Sprintf(
+		"ntt-%s-%d-%s",
+		request.Operation,
+		request.Stage.Ordinal,
+		suffix,
+	)
 }
 
 func RebaseTransferUnits(
@@ -392,6 +660,89 @@ func AwaitDestinationBalanceVisibility(
 	}
 }
 
+func AwaitEVMSourceBalanceVisibility(
+	ctx context.Context,
+	required *big.Int,
+	timeout time.Duration,
+	pollInterval time.Duration,
+	read func(context.Context) (*big.Int, uint64, error),
+) (balance *big.Int, observedBlock uint64, attempts int, err error) {
+	if required == nil || required.Sign() <= 0 {
+		return nil, 0, 0, fmt.Errorf(
+			"NTT required source balance is invalid",
+		)
+	}
+	if read == nil {
+		return nil, 0, 0, fmt.Errorf(
+			"NTT source balance reader is unavailable",
+		)
+	}
+	if timeout <= 0 {
+		timeout = defaultDestinationBalanceVisibilityTimeout
+	}
+	if pollInterval <= 0 {
+		pollInterval = defaultDestinationBalancePollInterval
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var latest *big.Int
+	var latestBlock uint64
+	var latestReadErr error
+	for {
+		attempts++
+		current, block, readErr := read(waitCtx)
+		if readErr == nil && current != nil && current.Sign() >= 0 {
+			latest = new(big.Int).Set(current)
+			latestBlock = block
+			latestReadErr = nil
+			if current.Cmp(required) >= 0 {
+				return latest, latestBlock, attempts, nil
+			}
+		} else {
+			latestReadErr = readErr
+			if block > latestBlock {
+				latestBlock = block
+			}
+		}
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-waitCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if ctx.Err() != nil {
+				return nil, latestBlock, attempts, ctx.Err()
+			}
+			latestText := "unavailable"
+			if latest != nil {
+				latestText = latest.String()
+			}
+			if latestReadErr != nil {
+				return nil, latestBlock, attempts, fmt.Errorf(
+					"NTT source balance was not visible after %s: latest=%s required=%s observed_block=%d last_read_failed=true",
+					timeout,
+					latestText,
+					required,
+					latestBlock,
+				)
+			}
+			return nil, latestBlock, attempts, fmt.Errorf(
+				"NTT source balance was not visible after %s: latest=%s required=%s observed_block=%d",
+				timeout,
+				latestText,
+				required,
+				latestBlock,
+			)
+		case <-timer.C:
+		}
+	}
+}
+
 func (s *LiveService) route(source market.ChainID) (direction, error) {
 	switch source {
 	case s.config.SolanaChain:
@@ -475,3 +826,4 @@ func (s *LiveService) destinationBalance(
 }
 
 var _ crosschainport.LiveTransferService = (*LiveService)(nil)
+var _ crosschainport.RecoverableLiveTransferService = (*LiveService)(nil)

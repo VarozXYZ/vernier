@@ -44,6 +44,28 @@ type CompactValidator interface {
 	ValidateCompact(context.Context, ValidationRequest, Artifact) (Artifact, error)
 }
 
+// AllowanceRequiredError preserves the spender proven by a failed executable
+// artifact. Recovery must inspect allowance and balance instead of inferring
+// either from provider text such as TRANSFER_FROM_FAILED.
+type AllowanceRequiredError struct {
+	Spender string
+	Err     error
+}
+
+func (e *AllowanceRequiredError) Error() string {
+	if e == nil || e.Err == nil {
+		return "token allowance or balance prevented execution"
+	}
+	return e.Err.Error()
+}
+
+func (e *AllowanceRequiredError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type ArtifactTooLargeError struct {
 	ActualBytes  int
 	MaximumBytes int

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/VarozXYZ/vernier/adapters/crosschain/across"
+	sqlitestore "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
 	chainport "github.com/VarozXYZ/vernier/ports/chain"
@@ -52,6 +54,20 @@ func (s *LiveService) Transfer(
 	request domainexecution.SequentialStageRequest,
 	journal executionport.SequentialJournal,
 ) (crosschainport.LiveTransferResult, error) {
+	return s.transfer(
+		ctx,
+		request,
+		journal,
+		acrossLiveOperationID(request),
+	)
+}
+
+func (s *LiveService) transfer(
+	ctx context.Context,
+	request domainexecution.SequentialStageRequest,
+	journal executionport.SequentialJournal,
+	operationID string,
+) (crosschainport.LiveTransferResult, error) {
 	if err := request.Validate(); err != nil {
 		return crosschainport.LiveTransferResult{}, err
 	}
@@ -80,6 +96,7 @@ func (s *LiveService) Transfer(
 	hookResult := &liveExecutionResult{}
 	hooks := &liveExecutionHooks{
 		Request: request, Journal: journal, Result: hookResult,
+		OperationID: operationID,
 		Accounts: map[string]domainexecution.AccountID{
 			"solana":  s.accountForKind("solana"),
 			"polygon": s.accountForKind("evm"),
@@ -98,7 +115,11 @@ func (s *LiveService) Transfer(
 			disposition = executionport.DispositionPossible
 		}
 		return crosschainport.LiveTransferResult{},
-			executionport.NewStageError(disposition, err)
+			executionport.NewStageErrorWithCosts(
+				disposition,
+				hookResult.Costs,
+				err,
+			)
 	}
 	if hookResult.SourceIdentity == "" || hookResult.DestinationIdentity == "" ||
 		hookResult.BalanceBefore == nil || hookResult.BalanceAfter == nil {
@@ -171,8 +192,119 @@ func (s *LiveService) Transfer(
 		ActualInput: request.Input, ActualOutput: output,
 		Costs:          costs,
 		SourceIdentity: sourceIdentity, DestinationIdentity: destinationIdentity,
-		ObservedAt: time.Now().UTC(), Evidence: hookResult.Evidence,
+		DestinationBalanceBefore: new(big.Int).Set(hookResult.BalanceBefore),
+		DestinationBalanceAfter:  new(big.Int).Set(hookResult.BalanceAfter),
+		ObservedAt:               time.Now().UTC(), Evidence: hookResult.Evidence,
 	}, nil
+}
+
+func (s *LiveService) RecoverTransfer(
+	ctx context.Context,
+	request domainexecution.SequentialStageRequest,
+	transactions []executionport.SequentialTransactionRecord,
+	journal executionport.SequentialJournal,
+) (crosschainport.LiveTransferResult, error) {
+	if err := request.Validate(); err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	var source *executionport.SequentialTransactionRecord
+	for index := range transactions {
+		record := &transactions[index]
+		if record.Phase != "across_source" {
+			continue
+		}
+		if source == nil || record.PreparedAt.After(source.PreparedAt) {
+			source = record
+		}
+	}
+	if source == nil || source.Status == "rejected" {
+		operationID := acrossLiveOperationID(request)
+		if source == nil {
+			// The deterministic first attempt may have persisted only its
+			// inner "created" row. No outer prepared identity means it is
+			// safe to create a fresh source attempt under a distinct audit ID.
+			operationID += fmt.Sprintf(
+				"-recovery-%d",
+				time.Now().UTC().UnixNano(),
+			)
+		}
+		return s.transfer(ctx, request, journal, operationID)
+	}
+	if source.Status == "confirmed_revert" {
+		return crosschainport.LiveTransferResult{},
+			executionport.NewStageError(
+				executionport.DispositionConfirmedFailure,
+				fmt.Errorf("across source transaction reverted"),
+			)
+	}
+	operationID := acrossLiveOperationID(request)
+	if err := resumeArmed(
+		ctx,
+		s.config.Output,
+		s.config.Configuration,
+		s.config.Client,
+		operationID,
+		s.config.StorePath,
+		s.config.Timeout,
+	); err != nil {
+		return crosschainport.LiveTransferResult{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureUncertain,
+				err,
+			)
+	}
+	store, err := sqlitestore.OpenAcrossCanary(s.config.StorePath)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	defer store.Close()
+	persisted, err := store.Get(ctx, operationID)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	before, beforeOK := new(big.Int).SetString(persisted.BalanceBefore, 10)
+	after, afterOK := new(big.Int).SetString(persisted.BalanceAfter, 10)
+	if !beforeOK || !afterOK || after.Cmp(before) <= 0 ||
+		strings.TrimSpace(persisted.SourceIdentity) == "" ||
+		strings.TrimSpace(persisted.DestinationIdentity) == "" {
+		return crosschainport.LiveTransferResult{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureUncertain,
+				fmt.Errorf("across recovered settlement evidence is incomplete"),
+			)
+	}
+	output, err := market.NewTokenAmount(
+		request.Stage.OutputToken,
+		new(big.Int).Sub(after, before),
+	)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	sourceIdentity := source.Identity
+	sourceIdentity.Hash = persisted.SourceIdentity
+	return crosschainport.LiveTransferResult{
+		ActualInput: request.Input, ActualOutput: output,
+		SourceIdentity: sourceIdentity,
+		DestinationIdentity: domainexecution.TransactionIdentity{
+			Chain:   request.Stage.DestinationChain,
+			Account: s.config.Accounts[request.Stage.DestinationChain],
+			Hash:    persisted.DestinationIdentity,
+		},
+		DestinationBalanceBefore: before,
+		DestinationBalanceAfter:  after,
+		ObservedAt:               time.Now().UTC(),
+		Evidence:                 "across_durable_destination_reconciliation",
+	}, nil
+}
+
+func acrossLiveOperationID(
+	request domainexecution.SequentialStageRequest,
+) string {
+	return fmt.Sprintf(
+		"across-%s-%d",
+		request.Operation,
+		request.Stage.Ordinal,
+	)
 }
 
 // CostApproval performs the same authenticated Across approval request used by
@@ -243,3 +375,4 @@ func (s *LiveService) accountForKind(kind string) domainexecution.AccountID {
 }
 
 var _ crosschainport.LiveTransferService = (*LiveService)(nil)
+var _ crosschainport.RecoverableLiveTransferService = (*LiveService)(nil)

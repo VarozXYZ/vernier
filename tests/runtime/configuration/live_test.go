@@ -69,6 +69,38 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 	}
 }
 
+func TestLoadLiveConfigResolvesGasRefuelDefaults(t *testing.T) {
+	manifest := writeSequentialLiveConfig(t, "750")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withRefuel := strings.Replace(
+		string(data),
+		"    operational_store:",
+		"    gas_refuel: {enabled: true}\n    operational_store:",
+		1,
+	)
+	if err := os.WriteFile(policyPath, []byte(withRefuel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refuel := config.GasRefuel
+	if !refuel.Enabled ||
+		refuel.ThresholdUSD.RatString() != "5" ||
+		refuel.TargetUSD.RatString() != "15" ||
+		refuel.MaxUSDC.RatString() != "20" ||
+		refuel.PollInterval != 5*time.Minute ||
+		refuel.Cooldown != 15*time.Minute ||
+		refuel.SlippageBPS != 20 {
+		t.Fatalf("unexpected gas refuel defaults: %+v", refuel)
+	}
+}
+
 func TestLoadLiveConfigRejectsSequentialExecutionBelowDiscoveryNotional(t *testing.T) {
 	manifest := writeSequentialLiveConfig(t, "1")
 	_, err := configuration.LoadLiveConfig(manifest)

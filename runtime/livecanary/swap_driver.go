@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,10 +20,56 @@ import (
 type SwapBinding struct {
 	Account          execution.AccountID
 	Validator        executionport.Validator
+	RefuelValidator  executionport.Validator
 	Estimator        SwapQuoteEstimator
 	TxManager        chainport.TxManager
 	Confirmation     chainport.ConfirmationSource
 	NonceCoordinator chainport.EVMNonceCoordinator
+	SpendableBalance SpendableBalanceReader
+	Allowance        AllowanceReader
+	RefuelNetwork    RefuelNetwork
+	NativeToken      market.Token
+}
+
+type AllowanceReader interface {
+	Allowance(
+		context.Context,
+		market.TokenID,
+		string,
+	) (*big.Int, error)
+}
+
+type AllowanceReaderFunc func(
+	context.Context,
+	market.TokenID,
+	string,
+) (*big.Int, error)
+
+func (f AllowanceReaderFunc) Allowance(
+	ctx context.Context,
+	token market.TokenID,
+	spender string,
+) (*big.Int, error) {
+	return f(ctx, token, spender)
+}
+
+type SpendableBalanceReader interface {
+	SpendableBalance(
+		context.Context,
+		market.TokenID,
+	) (*big.Int, error)
+}
+
+type SpendableBalanceReaderFunc func(
+	context.Context,
+	market.TokenID,
+) (*big.Int, error)
+
+func (f SpendableBalanceReaderFunc) SpendableBalance(
+	ctx context.Context,
+	token market.TokenID,
+) (*big.Int, error) {
+	return f(ctx, token)
 }
 
 type SwapQuoteEstimator interface {
@@ -126,6 +173,8 @@ type exitReturnQuote struct {
 	output market.TokenAmount
 	err    error
 }
+
+const destinationExitPreparationAttempts = 2
 
 func (d *SwapDriver) ExecuteStage(
 	ctx context.Context,
@@ -305,6 +354,309 @@ func (d *SwapDriver) ExecuteStage(
 		SourceIdentity: prepared.Identity,
 		ObservedAt:     settlement.ObservedAt, Evidence: settlement.Evidence,
 	}, nil
+}
+
+func (d *SwapDriver) RecoverStage(
+	ctx context.Context,
+	request execution.SequentialStageRequest,
+	transactions []executionport.SequentialTransactionRecord,
+	journal executionport.SequentialJournal,
+) (execution.SequentialStageSettlement, error) {
+	if err := request.Validate(); err != nil {
+		return execution.SequentialStageSettlement{}, err
+	}
+	binding, err := d.binding(request)
+	if err != nil {
+		return execution.SequentialStageSettlement{}, err
+	}
+	var candidate *executionport.SequentialTransactionRecord
+	for index := range transactions {
+		record := &transactions[index]
+		if record.Ordinal != request.Stage.Ordinal ||
+			record.Identity.Chain != request.Stage.SourceChain {
+			continue
+		}
+		if candidate == nil ||
+			record.PreparedAt.After(candidate.PreparedAt) {
+			candidate = record
+		}
+	}
+	if candidate == nil ||
+		candidate.Status == "rejected" ||
+		candidate.Status == "confirmed_revert" {
+		return d.executeRecoverySwap(ctx, request, binding, journal)
+	}
+	expected, expectedErr := market.NewTokenAmount(
+		request.Stage.OutputToken,
+		big.NewInt(1),
+	)
+	if expectedErr != nil {
+		return execution.SequentialStageSettlement{}, expectedErr
+	}
+	side := execution.LegSell
+	if request.Stage.Stage == execution.StageBuy {
+		side = execution.LegBuy
+	}
+	step := execution.OperationStep{
+		Operation: request.Operation,
+		Leg: execution.Leg{
+			ID: execution.StepID(fmt.Sprintf(
+				"%s/%d/%s",
+				request.Operation,
+				request.Stage.Ordinal,
+				candidate.Phase,
+			)),
+			Side: side, Chain: request.Stage.SourceChain,
+			Account: binding.Account, Market: request.Stage.Market,
+			Input: request.Input, ExpectedOutput: expected,
+		},
+		Identity:  candidate.Identity,
+		Technical: execution.StateBroadcastPossible,
+		Economic:  execution.EconomicReserved,
+	}
+	settlement, err := binding.TxManager.Reconcile(ctx, step)
+	if err != nil {
+		return execution.SequentialStageSettlement{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureTemporary,
+				fmt.Errorf("reconcile swap %s: %w", candidate.Identity.Hash, err),
+			)
+	}
+	switch settlement.Technical {
+	case execution.StateConfirmedSuccess:
+		if settlement.Economic != execution.EconomicEffectVerified ||
+			settlement.ActualIn.IsZero() || settlement.ActualOut.IsZero() {
+			return execution.SequentialStageSettlement{},
+				executionport.NewRecoveryError(
+					executionport.RecoveryFailureUncertain,
+					fmt.Errorf(
+						"confirmed swap %s has incomplete economic evidence",
+						candidate.Identity.Hash,
+					),
+				)
+		}
+		valuedCosts, valueErr := valueCosts(d.Costs, settlement.Costs)
+		if valueErr != nil {
+			return execution.SequentialStageSettlement{},
+				executionport.NewRecoveryError(
+					executionport.RecoveryFailureTemporary,
+					valueErr,
+				)
+		}
+		if markErr := journal.MarkTransaction(
+			ctx,
+			request.Operation,
+			request.Stage.Ordinal,
+			candidate.Phase,
+			"confirmed",
+		); markErr != nil {
+			return execution.SequentialStageSettlement{}, markErr
+		}
+		return execution.SequentialStageSettlement{
+			Request: request, ActualInput: settlement.ActualIn,
+			ActualOutput: settlement.ActualOut, Costs: valuedCosts,
+			SourceIdentity: candidate.Identity,
+			ObservedAt:     settlement.ObservedAt,
+			Evidence:       settlement.Evidence + "+startup_reconciliation",
+		}, nil
+	case execution.StateConfirmedRevert:
+		_ = journal.MarkTransaction(
+			context.WithoutCancel(ctx),
+			request.Operation,
+			request.Stage.Ordinal,
+			candidate.Phase,
+			"confirmed_revert",
+		)
+		valuedCosts, valueErr := valueCosts(d.Costs, settlement.Costs)
+		if valueErr != nil {
+			return execution.SequentialStageSettlement{}, valueErr
+		}
+		return execution.SequentialStageSettlement{},
+			executionport.NewStageErrorWithCosts(
+				executionport.DispositionConfirmedFailure,
+				valuedCosts,
+				fmt.Errorf("reconciled swap reverted"),
+			)
+	case execution.StateBroadcastRejected:
+		_ = journal.MarkTransaction(
+			context.WithoutCancel(ctx),
+			request.Operation,
+			request.Stage.Ordinal,
+			candidate.Phase,
+			"rejected",
+		)
+		return execution.SequentialStageSettlement{},
+			executionport.NewStageError(
+				executionport.DispositionRejected,
+				fmt.Errorf("reconciled swap was never accepted"),
+			)
+	default:
+		return execution.SequentialStageSettlement{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureUncertain,
+				fmt.Errorf(
+					"swap %s remains uncertain: %s",
+					candidate.Identity.Hash,
+					settlement.Evidence,
+				),
+			)
+	}
+}
+
+func (d *SwapDriver) executeRecoverySwap(
+	ctx context.Context,
+	request execution.SequentialStageRequest,
+	binding SwapBinding,
+	journal executionport.SequentialJournal,
+) (execution.SequentialStageSettlement, error) {
+	executionRequest := request
+	if request.Stage.Stage == execution.StageSell &&
+		binding.SpendableBalance != nil {
+		available, err := binding.SpendableBalance.SpendableBalance(
+			ctx,
+			request.Stage.InputToken,
+		)
+		if err != nil {
+			return execution.SequentialStageSettlement{},
+				executionport.NewRecoveryError(
+					executionport.RecoveryFailureTemporary,
+					fmt.Errorf("read spendable sell balance: %w", err),
+				)
+		}
+		if available == nil || available.Sign() <= 0 {
+			return execution.SequentialStageSettlement{},
+				executionport.NewRecoveryError(
+					executionport.RecoveryFailureBalanceMismatch,
+					fmt.Errorf("sell inventory is not yet visible"),
+				)
+		}
+		if available.Cmp(request.Input.Units()) < 0 {
+			minimumHistorical := new(big.Int).Mul(
+				request.Input.Units(),
+				big.NewInt(99),
+			)
+			minimumHistorical.Quo(minimumHistorical, big.NewInt(100))
+			if available.Cmp(minimumHistorical) < 0 {
+				return execution.SequentialStageSettlement{},
+					executionport.NewRecoveryError(
+						executionport.RecoveryFailureBalanceMismatch,
+						fmt.Errorf(
+							"spendable sell balance %s is materially below attributable inventory %s",
+							available,
+							request.Input.Units(),
+						),
+					)
+			}
+			resized, resizeErr := market.NewTokenAmount(
+				request.Stage.InputToken,
+				available,
+			)
+			if resizeErr != nil {
+				return execution.SequentialStageSettlement{}, resizeErr
+			}
+			executionRequest.Input = resized
+		}
+	}
+	settlement, err := d.ExecuteStage(ctx, executionRequest, journal)
+	if err != nil {
+		return execution.SequentialStageSettlement{},
+			classifyRecoverySwapError(
+				ctx,
+				binding,
+				executionRequest.Input,
+				err,
+			)
+	}
+	if executionRequest.Input.Units().Cmp(request.Input.Units()) != 0 {
+		settlement.Request = request
+		settlement.Evidence += "+recovery_balance_resized"
+	}
+	return settlement, nil
+}
+
+func classifyRecoverySwapError(
+	ctx context.Context,
+	binding SwapBinding,
+	input market.TokenAmount,
+	err error,
+) error {
+	var allowanceFailure *executionport.AllowanceRequiredError
+	if errors.As(err, &allowanceFailure) &&
+		binding.Allowance != nil &&
+		binding.SpendableBalance != nil {
+		balance, balanceErr := binding.SpendableBalance.SpendableBalance(
+			ctx,
+			input.Token(),
+		)
+		if balanceErr != nil {
+			return executionport.NewRecoveryError(
+				executionport.RecoveryFailureTemporary,
+				fmt.Errorf("inspect token balance: %w", balanceErr),
+			)
+		}
+		allowance, allowanceErr := binding.Allowance.Allowance(
+			ctx,
+			input.Token(),
+			allowanceFailure.Spender,
+		)
+		if allowanceErr != nil {
+			return executionport.NewRecoveryError(
+				executionport.RecoveryFailureTemporary,
+				fmt.Errorf("inspect token allowance: %w", allowanceErr),
+			)
+		}
+		if balance.Cmp(input.Units()) < 0 {
+			return executionport.NewRecoveryError(
+				executionport.RecoveryFailureBalanceMismatch,
+				fmt.Errorf(
+					"spendable balance %s is below required %s",
+					balance,
+					input.Units(),
+				),
+			)
+		}
+		if allowance.Cmp(input.Units()) < 0 {
+			return executionport.NewRecoveryError(
+				executionport.RecoveryFailureAllowance,
+				fmt.Errorf(
+					"allowance to %s is %s, required %s",
+					allowanceFailure.Spender,
+					allowance,
+					input.Units(),
+				),
+			)
+		}
+		return executionport.NewRecoveryError(
+			executionport.RecoveryFailureStaleArtifact,
+			err,
+		)
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "return amount is not enough"),
+		strings.Contains(text, "too little received"),
+		strings.Contains(text, "slippage"):
+		return executionport.NewRecoveryError(
+			executionport.RecoveryFailureStaleArtifact,
+			err,
+		)
+	case strings.Contains(text, "insufficient funds for gas"),
+		strings.Contains(text, "insufficient lamports"),
+		strings.Contains(text, "insufficient native"):
+		return executionport.NewRecoveryError(
+			executionport.RecoveryFailureInsufficientNative,
+			err,
+		)
+	case strings.Contains(text, "fee cap"),
+		strings.Contains(text, "priority fee") &&
+			strings.Contains(text, "maximum"):
+		return executionport.NewRecoveryError(
+			executionport.RecoveryFailureFeeCap,
+			err,
+		)
+	default:
+		return err
+	}
 }
 
 func (d *SwapDriver) Preflight(
@@ -559,12 +911,19 @@ func (d *SwapDriver) selectExit(
 		}()
 	}
 	started := clock()
-	destination, err := d.prepareAndSimulate(
+	destination, destinationAttempts, err := d.prepareExitWithRetry(
 		ctx,
+		operation,
 		destinationRequest,
 		destinationBinding,
 	)
 	if err != nil {
+		d.write(
+			"live_exit_destination operation=%s status=unavailable attempts=%d error=%q\n",
+			operation,
+			destinationAttempts,
+			err,
+		)
 		var quotedReturn exitReturnQuote
 		if !compareReturn {
 			quotedReturn = d.quoteReturnExit(ctx, plan, bridged)
@@ -937,12 +1296,52 @@ func (d *SwapDriver) prepareAndSimulate(
 ) (preparedSwap, error) {
 	bundle, err := d.prepareSwap(ctx, request, binding)
 	if err != nil {
-		return preparedSwap{}, err
+		return preparedSwap{}, fmt.Errorf("quote/build preparation: %w", err)
 	}
 	if err := d.simulate(ctx, binding, bundle.prepared); err != nil {
-		return preparedSwap{}, err
+		return preparedSwap{}, fmt.Errorf("transaction simulation: %w", err)
 	}
 	return bundle, nil
+}
+
+func (d *SwapDriver) prepareExitWithRetry(
+	ctx context.Context,
+	operation execution.OperationID,
+	request execution.SequentialStageRequest,
+	binding SwapBinding,
+) (preparedSwap, int, error) {
+	failures := make([]error, 0, destinationExitPreparationAttempts)
+	for attempt := 1; attempt <= destinationExitPreparationAttempts; attempt++ {
+		bundle, err := d.prepareAndSimulate(ctx, request, binding)
+		if err == nil {
+			if attempt > 1 {
+				d.write(
+					"live_exit_destination operation=%s status=ready attempt=%d/%d\n",
+					operation,
+					attempt,
+					destinationExitPreparationAttempts,
+				)
+			}
+			return bundle, attempt, nil
+		}
+		attemptErr := fmt.Errorf(
+			"attempt %d/%d: %w",
+			attempt,
+			destinationExitPreparationAttempts,
+			err,
+		)
+		failures = append(failures, attemptErr)
+		d.write(
+			"live_exit_destination operation=%s status=failed attempt=%d/%d error=%q\n",
+			operation,
+			attempt,
+			destinationExitPreparationAttempts,
+			err,
+		)
+	}
+	return preparedSwap{},
+		destinationExitPreparationAttempts,
+		errors.Join(failures...)
 }
 
 func (d *SwapDriver) prepareSwap(
@@ -1259,3 +1658,4 @@ var _ executionport.SequentialStageDriver = (*SwapDriver)(nil)
 var _ executionport.SequentialPreflight = (*SwapDriver)(nil)
 var _ executionport.SequentialExitSelector = (*SwapDriver)(nil)
 var _ executionport.SequentialRecoveryExitSelector = (*SwapDriver)(nil)
+var _ executionport.SequentialRecoveryDriver = (*SwapDriver)(nil)

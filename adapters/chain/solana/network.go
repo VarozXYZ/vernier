@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -159,6 +160,30 @@ func (n *ReadOnlyNetwork) CurrentSlot(ctx context.Context) (uint64, error) {
 		return 0, fmt.Errorf("read %s current slot: %w", n.label, err)
 	}
 	return slot, nil
+}
+
+func (n *ReadOnlyNetwork) NativeBalance(
+	ctx context.Context,
+	address string,
+) (*big.Int, error) {
+	if strings.TrimSpace(address) == "" {
+		return nil, fmt.Errorf("native balance address is required")
+	}
+	var result struct {
+		Value uint64 `json:"value"`
+	}
+	if err := n.callHTTP(
+		ctx,
+		"getBalance",
+		[]any{
+			address,
+			map[string]string{"commitment": "confirmed"},
+		},
+		&result,
+	); err != nil {
+		return nil, fmt.Errorf("read %s native balance: %w", n.label, err)
+	}
+	return new(big.Int).SetUint64(result.Value), nil
 }
 
 func (n *ReadOnlyNetwork) FeeForMessage(

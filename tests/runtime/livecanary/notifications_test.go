@@ -3,6 +3,7 @@ package livecanary_test
 import (
 	"context"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,8 +17,10 @@ import (
 )
 
 type liveNotificationSender struct {
-	mu     sync.Mutex
-	events []notificationport.LiveExecutionEvent
+	mu        sync.Mutex
+	events    []notificationport.LiveExecutionEvent
+	lifecycle []notificationport.LiveRuntimeEvent
+	order     []string
 }
 
 func (s *liveNotificationSender) SendLiveExecution(
@@ -27,7 +30,48 @@ func (s *liveNotificationSender) SendLiveExecution(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = append(s.events, event)
+	s.order = append(s.order, "execution:"+string(event.Kind))
 	return nil
+}
+
+func (s *liveNotificationSender) SendLiveRuntime(
+	_ context.Context,
+	event notificationport.LiveRuntimeEvent,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lifecycle = append(s.lifecycle, event)
+	s.order = append(s.order, "runtime:"+string(event.Kind))
+	return nil
+}
+
+func TestLiveNotifierPreservesLifecycleAndExecutionOrder(t *testing.T) {
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier.NotifyRuntime(notificationport.LiveRuntimeEvent{
+		Kind: notificationport.LiveRuntimeStarted,
+		Mode: "live",
+	})
+	notifier.Notify(notificationport.LiveExecutionEvent{
+		Kind:      notificationport.LiveExecutionStarted,
+		Operation: "operation",
+	})
+	notifier.NotifyRuntime(notificationport.LiveRuntimeEvent{
+		Kind: notificationport.LiveRuntimeStopped,
+		Mode: "live", Reason: "completed",
+	})
+	notifier.Close()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	got := strings.Join(sender.order, ",")
+	want := "runtime:started,execution:started,runtime:stopped"
+	if got != want {
+		t.Fatalf("notification order=%q, want %q", got, want)
+	}
 }
 
 func TestProgressObserverEmitsNonBlockingLifecycleEvents(t *testing.T) {

@@ -112,6 +112,47 @@ func TestSequentialLiveStoreAcknowledgesManualReconciliation(t *testing.T) {
 	}
 }
 
+func TestSequentialLiveStoreAcknowledgesRecoveryBlocked(t *testing.T) {
+	store, err := sqlitestore.OpenSequentialLive(
+		filepath.Join(t.TempDir(), "live.sqlite"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	input, _ := market.NewTokenAmount("quote-a", big.NewInt(1_000_000))
+	now := time.Now().UTC()
+	operation := domainexecution.SequentialOperation{
+		ID: "operation-blocked", Plan: "plan-1",
+		OpportunityID: "opportunity-1", ConfigHash: "config",
+		State:         domainexecution.SequentialRunning,
+		CurrentAmount: input, StartedAt: now, UpdatedAt: now,
+	}
+	ctx := context.Background()
+	if err := store.CreateSequentialOperation(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetSequentialRecoveryState(
+		ctx,
+		operation.ID,
+		domainexecution.SequentialRecoveryBlocked,
+		context.DeadlineExceeded,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AcknowledgeManualReconciliation(
+		ctx,
+		operation.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.ActiveSequentialOperation(
+		ctx,
+	); err != nil || found {
+		t.Fatalf("active found=%t err=%v", found, err)
+	}
+}
+
 func TestSequentialLiveStorePersistsRealizedCostsAndPnL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "live-costs.sqlite")
 	store, err := sqlitestore.OpenSequentialLive(path)

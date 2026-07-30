@@ -237,6 +237,17 @@ type LiveConfig struct {
 	OperationalStore              OperationalStoreConfig       `yaml:"operational_store"`
 	Accounts                      map[string]LiveAccountConfig `yaml:"accounts"`
 	Inventory                     []InventoryBalanceConfig     `yaml:"inventory"`
+	GasRefuel                     GasRefuelConfig              `yaml:"gas_refuel"`
+}
+
+type GasRefuelConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	ThresholdUSD    string `yaml:"threshold_usd"`
+	TargetUSD       string `yaml:"target_usd"`
+	PollSeconds     int    `yaml:"poll_seconds"`
+	CooldownSeconds int    `yaml:"cooldown_seconds"`
+	SlippageBPS     uint16 `yaml:"slippage_bps"`
+	MaxUSDC         string `yaml:"max_usdc"`
 }
 
 type OperationalStoreConfig struct {
@@ -469,6 +480,17 @@ type ParsedLiveConfig struct {
 	SQLiteSynchronous             string
 	Accounts                      map[string]ResolvedLiveAccount
 	Inventory                     []ResolvedInventoryBalance
+	GasRefuel                     ResolvedGasRefuel
+}
+
+type ResolvedGasRefuel struct {
+	Enabled      bool
+	ThresholdUSD *big.Rat
+	TargetUSD    *big.Rat
+	PollInterval time.Duration
+	Cooldown     time.Duration
+	SlippageBPS  uint16
+	MaxUSDC      *big.Rat
 }
 
 type LookupEnv func(string) (string, bool)
@@ -1001,6 +1023,60 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		config.CostCacheTTLMS < config.CostRefreshIntervalMS {
 		return ParsedLiveConfig{}, fmt.Errorf("live complete-flow cost cache policy is invalid")
 	}
+	refuel := ResolvedGasRefuel{Enabled: config.GasRefuel.Enabled}
+	if refuel.Enabled {
+		if strings.TrimSpace(config.GasRefuel.ThresholdUSD) == "" {
+			config.GasRefuel.ThresholdUSD = "5"
+		}
+		if strings.TrimSpace(config.GasRefuel.TargetUSD) == "" {
+			config.GasRefuel.TargetUSD = "15"
+		}
+		if strings.TrimSpace(config.GasRefuel.MaxUSDC) == "" {
+			config.GasRefuel.MaxUSDC = "20"
+		}
+		if config.GasRefuel.PollSeconds == 0 {
+			config.GasRefuel.PollSeconds = 300
+		}
+		if config.GasRefuel.CooldownSeconds == 0 {
+			config.GasRefuel.CooldownSeconds = 900
+		}
+		if config.GasRefuel.SlippageBPS == 0 {
+			config.GasRefuel.SlippageBPS = 20
+		}
+		refuel.ThresholdUSD, err = positive(
+			config.GasRefuel.ThresholdUSD,
+			"live gas refuel threshold",
+		)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		refuel.TargetUSD, err = positive(
+			config.GasRefuel.TargetUSD,
+			"live gas refuel target",
+		)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		refuel.MaxUSDC, err = positive(
+			config.GasRefuel.MaxUSDC,
+			"live gas refuel maximum",
+		)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+		refuel.PollInterval =
+			time.Duration(config.GasRefuel.PollSeconds) * time.Second
+		refuel.Cooldown =
+			time.Duration(config.GasRefuel.CooldownSeconds) * time.Second
+		refuel.SlippageBPS = config.GasRefuel.SlippageBPS
+		if refuel.TargetUSD.Cmp(refuel.ThresholdUSD) <= 0 ||
+			refuel.PollInterval < time.Minute ||
+			refuel.Cooldown < refuel.PollInterval ||
+			refuel.SlippageBPS > 10_000 {
+			return ParsedLiveConfig{},
+				fmt.Errorf("live gas refuel policy is invalid")
+		}
+	}
 	synchronous := strings.ToUpper(strings.TrimSpace(config.OperationalStore.Synchronous))
 	if synchronous == "" {
 		synchronous = "FULL"
@@ -1185,6 +1261,7 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		EVMDeadline:             time.Duration(config.EVMDeadlineSeconds) * time.Second,
 		OperationalStorePath:    config.OperationalStore.Path, SQLiteSynchronous: synchronous,
 		Accounts: accounts, Inventory: inventoryBalances,
+		GasRefuel: refuel,
 	}, nil
 }
 

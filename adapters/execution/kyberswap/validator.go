@@ -144,12 +144,14 @@ func (v *Validator) Validate(
 				continue
 			}
 			if buildAttempts > 1 {
+				err = classifyAllowanceFailure(err, router)
 				return executionport.Artifact{}, fmt.Errorf(
 					"%s KyberSwap transaction after one fresh-route retry: %w",
 					validationPhase,
 					err,
 				)
 			}
+			err = classifyAllowanceFailure(err, router)
 			return executionport.Artifact{}, fmt.Errorf(
 				"%s KyberSwap transaction: %w",
 				validationPhase,
@@ -204,6 +206,20 @@ func (v *Validator) Validate(
 		},
 		BuiltAt: now,
 	}, nil
+}
+
+func classifyAllowanceFailure(err error, router common.Address) error {
+	if err == nil || router == (common.Address{}) ||
+		!strings.Contains(
+			strings.ToUpper(err.Error()),
+			"TRANSFER_FROM_FAILED",
+		) {
+		return err
+	}
+	return &executionport.AllowanceRequiredError{
+		Spender: router.Hex(),
+		Err:     err,
+	}
 }
 
 // EstimateNetworkGas uses KyberSwap's route-level gas estimate without

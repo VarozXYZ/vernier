@@ -57,6 +57,7 @@ type liveExecutionResult struct {
 type liveExecutionHooks struct {
 	Request          domainexecution.SequentialStageRequest
 	Journal          executionport.SequentialJournal
+	OperationID      string
 	Accounts         map[string]domainexecution.AccountID
 	NativeAssets     map[market.ChainID]market.AssetID
 	NonceCoordinator chainport.EVMNonceCoordinator
@@ -337,9 +338,15 @@ func executeArmed(
 	if err != nil {
 		return err
 	}
-	operationID, err := newAcrossOperationID()
-	if err != nil {
-		return err
+	operationID := ""
+	if hooks != nil {
+		operationID = strings.TrimSpace(hooks.OperationID)
+	}
+	if operationID == "" {
+		operationID, err = newAcrossOperationID()
+		if err != nil {
+			return err
+		}
 	}
 	store, err := sqlitepersistence.OpenAcrossCanary(storePath)
 	if err != nil {

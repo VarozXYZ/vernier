@@ -15,7 +15,9 @@ import (
 
 	sqlitestore "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	"github.com/VarozXYZ/vernier/domain/execution"
+	"github.com/VarozXYZ/vernier/domain/market"
 	"github.com/VarozXYZ/vernier/internal/buildinfo"
+	executionport "github.com/VarozXYZ/vernier/ports/execution"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 	"github.com/VarozXYZ/vernier/runtime/livecanary"
 	"github.com/VarozXYZ/vernier/runtime/observability"
@@ -24,6 +26,14 @@ import (
 type armedRuntime interface {
 	Run(context.Context) error
 	Close() error
+}
+
+type refuelRuntime interface {
+	RefuelOnce(
+		context.Context,
+		market.ChainID,
+		bool,
+	) (executionport.RefuelRecord, error)
 }
 
 type runMode string
@@ -85,6 +95,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		"",
 		"close one manually reconciled operation barrier by exact operation ID",
 	)
+	refuelOnce := flags.String(
+		"refuel-once",
+		"",
+		"build and simulate one gas refuel for solana or polygon; add -arm to broadcast",
+	)
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -100,7 +115,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		(*arm || *dryRun || *costObserve ||
 			strings.TrimSpace(*confirmCanary) != "" ||
 			strings.TrimSpace(*confirmLive) != "" ||
-			strings.TrimSpace(*forceCanaryDirection) != "") {
+			strings.TrimSpace(*forceCanaryDirection) != "" ||
+			strings.TrimSpace(*refuelOnce) != "") {
 		fmt.Fprintln(
 			stderr,
 			"live: -acknowledge-reconciled-operation cannot be combined with execution flags",
@@ -132,6 +148,23 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if forcedDirection != "" && !*arm {
 		fmt.Fprintln(stderr, "live: -force-canary-direction requires -arm")
+		return 2
+	}
+	refuelChain := market.ChainID(strings.ToLower(strings.TrimSpace(*refuelOnce)))
+	if refuelChain != "" &&
+		refuelChain != market.ChainID("solana") &&
+		refuelChain != market.ChainID("polygon") {
+		fmt.Fprintln(stderr, "live: -refuel-once must be solana or polygon")
+		return 2
+	}
+	if refuelChain != "" &&
+		(*dryRun || *costObserve || forcedDirection != "" ||
+			strings.TrimSpace(*confirmCanary) != "" ||
+			strings.TrimSpace(*confirmLive) != "") {
+		fmt.Fprintln(
+			stderr,
+			"live: -refuel-once cannot be combined with execution or observation flags",
+		)
 		return 2
 	}
 	if err := configuration.LoadEnvFile(*envPath, os.LookupEnv, os.Setenv); err != nil {
@@ -166,7 +199,32 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		)
 		return 0
 	}
-	if *arm && config.ExecutionMode == "sequential_bridge_canary" {
+	if refuelChain != "" {
+		store, openErr := sqlitestore.OpenSequentialLive(
+			config.OperationalStorePath,
+		)
+		if openErr != nil {
+			fmt.Fprintf(stderr, "live: open operational journal: %v\n", openErr)
+			return 1
+		}
+		active, found, activeErr := store.ActiveSequentialOperation(ctx)
+		_ = store.Close()
+		if activeErr != nil {
+			fmt.Fprintf(stderr, "live: inspect operational barrier: %v\n", activeErr)
+			return 1
+		}
+		if found {
+			fmt.Fprintf(
+				stderr,
+				"live: operation %s is %s; run automatic recovery before refueling manually\n",
+				active.ID,
+				active.State,
+			)
+			return 1
+		}
+	}
+	if *arm && refuelChain == "" &&
+		config.ExecutionMode == "sequential_bridge_canary" {
 		expected := ""
 		if config.CanaryInput != nil {
 			expected = config.CanaryInput.RatString()
@@ -180,7 +238,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if *arm && config.ExecutionMode == "sequential_bridge_live" {
+	if *arm && refuelChain == "" &&
+		config.ExecutionMode == "sequential_bridge_live" {
 		expected := ""
 		if config.ExecutionInput != nil {
 			expected = config.ExecutionInput.RatString()
@@ -204,6 +263,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	mode := runMode("")
 	if *arm {
+		mode = modeArmed
+	} else if refuelChain != "" {
+		// Refuel preview needs signer-backed transaction construction and
+		// simulation, but RefuelOnce still keeps broadcast disarmed.
 		mode = modeArmed
 	} else if *costObserve {
 		mode = modeCostObserve
@@ -246,6 +309,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			Logger:           logger,
 			Output:           stdout,
 			ObserveCostsOnly: mode == modeCostObserve,
+			RefuelOnly:       refuelChain != "",
 			ForcedCanary:     forcedDirection,
 		})
 	} else {
@@ -260,6 +324,30 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer runtime.Close()
+	if refuelChain != "" {
+		refueler, ok := runtime.(refuelRuntime)
+		if !ok {
+			fmt.Fprintln(stderr, "live: runtime does not support gas refuel")
+			return 1
+		}
+		record, refuelErr := refueler.RefuelOnce(ctx, refuelChain, *arm)
+		if refuelErr != nil {
+			fmt.Fprintf(stderr, "live: refuel %s: %v\n", refuelChain, refuelErr)
+			return 1
+		}
+		action := "simulated"
+		if *arm {
+			action = "completed"
+		}
+		fmt.Fprintf(
+			stdout,
+			"live_refuel chain=%s action=%s input=%s output=%s fee=%s tx=%s\n",
+			refuelChain, action, record.Input.String(),
+			record.NativeReceived.String(), record.Fee.String(),
+			record.Identity.Hash,
+		)
+		return 0
+	}
 	if err := runtime.Run(ctx); err != nil {
 		fmt.Fprintf(stderr, "live: runtime failed: %v\n", err)
 		return 1

@@ -18,15 +18,21 @@ import (
 )
 
 type LiveNotifier struct {
-	sender notificationport.LiveExecutionSender
-	logger *slog.Logger
-	queue  chan notificationport.LiveExecutionEvent
+	sender        notificationport.LiveExecutionSender
+	runtimeSender notificationport.LiveRuntimeSender
+	logger        *slog.Logger
+	queue         chan liveNotification
 
 	mu        sync.Mutex
 	closed    bool
 	terminal  map[string]struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+}
+
+type liveNotification struct {
+	execution *notificationport.LiveExecutionEvent
+	runtime   *notificationport.LiveRuntimeEvent
 }
 
 func NewLiveNotifier(
@@ -38,8 +44,11 @@ func NewLiveNotifier(
 	}
 	notifier := &LiveNotifier{
 		sender: sender, logger: logger,
-		queue:    make(chan notificationport.LiveExecutionEvent, 64),
+		queue:    make(chan liveNotification, 64),
 		terminal: make(map[string]struct{}),
+	}
+	if runtimeSender, ok := sender.(notificationport.LiveRuntimeSender); ok {
+		notifier.runtimeSender = runtimeSender
 	}
 	notifier.wg.Add(1)
 	go notifier.run()
@@ -55,19 +64,60 @@ func (n *LiveNotifier) Notify(event notificationport.LiveExecutionEvent) {
 		return
 	}
 	if event.Kind == notificationport.LiveExecutionCompleted ||
-		event.Kind == notificationport.LiveExecutionFailed {
-		if _, exists := n.terminal[event.Operation]; exists {
+		event.Kind == notificationport.LiveExecutionFailed ||
+		event.Kind == notificationport.LiveExecutionRecoveryBlocked ||
+		event.Kind == notificationport.LiveExecutionRefuelCompleted ||
+		event.Kind == notificationport.LiveExecutionRefuelFailed ||
+		event.Kind == notificationport.LiveExecutionRefuelUncertain {
+		key := terminalNotificationKey(event)
+		if _, exists := n.terminal[key]; exists {
 			return
 		}
-		n.terminal[event.Operation] = struct{}{}
+		n.terminal[key] = struct{}{}
 	}
 	select {
-	case n.queue <- event:
+	case n.queue <- liveNotification{execution: &event}:
 	default:
 		if n.logger != nil {
 			n.logger.Error(
 				"Live Telegram queue is full; notification dropped",
 				"operation", event.Operation, "kind", event.Kind,
+			)
+		}
+	}
+}
+
+func terminalNotificationKey(
+	event notificationport.LiveExecutionEvent,
+) string {
+	class := "execution"
+	switch event.Kind {
+	case notificationport.LiveExecutionRecoveryBlocked:
+		class = "recovery"
+	case notificationport.LiveExecutionRefuelCompleted,
+		notificationport.LiveExecutionRefuelFailed,
+		notificationport.LiveExecutionRefuelUncertain:
+		class = "refuel"
+	}
+	return event.Operation + "/" + class
+}
+
+// NotifyRuntime enqueues process lifecycle state without putting Telegram on
+// the execution path. Senders that do not implement LiveRuntimeSender simply
+// ignore lifecycle events.
+func (n *LiveNotifier) NotifyRuntime(event notificationport.LiveRuntimeEvent) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed || n.runtimeSender == nil {
+		return
+	}
+	select {
+	case n.queue <- liveNotification{runtime: &event}:
+	default:
+		if n.logger != nil {
+			n.logger.Error(
+				"Live Telegram lifecycle queue is full; notification dropped",
+				"kind", event.Kind,
 			)
 		}
 	}
@@ -87,12 +137,21 @@ func (n *LiveNotifier) run() {
 	defer n.wg.Done()
 	for event := range n.queue {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-		err := n.sender.SendLiveExecution(ctx, event)
+		var err error
+		var kind any
+		switch {
+		case event.execution != nil:
+			kind = event.execution.Kind
+			err = n.sender.SendLiveExecution(ctx, *event.execution)
+		case event.runtime != nil && n.runtimeSender != nil:
+			kind = event.runtime.Kind
+			err = n.runtimeSender.SendLiveRuntime(ctx, *event.runtime)
+		}
 		cancel()
 		if err != nil && n.logger != nil {
 			n.logger.Error(
 				"Live Telegram notification failed",
-				"operation", event.Operation, "kind", event.Kind, "error", err,
+				"kind", kind, "error", err,
 			)
 		}
 	}
