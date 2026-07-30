@@ -229,6 +229,60 @@ func TestValidatorEstimatesExecutionAndCostGasByDefault(t *testing.T) {
 	}
 }
 
+func TestValidatorAcceptsExplicitZeroDynamicSlippage(t *testing.T) {
+	source := &routeBuilderStub{}
+	validator := newValidatorForTest(t, source)
+	request := validationRequest(t)
+	minimum, _ := market.NewTokenAmount(
+		"quote",
+		big.NewInt(2_490_000),
+	)
+	request.Slippage = &executionport.SlippageConstraint{
+		BPS:           0,
+		MinimumOutput: minimum,
+		Reason:        "dynamic_buy_budget",
+	}
+	artifact, err := validator.Validate(
+		context.Background(),
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.lastBuild.SlippageBPS != 0 ||
+		artifact.Metadata["slippage_bps"] != "0" ||
+		artifact.Metadata["required_minimum_output_units"] != "2490000" {
+		t.Fatalf(
+			"dynamic slippage was not preserved: request=%+v metadata=%+v",
+			source.lastBuild,
+			artifact.Metadata,
+		)
+	}
+}
+
+func TestValidatorRejectsBuildBelowDynamicMinimumWithoutRetry(t *testing.T) {
+	source := &routeBuilderStub{}
+	validator := newValidatorForTest(t, source)
+	request := validationRequest(t)
+	minimum, _ := market.NewTokenAmount(
+		"quote",
+		big.NewInt(2_490_001),
+	)
+	request.Slippage = &executionport.SlippageConstraint{
+		BPS:           0,
+		MinimumOutput: minimum,
+		Reason:        "dynamic_buy_budget",
+	}
+	_, err := validator.Validate(context.Background(), request)
+	var thresholdErr *executionport.SlippageThresholdError
+	if !errors.As(err, &thresholdErr) {
+		t.Fatalf("error = %v; want slippage threshold error", err)
+	}
+	if source.builds != 1 {
+		t.Fatalf("threshold rejection made %d builds; want 1", source.builds)
+	}
+}
+
 func newValidatorForTest(
 	t *testing.T,
 	source kyberswapadapter.RouteBuilder,

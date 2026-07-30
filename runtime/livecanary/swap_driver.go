@@ -150,6 +150,7 @@ type SwapDriver struct {
 	MinimumNet      *big.Rat
 	ReturnMargin    *big.Rat
 	ExitCosts       ExitCostSource
+	DynamicSlippage DynamicSlippagePolicy
 	Clock           func() time.Time
 	FallbackAfter   time.Duration
 	ArtifactMaxAge  time.Duration
@@ -204,7 +205,7 @@ func (d *SwapDriver) ExecuteStage(
 			)
 	}
 	if !cached {
-		bundle, err = d.prepareAndSimulate(ctx, request, binding)
+		bundle, err = d.prepareAndSimulate(ctx, request, binding, nil)
 		if err != nil {
 			return execution.SequentialStageSettlement{}, executionport.NewStageError(
 				executionport.DispositionRejected, err,
@@ -683,7 +684,19 @@ func (d *SwapDriver) Preflight(
 			executionport.DispositionRejected, err,
 		)
 	}
-	buy, err := d.prepareSwap(ctx, buyRequest, buyBinding)
+	buySlippage, err := d.dynamicBuySlippage(plan)
+	if err != nil {
+		return executionport.NewStageError(
+			executionport.DispositionRejected,
+			fmt.Errorf("buy dynamic slippage: %w", err),
+		)
+	}
+	buy, err := d.prepareSwap(
+		ctx,
+		buyRequest,
+		buyBinding,
+		buySlippage,
+	)
 	if err != nil {
 		return executionport.NewStageError(
 			executionport.DispositionRejected,
@@ -735,7 +748,7 @@ func (d *SwapDriver) Preflight(
 			return
 		}
 		bundle, prepareErr := d.prepareAndSimulate(
-			ctx, sellRequest, sellBinding,
+			ctx, sellRequest, sellBinding, nil,
 		)
 		sellPrepared <- sellResult{
 			artifact: bundle.artifact,
@@ -911,11 +924,33 @@ func (d *SwapDriver) selectExit(
 		}()
 	}
 	started := clock()
+	now := clock().UTC()
+	destinationCost, destinationCostsOK := market.AssetQuantity{}, false
+	if d.ExitCosts != nil {
+		destinationCost, destinationCostsOK = d.ExitCosts.ExitCost(
+			plan.Opportunity.Direction,
+			execution.ExitSellAtDestination,
+			now,
+		)
+	}
+	var sellSlippage *executionport.SlippageConstraint
+	if !forceComparison && destinationCostsOK {
+		sellSlippage, err = d.dynamicSellSlippage(
+			plan,
+			bridged,
+			incurred,
+			destinationCost,
+		)
+		if err != nil {
+			return execution.SequentialExitDecision{}, err
+		}
+	}
 	destination, destinationAttempts, err := d.prepareExitWithRetry(
 		ctx,
 		operation,
 		destinationRequest,
 		destinationBinding,
+		sellSlippage,
 	)
 	if err != nil {
 		d.write(
@@ -948,15 +983,6 @@ func (d *SwapDriver) selectExit(
 	)
 	if err != nil {
 		return execution.SequentialExitDecision{}, err
-	}
-	now := clock().UTC()
-	destinationCost, destinationCostsOK := market.AssetQuantity{}, false
-	if d.ExitCosts != nil {
-		destinationCost, destinationCostsOK = d.ExitCosts.ExitCost(
-			plan.Opportunity.Direction,
-			execution.ExitSellAtDestination,
-			now,
-		)
 	}
 	if destinationCostsOK {
 		destinationRecovery, err = destinationRecovery.Sub(destinationCost)
@@ -1293,8 +1319,9 @@ func (d *SwapDriver) prepareAndSimulate(
 	ctx context.Context,
 	request execution.SequentialStageRequest,
 	binding SwapBinding,
+	slippage *executionport.SlippageConstraint,
 ) (preparedSwap, error) {
-	bundle, err := d.prepareSwap(ctx, request, binding)
+	bundle, err := d.prepareSwap(ctx, request, binding, slippage)
 	if err != nil {
 		return preparedSwap{}, fmt.Errorf("quote/build preparation: %w", err)
 	}
@@ -1309,10 +1336,16 @@ func (d *SwapDriver) prepareExitWithRetry(
 	operation execution.OperationID,
 	request execution.SequentialStageRequest,
 	binding SwapBinding,
+	slippage *executionport.SlippageConstraint,
 ) (preparedSwap, int, error) {
 	failures := make([]error, 0, destinationExitPreparationAttempts)
 	for attempt := 1; attempt <= destinationExitPreparationAttempts; attempt++ {
-		bundle, err := d.prepareAndSimulate(ctx, request, binding)
+		bundle, err := d.prepareAndSimulate(
+			ctx,
+			request,
+			binding,
+			slippage,
+		)
 		if err == nil {
 			if attempt > 1 {
 				d.write(
@@ -1338,6 +1371,10 @@ func (d *SwapDriver) prepareExitWithRetry(
 			destinationExitPreparationAttempts,
 			err,
 		)
+		var thresholdErr *executionport.SlippageThresholdError
+		if errors.As(err, &thresholdErr) {
+			break
+		}
 	}
 	return preparedSwap{},
 		destinationExitPreparationAttempts,
@@ -1348,6 +1385,7 @@ func (d *SwapDriver) prepareSwap(
 	ctx context.Context,
 	request execution.SequentialStageRequest,
 	binding SwapBinding,
+	slippage *executionport.SlippageConstraint,
 ) (preparedSwap, error) {
 	clock := d.Clock
 	if clock == nil {
@@ -1362,6 +1400,7 @@ func (d *SwapDriver) prepareSwap(
 	if err != nil {
 		return preparedSwap{}, err
 	}
+	validationRequest.Slippage = slippage
 	started := clock()
 	artifact, err := binding.Validator.Validate(ctx, validationRequest)
 	if err != nil {
@@ -1528,6 +1567,20 @@ func (d *SwapDriver) logPrepared(
 		)
 	}
 	attempts := bundle.artifact.Metadata["build_attempts"]
+	if reason := bundle.artifact.Metadata["slippage_reason"]; reason != "" {
+		d.write(
+			"live_stage operation=%s stage=%d/%s phase=dynamic_slippage reason=%s bps=%s expected_output_units=%s minimum_output_units=%s required_final_units=%s budget_units=%s\n",
+			request.Operation,
+			request.Stage.Ordinal,
+			request.Stage.Stage,
+			reason,
+			bundle.artifact.Metadata["slippage_bps"],
+			bundle.artifact.ValidatedQuote.AmountOut,
+			bundle.artifact.Metadata["minimum_output_units"],
+			bundle.artifact.Metadata["slippage_required_final_units"],
+			dynamicBudgetMetadata(bundle.artifact.Metadata),
+		)
+	}
 	d.write(
 		"live_stage operation=%s stage=%d/%s phase=artifact_ready input_units=%s output_units=%s build_attempts=%s preflight_reused=%t latency=%s\n",
 		request.Operation,
@@ -1546,6 +1599,13 @@ func (d *SwapDriver) logPrepared(
 		request.Stage.Stage,
 		bundle.prepared.Identity.Hash,
 	)
+}
+
+func dynamicBudgetMetadata(metadata map[string]string) string {
+	if value := metadata["slippage_dynamic_budget_units"]; value != "" {
+		return value
+	}
+	return metadata["slippage_remaining_budget_units"]
 }
 
 func (d *SwapDriver) bridgeDestinationAmount(

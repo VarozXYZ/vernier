@@ -145,6 +145,10 @@ func (v *Validator) Validate(
 		value        *big.Int
 		estimatedGas uint64
 	)
+	slippageBPS := v.config.SlippageBPS
+	if request.Slippage != nil {
+		slippageBPS = request.Slippage.BPS
+	}
 	buildAttempts := 0
 	for {
 		buildAttempts++
@@ -159,7 +163,7 @@ func (v *Validator) Validate(
 		built, err = v.config.Source.Build(ctx, quoteadapter.BuildRequest{
 			Route: route, Sender: v.config.Sender.Hex(),
 			Recipient: v.config.Sender.Hex(), Origin: v.config.Sender.Hex(),
-			SlippageBPS:         v.config.SlippageBPS,
+			SlippageBPS:         slippageBPS,
 			EnableGasEstimation: false,
 		})
 		if err == nil {
@@ -221,6 +225,26 @@ func (v *Validator) Validate(
 	if !ok || outputUnits.Sign() <= 0 {
 		return executionport.Artifact{}, fmt.Errorf("KyberSwap build output is invalid")
 	}
+	thresholdUnits := slippageFloor(outputUnits, slippageBPS)
+	if request.Slippage != nil {
+		minimum := request.Slippage.MinimumOutput
+		if minimum.Token() != request.Leg.ExpectedOutput.Token() ||
+			thresholdUnits.Cmp(minimum.Units()) < 0 {
+			actual, amountErr := market.NewTokenAmount(
+				request.Leg.ExpectedOutput.Token(),
+				thresholdUnits,
+			)
+			if amountErr != nil {
+				return executionport.Artifact{}, amountErr
+			}
+			return executionport.Artifact{},
+				&executionport.SlippageThresholdError{
+					Provider: "kyberswap",
+					Actual:   actual,
+					Required: minimum,
+				}
+		}
+	}
 	output, err := market.NewTokenAmount(request.Leg.ExpectedOutput.Token(), outputUnits)
 	if err != nil {
 		return executionport.Artifact{}, err
@@ -238,18 +262,40 @@ func (v *Validator) Validate(
 	if err != nil {
 		return executionport.Artifact{}, err
 	}
+	metadata := map[string]string{
+		"kind": "kyberswap_route_build",
+		"to":   router.Hex(), "value": value.String(),
+		"gas_limit":            strconv.FormatUint(gasLimit, 10),
+		"expected_gas_used":    strconv.FormatUint(expectedGas, 10),
+		"build_attempts":       strconv.Itoa(buildAttempts),
+		"slippage_bps":         strconv.FormatUint(uint64(slippageBPS), 10),
+		"minimum_output_units": thresholdUnits.String(),
+	}
+	if request.Slippage != nil {
+		metadata["slippage_reason"] = request.Slippage.Reason
+		metadata["required_minimum_output_units"] =
+			request.Slippage.MinimumOutput.String()
+		for key, value := range request.Slippage.Evidence {
+			metadata["slippage_"+key] = value
+		}
+	}
 	return executionport.Artifact{
 		Leg: request.Leg, ValidatedQuote: validated,
-		Payload: append([]byte(nil), calldata...),
-		Metadata: map[string]string{
-			"kind": "kyberswap_route_build",
-			"to":   router.Hex(), "value": value.String(),
-			"gas_limit":         strconv.FormatUint(gasLimit, 10),
-			"expected_gas_used": strconv.FormatUint(expectedGas, 10),
-			"build_attempts":    strconv.Itoa(buildAttempts),
-		},
-		BuiltAt: now,
+		Payload:  append([]byte(nil), calldata...),
+		Metadata: metadata,
+		BuiltAt:  now,
 	}, nil
+}
+
+func slippageFloor(amount *big.Int, bps uint16) *big.Int {
+	if amount == nil || amount.Sign() <= 0 {
+		return new(big.Int)
+	}
+	numerator := new(big.Int).Mul(
+		new(big.Int).Set(amount),
+		big.NewInt(int64(10_000-uint64(bps))),
+	)
+	return numerator.Quo(numerator, big.NewInt(10_000))
 }
 
 func (v *Validator) resolveGas(estimated uint64) (uint64, uint64, error) {

@@ -17,7 +17,38 @@ type ValidationRequest struct {
 	Leg         execution.Leg
 	Discovery   market.Quote
 	Snapshot    market.MarketSnapshot
+	Slippage    *SlippageConstraint
 	RequestedAt time.Time
+}
+
+// SlippageConstraint carries a stage-specific tolerance. A non-nil constraint
+// distinguishes an explicit zero BPS policy from the validator default.
+type SlippageConstraint struct {
+	BPS           uint16
+	MinimumOutput market.TokenAmount
+	Reason        string
+	Evidence      map[string]string
+}
+
+// SlippageThresholdError means a fresh provider artifact cannot preserve the
+// economic floor selected by the runtime. Retrying the same evaluation would
+// add hot-path I/O without new economic information.
+type SlippageThresholdError struct {
+	Provider string
+	Actual   market.TokenAmount
+	Required market.TokenAmount
+}
+
+func (e *SlippageThresholdError) Error() string {
+	if e == nil {
+		return "swap threshold is below the required output"
+	}
+	return fmt.Sprintf(
+		"%s swap threshold %s is below required output %s",
+		e.Provider,
+		e.Actual,
+		e.Required,
+	)
 }
 
 // Artifact is an in-memory executable leg. Payload may contain calldata or a
