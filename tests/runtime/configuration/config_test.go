@@ -9,13 +9,13 @@ import (
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 )
 
-const manifestYAML = `schema_version: 1
+const manifestYAML = `schema_version: 2
 topology: topology.yaml
 policy: policy.yaml
 active_research: live
 `
 
-const topologyYAML = `schema_version: 1
+const topologyYAML = `schema_version: 2
 chains:
   chain_a: {kind: evm, label: Chain A, chain_id: "1", rpc_url_env: CHAIN_A_RPC}
   chain_b: {kind: evm, label: Chain B, chain_id: "8453", rpc_url_env: CHAIN_B_RPC}
@@ -56,7 +56,7 @@ price_sources:
     fallback: {kind: chainlink, chain: chain_b, feed_address: "0x000000000000000000000000000000000000000b"}
 `
 
-const policyYAML = `schema_version: 1
+const policyYAML = `schema_version: 2
 setups:
   cross_chain: {markets: [market_a, market_b]}
 research:
@@ -89,7 +89,7 @@ func TestLoadConfigResolvesModularYAMLExactly(t *testing.T) {
 
 func TestLoadConfigRejectsUnknownFieldsAndBrokenReferences(t *testing.T) {
 	for name, topology := range map[string]string{
-		"unknown field":  strings.Replace(topologyYAML, "schema_version: 1", "schema_version: 1\nunknown: true", 1),
+		"unknown field":  strings.Replace(topologyYAML, "schema_version: 2", "schema_version: 2\nunknown: true", 1),
 		"unknown market": strings.Replace(topologyYAML, "market_a: {venue: venue_a", "market_a: {venue: missing", 1),
 		"wrong asset":    strings.Replace(topologyYAML, "quote_asset: usd", "quote_asset: weth", 1),
 	} {
@@ -98,6 +98,19 @@ func TestLoadConfigRejectsUnknownFieldsAndBrokenReferences(t *testing.T) {
 				t.Fatal("invalid configuration was accepted")
 			}
 		})
+	}
+}
+
+func TestLoadConfigRejectsSchemaV1Explicitly(t *testing.T) {
+	manifest := strings.Replace(
+		manifestYAML, "schema_version: 2", "schema_version: 1", 1,
+	)
+	_, err := configuration.LoadConfig(
+		writeConfig(t, manifest, topologyYAML, policyYAML),
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "schema v2 is required") {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -113,7 +126,7 @@ func TestConfigurationHashIgnoresYAMLFormatting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondTopology := strings.Replace(topologyYAML, "schema_version: 1\n", "# comment\nschema_version: 1\n\n", 1)
+	secondTopology := strings.Replace(topologyYAML, "schema_version: 2\n", "# comment\nschema_version: 2\n\n", 1)
 	second, err := configuration.LoadConfig(writeConfig(t, manifestYAML, secondTopology, policyYAML))
 	if err != nil {
 		t.Fatal(err)
@@ -139,12 +152,12 @@ func TestPublicVirtualSetupResolves(t *testing.T) {
 }
 
 func TestLoadConfigResolvesSolanaAndMultiHopPaths(t *testing.T) {
-	manifest := `schema_version: 1
+	manifest := `schema_version: 2
 topology: topology.yaml
 policy: policy.yaml
 active_research: route
 `
-	topology := `schema_version: 1
+	topology := `schema_version: 2
 chains:
   robinhood: {kind: evm, label: Robinhood, chain_id: "4663", rpc_url_env: RH_RPC}
   solana: {kind: solana, label: Solana, chain_id: solana, http_url_env: SOL_HTTP, websocket_url_env: SOL_WS}
@@ -184,7 +197,7 @@ quote_sources:
 price_sources:
   asset_b_usd: {base_asset: asset_b, quote_asset: usd, primary: {kind: coingecko, coin_id: usd-coin, currency: usd}, fallback: {kind: chainlink, chain: robinhood, feed_address: "0x0000000000000000000000000000000000000007"}}
 `
-	policy := `schema_version: 1
+	policy := `schema_version: 2
 setups: {route_setup: {markets: [rh, sol]}}
 research: {route: {run_id: route, setup: route_setup, inventory_mode: prepositioned, price_source: asset_b_usd, fixed_cost: {asset: usd, amount: "0.5"}, min_net_profit: "0", sizing: {kind: linear_range, asset: quote, min: "100", max: "5000", samples: 10}}}
 `
@@ -198,12 +211,12 @@ research: {route: {run_id: route, setup: route_setup, inventory_mode: prepositio
 }
 
 func TestLoadConfigResolvesTwoRemoteMarketsAndTriggerOnlyPools(t *testing.T) {
-	manifest := `schema_version: 1
+	manifest := `schema_version: 2
 topology: topology.yaml
 policy: policy.yaml
 active_research: remote
 `
-	topology := `schema_version: 1
+	topology := `schema_version: 2
 chains:
   synthetic_sol: {kind: solana, label: Synthetic Solana, http_url_env: SYNTH_SOL_HTTP, websocket_url_env: SYNTH_SOL_WS}
   synthetic_evm: {kind: evm, label: Synthetic EVM, chain_id: "137", http_url_env: SYNTH_EVM_HTTP, websocket_url_env: SYNTH_EVM_WS}
@@ -226,7 +239,7 @@ markets:
   sol: {chain: synthetic_sol, base_token: base_sol, quote_token: quote_sol, quote_source: synthetic_jupiter, trigger_pools: [sol_a, sol_b]}
   evm: {chain: synthetic_evm, base_token: base_evm, quote_token: quote_evm, quote_source: synthetic_kyber, trigger_pools: [evm_a]}
 `
-	policy := `schema_version: 1
+	policy := `schema_version: 2
 setups: {remote_pair: {markets: [sol, evm]}}
 research:
   remote:

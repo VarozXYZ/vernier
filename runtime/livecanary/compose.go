@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -69,12 +70,14 @@ type ComposeConfig struct {
 func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err error) {
 	if strings.TrimSpace(config.ManifestPath) == "" || config.LookupEnv == nil ||
 		config.Output == nil ||
-		(config.Live.ExecutionMode != "sequential_bridge_canary" &&
-			config.Live.ExecutionMode != "sequential_bridge_live") {
+		(config.Live.ExecutionPolicyKind !=
+			string(execution.PolicyTransportedSequential) &&
+			config.Live.ExecutionPolicyKind !=
+				string(execution.PolicyPrefundedSequential)) {
 		return nil, fmt.Errorf("sequential Live composition configuration is incomplete")
 	}
 	if config.ForcedCanary != "" &&
-		config.Live.ExecutionMode != "sequential_bridge_canary" {
+		config.Live.RunTier != "canary" {
 		return nil, fmt.Errorf(
 			"forced canary execution requires sequential_bridge_canary",
 		)
@@ -239,20 +242,6 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		return nil, err
 	}
 	evmSender := gethcrypto.PubkeyToAddress(evmKey.PublicKey)
-	solanaPreflightAddressText, err := requiredEnv(
-		config.LookupEnv,
-		solanaAccount.SellPreflightAddressEnv,
-	)
-	if err != nil {
-		return nil, err
-	}
-	solanaPreflightAddress, err := solanago.PublicKeyFromBase58(
-		solanaPreflightAddressText,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("invalid Solana sell preflight address")
-	}
-
 	solanaBinding, err := composeSolanaSwap(
 		ctx, config, solanaMarket, solanaAccount, solanaKey, solanaNetwork,
 	)
@@ -267,30 +256,43 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		return nil, err
 	}
 	cleanup = append(cleanup, evmClosers...)
-	solanaSellPreflight, err := composeSolanaSellPreflight(
-		ctx,
-		config,
-		solanaMarket,
-		solanaAccount,
-		solanaKey,
-		solanaPreflightAddress,
-		solanaNetwork,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("compose Solana sell preflight: %w", err)
+	var solanaSellPreflight, evmSellPreflight SellPreflight
+	if config.Live.ExecutionPolicyKind ==
+		string(execution.PolicyTransportedSequential) {
+		solanaPreflightAddressText, preflightErr := requiredEnv(
+			config.LookupEnv,
+			solanaAccount.SellPreflightAddressEnv,
+		)
+		if preflightErr != nil {
+			return nil, preflightErr
+		}
+		solanaPreflightAddress, preflightErr :=
+			solanago.PublicKeyFromBase58(solanaPreflightAddressText)
+		if preflightErr != nil {
+			return nil, fmt.Errorf("invalid Solana sell preflight address")
+		}
+		solanaSellPreflight, preflightErr = composeSolanaSellPreflight(
+			ctx, config, solanaMarket, solanaAccount, solanaKey,
+			solanaPreflightAddress, solanaNetwork,
+		)
+		if preflightErr != nil {
+			return nil, fmt.Errorf(
+				"compose Solana sell preflight: %w", preflightErr,
+			)
+		}
+		var evmPreflightClosers []func()
+		evmSellPreflight, evmPreflightClosers, preflightErr =
+			composeEVMSellPreflight(
+				ctx, config, evmMarket, evmAccount, evmSender,
+				endpoints[evmChain],
+			)
+		if preflightErr != nil {
+			return nil, fmt.Errorf(
+				"compose EVM sell preflight: %w", preflightErr,
+			)
+		}
+		cleanup = append(cleanup, evmPreflightClosers...)
 	}
-	evmSellPreflight, evmPreflightClosers, err := composeEVMSellPreflight(
-		ctx,
-		config,
-		evmMarket,
-		evmAccount,
-		evmSender,
-		endpoints[evmChain],
-	)
-	if err != nil {
-		return nil, fmt.Errorf("compose EVM sell preflight: %w", err)
-	}
-	cleanup = append(cleanup, evmPreflightClosers...)
 
 	journal, err := sqlitestore.OpenSequentialLive(config.Live.OperationalStorePath)
 	if err != nil {
@@ -448,10 +450,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			solanaMarket.ID: solanaBinding,
 			evmMarket.ID:    evmBinding,
 		},
-		SellPreflights: map[market.MarketID]SellPreflight{
-			solanaMarket.ID: solanaSellPreflight,
-			evmMarket.ID:    evmSellPreflight,
-		},
+		SellPreflights: map[market.MarketID]SellPreflight{},
 		TokenDecimals: map[market.TokenID]uint8{
 			solanaMarket.Base.Token.ID:  solanaMarket.Base.Token.Decimals,
 			solanaMarket.Quote.Token.ID: solanaMarket.Quote.Token.Decimals,
@@ -468,9 +467,17 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			MaxBPS:       config.Live.DynamicSlippage.MaxBPS,
 			FixedSellBPS: config.Live.SlippageBPS,
 		},
-		FallbackAfter:  config.Live.ConfirmationTimeout,
-		ArtifactMaxAge: config.Live.BuildToBroadcastTimeout,
-		Output:         config.Output, Costs: costValuator,
+		ExitValidationAttempts:   config.Live.ExitValidationAttempts,
+		ExitValidationRetryDelay: config.Live.ExitValidationRetryDelay,
+		FallbackAfter:            config.Live.ConfirmationTimeout,
+		ArtifactMaxAge:           config.Live.BuildToBroadcastTimeout,
+		Output:                   config.Output, Costs: costValuator,
+	}
+	if solanaSellPreflight != nil {
+		swapDriver.SellPreflights[solanaMarket.ID] = solanaSellPreflight
+	}
+	if evmSellPreflight != nil {
+		swapDriver.SellPreflights[evmMarket.ID] = evmSellPreflight
 	}
 	drivers := executionport.DriverSet{
 		Buy: swapDriver,
@@ -500,6 +507,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			Drivers: drivers, Clock: time.Now,
 			Observer:         NewRecoveryObserver(liveNotifier, time.Now),
 			UncertainTimeout: 10 * time.Minute,
+			CostValuator:     costValuator,
 		},
 	)
 	if err != nil {
@@ -577,6 +585,9 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 				evmMarket.ID:    market.ChainID(evmChain),
 			},
 			ExecutionUnits: executionUnits,
+			ExecutionPolicy: execution.ExecutionPolicyKind(
+				config.Live.ExecutionPolicyKind,
+			),
 		},
 		executor,
 		operationLimit,
@@ -1047,14 +1058,65 @@ func composeEVMSwap(
 	if err != nil {
 		return fail(err)
 	}
-	fanoutText, err := requiredEnv(config.LookupEnv, account.FanoutRPCURLEnv)
-	if err != nil {
-		return fail(err)
+	var confirmationSource chainport.ConfirmationSource
+	chainConfig := config.Research.Chains[configured.Chain]
+	websocketURL, websocketErr := requiredEnv(
+		config.LookupEnv,
+		chainConfig.WebSocketURLEnv,
+	)
+	if websocketErr == nil {
+		confirmationNetwork, confirmationErr :=
+			evmadapter.DialReadOnlyNetwork(
+				ctx,
+				string(configured.Chain),
+				chainConfig.Label,
+				chainConfig.ChainID,
+				primaryURL,
+				websocketURL,
+			)
+		if confirmationErr == nil {
+			confirmation, sourceErr := evmadapter.NewConfirmationSource(
+				evmadapter.ConfirmationSourceConfig{
+					Network: confirmationNetwork,
+					Decoder: decoder,
+					Clock:   time.Now,
+				},
+			)
+			if sourceErr == nil {
+				sourceErr = confirmation.Warm(ctx)
+			}
+			if sourceErr == nil {
+				confirmationSource = confirmation
+				closers = append(closers, confirmationNetwork.Close)
+			} else {
+				confirmationNetwork.Close()
+				websocketErr = sourceErr
+			}
+		} else {
+			websocketErr = confirmationErr
+		}
 	}
-	fanout := make(map[string]evmadapter.TxClient)
-	for index, endpoint := range splitValues(fanoutText) {
+	if websocketErr != nil {
+		if config.Logger != nil {
+			config.Logger.Warn(
+				"EVM settlement websocket unavailable; parallel RPC receipt confirmation remains enabled",
+				"reason", "connection_or_subscription_failed",
+			)
+		}
+		fmt.Fprintf(
+			config.Output,
+			"live_warning component=evm_confirmation websocket=unavailable fallback=parallel_receipt_rpc reason=connection_or_subscription_failed\n",
+		)
+	}
+	fanoutText := mustLookup(config.LookupEnv, account.FanoutRPCURLEnv)
+	endpoints := distinctValues(
+		append([]string{primaryURL}, splitValues(fanoutText)...),
+	)
+	fanout := make(map[string]evmadapter.TxClient, len(endpoints))
+	for index, endpoint := range endpoints {
+		label := fanoutEndpointLabel(index, endpoint)
 		if endpoint == primaryURL {
-			fanout[fmt.Sprintf("fanout-%d", index)] = primary
+			fanout[label] = primary
 			continue
 		}
 		client, dialErr := ethclient.DialContext(ctx, endpoint)
@@ -1062,7 +1124,7 @@ func composeEVMSwap(
 			return fail(fmt.Errorf("dial EVM fanout endpoint %d: %w", index, dialErr))
 		}
 		closers = append(closers, client.Close)
-		fanout[fmt.Sprintf("fanout-%d", index)] = client
+		fanout[label] = client
 	}
 	if len(fanout) == 0 {
 		return fail(fmt.Errorf("EVM fanout endpoint list is empty"))
@@ -1074,6 +1136,31 @@ func composeEVMSwap(
 		PrivateKey: privateKey, Primary: primary, Fanout: fanout,
 		Simulator: primary, Clock: time.Now, ReceiptDecoder: decoder,
 		FeeRefreshInterval: config.Live.FeeCacheMaxAge,
+		OnFanoutResult: func(attempt evmadapter.FanoutAttempt) {
+			status := "rejected"
+			if attempt.Accepted {
+				status = "accepted"
+			}
+			fmt.Fprintf(
+				config.Output,
+				"live_evm_fanout endpoint=%s status=%s error_class=%s already_known=%t latency=%s\n",
+				attempt.Endpoint,
+				status,
+				attempt.ErrorClass,
+				attempt.AlreadyKnown,
+				attempt.Latency.Round(time.Microsecond),
+			)
+			if config.Logger != nil {
+				config.Logger.Info(
+					"EVM raw transaction fanout completed",
+					"endpoint", attempt.Endpoint,
+					"status", status,
+					"error_class", attempt.ErrorClass,
+					"already_known", attempt.AlreadyKnown,
+					"latency", attempt.Latency,
+				)
+			}
+		},
 	})
 	if err != nil {
 		return fail(err)
@@ -1085,6 +1172,7 @@ func composeEVMSwap(
 		Account: execution.AccountID(account.ID), Validator: validator,
 		RefuelValidator: refuelValidator,
 		Estimator:       estimator, TxManager: manager,
+		Confirmation:     confirmationSource,
 		NonceCoordinator: manager,
 		SpendableBalance: SpendableBalanceReaderFunc(func(
 			balanceCtx context.Context,
@@ -1323,6 +1411,32 @@ func splitValues(value string) []string {
 		}
 	}
 	return result
+}
+
+func distinctValues(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func fanoutEndpointLabel(index int, endpoint string) string {
+	label := fmt.Sprintf("fanout-%d", index)
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Hostname() == "" {
+		return label
+	}
+	return label + ":" + strings.ToLower(parsed.Hostname())
 }
 
 func parseEVMPrivateKey(value string) (*ecdsa.PrivateKey, error) {

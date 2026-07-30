@@ -10,13 +10,13 @@ import (
 	"github.com/VarozXYZ/vernier/runtime/observev3"
 )
 
-const observeManifest = `schema_version: 1
+const observeManifest = `schema_version: 2
 topology: topology.yaml
 policy: policy.yaml
 active_research: observe
 `
 
-const observeTopology = `schema_version: 1
+const observeTopology = `schema_version: 2
 chains:
   ethereum: {kind: evm, label: Ethereum, chain_id: "1", rpc_url_env: ETHEREUM_RPC}
 assets:
@@ -51,7 +51,7 @@ price_sources:
     fallback: {kind: chainlink, chain: ethereum, feed_address: "0x8000000000000000000000000000000000000008"}
 `
 
-const observePolicy = `schema_version: 1
+const observePolicy = `schema_version: 2
 setups:
   setup: {markets: [local_market, other_market]}
 research:
@@ -71,7 +71,7 @@ func TestConfigUsesSharedYAMLAndDerivesBothDirections(t *testing.T) {
 		len(config.QuoteInputs) != 2 || config.QuoteInputs[0].Amount != "1000000" || config.QuoteInputs[1].Amount != "1000000" {
 		t.Fatalf("unexpected observer configuration: %+v", config)
 	}
-	path := writeObserverFiles(t, strings.Replace(observeTopology, "schema_version: 1", "schema_version: 1\nunexpected: true", 1))
+	path := writeObserverFiles(t, strings.Replace(observeTopology, "schema_version: 2", "schema_version: 2\nunexpected: true", 1))
 	if _, err := configuration.LoadConfig(path); err == nil {
 		t.Fatal("unknown YAML field was accepted")
 	}

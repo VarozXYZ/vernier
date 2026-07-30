@@ -142,20 +142,22 @@ type ExitCostSource interface {
 }
 
 type SwapDriver struct {
-	Bindings        map[market.MarketID]SwapBinding
-	SellPreflights  map[market.MarketID]SellPreflight
-	TokenDecimals   map[market.TokenID]uint8
-	BridgePrecision uint8
-	QuoteAsset      market.AssetID
-	MinimumNet      *big.Rat
-	ReturnMargin    *big.Rat
-	ExitCosts       ExitCostSource
-	DynamicSlippage DynamicSlippagePolicy
-	Clock           func() time.Time
-	FallbackAfter   time.Duration
-	ArtifactMaxAge  time.Duration
-	Output          io.Writer
-	Costs           executionport.CostValuator
+	Bindings                 map[market.MarketID]SwapBinding
+	SellPreflights           map[market.MarketID]SellPreflight
+	TokenDecimals            map[market.TokenID]uint8
+	BridgePrecision          uint8
+	QuoteAsset               market.AssetID
+	MinimumNet               *big.Rat
+	ReturnMargin             *big.Rat
+	ExitCosts                ExitCostSource
+	DynamicSlippage          DynamicSlippagePolicy
+	ExitValidationAttempts   int
+	ExitValidationRetryDelay time.Duration
+	Clock                    func() time.Time
+	FallbackAfter            time.Duration
+	ArtifactMaxAge           time.Duration
+	Output                   io.Writer
+	Costs                    executionport.CostValuator
 
 	preflightMu   sync.Mutex
 	preflightBuys map[execution.OperationID]preparedSwap
@@ -174,8 +176,6 @@ type exitReturnQuote struct {
 	output market.TokenAmount
 	err    error
 }
-
-const destinationExitPreparationAttempts = 2
 
 func (d *SwapDriver) ExecuteStage(
 	ctx context.Context,
@@ -665,9 +665,13 @@ func (d *SwapDriver) Preflight(
 	operation execution.OperationID,
 	plan execution.SequentialPlan,
 ) error {
+	sellIndex := 2
+	if plan.EffectivePolicy() == execution.PolicyPrefundedSequential {
+		sellIndex = 1
+	}
 	if operation == "" || len(plan.Stages) != 4 ||
 		plan.Stages[0].Stage != execution.StageBuy ||
-		plan.Stages[2].Stage != execution.StageSell {
+		plan.Stages[sellIndex].Stage != execution.StageSell {
 		return executionport.NewStageError(
 			executionport.DispositionRejected,
 			fmt.Errorf("swap preflight plan is incomplete"),
@@ -705,8 +709,14 @@ func (d *SwapDriver) Preflight(
 	}
 	sellInput, err := d.bridgeDestinationAmount(
 		buy.artifact.ValidatedQuote.AmountOut,
-		plan.Stages[2].InputToken,
+		plan.Stages[sellIndex].InputToken,
 	)
+	if plan.EffectivePolicy() == execution.PolicyPrefundedSequential {
+		sellInput, err = d.convertAmount(
+			buy.artifact.ValidatedQuote.AmountOut,
+			plan.Stages[sellIndex].InputToken,
+		)
+	}
 	if err != nil {
 		return executionport.NewStageError(
 			executionport.DispositionRejected,
@@ -715,13 +725,44 @@ func (d *SwapDriver) Preflight(
 	}
 	sellRequest := execution.SequentialStageRequest{
 		Operation: operation, Plan: plan.ID,
-		Stage: plan.Stages[2], Input: sellInput,
+		Stage: plan.Stages[sellIndex], Input: sellInput,
 	}
 	sellBinding, err := d.binding(sellRequest)
 	if err != nil {
 		return executionport.NewStageError(
 			executionport.DispositionRejected, err,
 		)
+	}
+	if plan.EffectivePolicy() == execution.PolicyPrefundedSequential &&
+		sellBinding.SpendableBalance != nil {
+		available, balanceErr :=
+			sellBinding.SpendableBalance.SpendableBalance(
+				ctx,
+				sellInput.Token(),
+			)
+		if balanceErr != nil {
+			return executionport.NewStageError(
+				executionport.DispositionRejected,
+				fmt.Errorf(
+					"read prefunded destination inventory: %w",
+					balanceErr,
+				),
+			)
+		}
+		if available == nil || available.Cmp(sellInput.Units()) < 0 {
+			availableText := "0"
+			if available != nil {
+				availableText = available.String()
+			}
+			return executionport.NewStageError(
+				executionport.DispositionRejected,
+				fmt.Errorf(
+					"prefunded destination inventory is insufficient: available_units=%s required_units=%s",
+					availableText,
+					sellInput.Units(),
+				),
+			)
+		}
 	}
 	sellPreflight := d.SellPreflights[sellRequest.Stage.Market]
 	type sellResult struct {
@@ -747,9 +788,23 @@ func (d *SwapDriver) Preflight(
 			}
 			return
 		}
-		bundle, prepareErr := d.prepareAndSimulate(
-			ctx, sellRequest, sellBinding, nil,
-		)
+		var bundle preparedSwap
+		var prepareErr error
+		if plan.EffectivePolicy() ==
+			execution.PolicyPrefundedSequential {
+			bundle, _, prepareErr = d.prepareSwapWithRetry(
+				ctx,
+				operation,
+				sellRequest,
+				sellBinding,
+				nil,
+				"live_preflight_sell",
+			)
+		} else {
+			bundle, prepareErr = d.prepareAndSimulate(
+				ctx, sellRequest, sellBinding, nil,
+			)
+		}
 		sellPrepared <- sellResult{
 			artifact: bundle.artifact,
 			identity: string(sellBinding.Account),
@@ -863,6 +918,212 @@ func (d *SwapDriver) SelectRecoveryExit(
 	return d.selectExit(ctx, operation, plan, bridged, incurred, true)
 }
 
+// SelectPrefundedExit always prepares the destination sale first. Because no
+// transaction has been committed at this point, a failed build/simulation or
+// a typed economic-threshold rejection is proof of no destination effect and
+// may safely authorize the origin branch.
+func (d *SwapDriver) SelectPrefundedExit(
+	ctx context.Context,
+	operation execution.OperationID,
+	plan execution.SequentialPlan,
+	bought market.TokenAmount,
+	incurred []execution.CostComponent,
+) (execution.SequentialExitDecision, error) {
+	if plan.EffectivePolicy() != execution.PolicyPrefundedSequential ||
+		len(plan.Stages) != 4 || len(plan.CircuitBreaker) != 1 ||
+		bought.IsZero() {
+		return execution.SequentialExitDecision{},
+			fmt.Errorf("prefunded exit input is incomplete")
+	}
+	input, err := d.convertAmount(bought, plan.Stages[1].InputToken)
+	if err != nil {
+		return execution.SequentialExitDecision{}, err
+	}
+	request := execution.SequentialStageRequest{
+		Operation: operation, Plan: plan.ID,
+		Stage: plan.Stages[1], Input: input,
+	}
+	binding, err := d.binding(request)
+	if err != nil {
+		return d.SelectOriginCircuitBreaker(
+			ctx, operation, plan, bought, incurred, err,
+		)
+	}
+	pending, err := d.prefundedPendingCost(plan, incurred)
+	if err != nil {
+		return d.SelectOriginCircuitBreaker(
+			ctx, operation, plan, bought, incurred, err,
+		)
+	}
+	constraint, err := d.dynamicSellSlippage(
+		plan, bought, incurred, pending,
+	)
+	if err != nil {
+		return d.SelectOriginCircuitBreaker(
+			ctx, operation, plan, bought, incurred, err,
+		)
+	}
+	bundle, attempts, err := d.prepareExitWithRetry(
+		ctx, operation, request, binding, constraint,
+	)
+	if err != nil {
+		return d.SelectOriginCircuitBreaker(
+			ctx, operation, plan, bought, incurred,
+			fmt.Errorf("destination preparation failed after %d attempt(s): %w", attempts, err),
+		)
+	}
+	quoteAsset := d.planQuoteAsset(plan)
+	recovery, err := d.recoveryValue(
+		bundle.artifact.ValidatedQuote.AmountOut,
+		plan.Stages[0].InputToken,
+		quoteAsset,
+	)
+	if err != nil {
+		return execution.SequentialExitDecision{}, err
+	}
+	zero, _ := market.NewAssetQuantity(quoteAsset, new(big.Rat))
+	slippageEvidence := "fixed_slippage"
+	if constraint != nil {
+		slippageEvidence = "dynamic_slippage"
+	}
+	decision := execution.SequentialExitDecision{
+		Operation: operation, Route: execution.ExitSellAtDestination,
+		DestinationOutput:   bundle.artifact.ValidatedQuote.AmountOut,
+		DestinationRecovery: recovery, SafetyMargin: zero,
+		DestinationQualified: true, CostEvidenceAvailable: true,
+		DecidedAt: d.now(),
+		Evidence: "prefunded_destination_first+fresh_build+simulation+" +
+			slippageEvidence,
+	}
+	d.storeExitSell(operation, bundle)
+	d.logExitDecision(decision, 0)
+	return decision, nil
+}
+
+func (d *SwapDriver) SelectOriginCircuitBreaker(
+	ctx context.Context,
+	operation execution.OperationID,
+	plan execution.SequentialPlan,
+	bought market.TokenAmount,
+	incurred []execution.CostComponent,
+	cause error,
+) (execution.SequentialExitDecision, error) {
+	if plan.EffectivePolicy() != execution.PolicyPrefundedSequential ||
+		len(plan.CircuitBreaker) != 1 || bought.IsZero() {
+		return execution.SequentialExitDecision{},
+			fmt.Errorf("origin circuit-breaker input is incomplete")
+	}
+	stage := plan.CircuitBreaker[0]
+	input, err := d.convertAmount(bought, stage.InputToken)
+	if err != nil {
+		return execution.SequentialExitDecision{}, err
+	}
+	request := execution.SequentialStageRequest{
+		Operation: operation, Plan: plan.ID, Stage: stage, Input: input,
+	}
+	binding, err := d.binding(request)
+	if err != nil {
+		return execution.SequentialExitDecision{}, err
+	}
+	// Recovery uses its bounded validator policy. It deliberately does not
+	// re-impose the original minimum profit after destination has failed.
+	bundle, err := d.prepareAndSimulate(ctx, request, binding, nil)
+	if err != nil {
+		return execution.SequentialExitDecision{},
+			fmt.Errorf("origin circuit breaker: %w", err)
+	}
+	quoteAsset := d.planQuoteAsset(plan)
+	recovery, err := d.recoveryValue(
+		bundle.artifact.ValidatedQuote.AmountOut,
+		stage.OutputToken,
+		quoteAsset,
+	)
+	if err != nil {
+		return execution.SequentialExitDecision{}, err
+	}
+	zero, _ := market.NewAssetQuantity(quoteAsset, new(big.Rat))
+	evidence := "origin_circuit_breaker+fresh_build+simulation"
+	if cause != nil {
+		var threshold *executionport.SlippageThresholdError
+		if errors.As(cause, &threshold) {
+			evidence += "+dynamic_slippage_drop"
+		} else {
+			evidence += "+destination_safe_failure"
+		}
+	}
+	decision := execution.SequentialExitDecision{
+		Operation: operation, Route: execution.ExitSellAtOrigin,
+		ReturnOutput:   bundle.artifact.ValidatedQuote.AmountOut,
+		ReturnRecovery: recovery, DestinationRecovery: zero,
+		SafetyMargin: zero, CostEvidenceAvailable: true,
+		DecidedAt: d.now(), Evidence: evidence,
+	}
+	d.storeExitSell(operation, bundle)
+	d.logExitDecision(decision, 0)
+	return decision, nil
+}
+
+func (d *SwapDriver) prefundedPendingCost(
+	plan execution.SequentialPlan,
+	incurred []execution.CostComponent,
+) (market.AssetQuantity, error) {
+	candidate, err := selectedCandidate(plan.Opportunity)
+	if err != nil {
+		return market.AssetQuantity{}, err
+	}
+	pending := candidate.Cost.Amount
+	if pending.Asset() == "" || pending.Asset() != d.planQuoteAsset(plan) {
+		return market.AssetQuantity{},
+			fmt.Errorf("frozen admission cost snapshot is unavailable")
+	}
+	for _, component := range incurred {
+		if component.IncludedInOutput {
+			continue
+		}
+		if component.QuoteValue.Asset() != pending.Asset() {
+			return market.AssetQuantity{},
+				fmt.Errorf("realized cost is not valued in the admission asset")
+		}
+		next, subErr := pending.Sub(component.QuoteValue)
+		if subErr != nil {
+			return market.AssetQuantity{}, subErr
+		}
+		pending = next
+	}
+	if pending.Sign() < 0 {
+		pending, _ = market.NewAssetQuantity(pending.Asset(), new(big.Rat))
+	}
+	return pending, nil
+}
+
+func (d *SwapDriver) planQuoteAsset(plan execution.SequentialPlan) market.AssetID {
+	if d.QuoteAsset != "" {
+		return d.QuoteAsset
+	}
+	if plan.Opportunity.SelectedIndex >= 0 &&
+		plan.Opportunity.SelectedIndex < len(plan.Opportunity.Candidates) {
+		return plan.Opportunity.Candidates[plan.Opportunity.SelectedIndex].Input.Asset()
+	}
+	return ""
+}
+
+func (d *SwapDriver) now() time.Time {
+	if d.Clock != nil {
+		return d.Clock().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (d *SwapDriver) ConvertStageInput(
+	stage execution.SequentialStagePlan,
+	source market.TokenAmount,
+) (market.TokenAmount, error) {
+	if source.Token() == stage.InputToken {
+		return source, nil
+	}
+	return d.convertAmount(source, stage.InputToken)
+}
+
 func (d *SwapDriver) selectExit(
 	ctx context.Context,
 	operation execution.OperationID,
@@ -959,12 +1220,10 @@ func (d *SwapDriver) selectExit(
 			destinationAttempts,
 			err,
 		)
-		var quotedReturn exitReturnQuote
-		if !compareReturn {
-			quotedReturn = d.quoteReturnExit(ctx, plan, bridged)
-		} else {
-			quotedReturn = <-returnResult
-		}
+		// The parallel return quote may be several seconds old after the
+		// destination exhausted its validation retries. Never bridge back
+		// using that stale comparison.
+		quotedReturn := d.quoteReturnExit(ctx, plan, bridged)
 		return d.selectForcedReturn(
 			operation,
 			plan,
@@ -1034,7 +1293,13 @@ func (d *SwapDriver) selectExit(
 		return decision, nil
 	}
 
-	quotedReturn := <-returnResult
+	var quotedReturn exitReturnQuote
+	if destinationAttempts > 1 {
+		quotedReturn = d.quoteReturnExit(ctx, plan, bridged)
+		decision.Evidence += "+refreshed_return_after_destination_retry"
+	} else {
+		quotedReturn = <-returnResult
+	}
 	if quotedReturn.err != nil {
 		decision.Evidence += "+return_quote_unavailable"
 		d.storeExitSell(operation, destination)
@@ -1338,8 +1603,34 @@ func (d *SwapDriver) prepareExitWithRetry(
 	binding SwapBinding,
 	slippage *executionport.SlippageConstraint,
 ) (preparedSwap, int, error) {
-	failures := make([]error, 0, destinationExitPreparationAttempts)
-	for attempt := 1; attempt <= destinationExitPreparationAttempts; attempt++ {
+	return d.prepareSwapWithRetry(
+		ctx,
+		operation,
+		request,
+		binding,
+		slippage,
+		"live_exit_destination",
+	)
+}
+
+func (d *SwapDriver) prepareSwapWithRetry(
+	ctx context.Context,
+	operation execution.OperationID,
+	request execution.SequentialStageRequest,
+	binding SwapBinding,
+	slippage *executionport.SlippageConstraint,
+	logEvent string,
+) (preparedSwap, int, error) {
+	attempts := d.ExitValidationAttempts
+	if attempts <= 0 {
+		attempts = 15
+	}
+	retryDelay := d.ExitValidationRetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 100 * time.Millisecond
+	}
+	failures := make([]error, 0, attempts)
+	for attempt := 1; attempt <= attempts; attempt++ {
 		bundle, err := d.prepareAndSimulate(
 			ctx,
 			request,
@@ -1349,10 +1640,11 @@ func (d *SwapDriver) prepareExitWithRetry(
 		if err == nil {
 			if attempt > 1 {
 				d.write(
-					"live_exit_destination operation=%s status=ready attempt=%d/%d\n",
+					"%s operation=%s status=ready attempt=%d/%d\n",
+					logEvent,
 					operation,
 					attempt,
-					destinationExitPreparationAttempts,
+					attempts,
 				)
 			}
 			return bundle, attempt, nil
@@ -1360,24 +1652,36 @@ func (d *SwapDriver) prepareExitWithRetry(
 		attemptErr := fmt.Errorf(
 			"attempt %d/%d: %w",
 			attempt,
-			destinationExitPreparationAttempts,
+			attempts,
 			err,
 		)
 		failures = append(failures, attemptErr)
 		d.write(
-			"live_exit_destination operation=%s status=failed attempt=%d/%d error=%q\n",
+			"%s operation=%s status=failed attempt=%d/%d error=%q\n",
+			logEvent,
 			operation,
 			attempt,
-			destinationExitPreparationAttempts,
+			attempts,
 			err,
 		)
-		var thresholdErr *executionport.SlippageThresholdError
-		if errors.As(err, &thresholdErr) {
-			break
+		var threshold *executionport.SlippageThresholdError
+		if errors.As(err, &threshold) {
+			return preparedSwap{}, attempt, errors.Join(failures...)
+		}
+		if attempt < attempts {
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return preparedSwap{}, attempt, ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	return preparedSwap{},
-		destinationExitPreparationAttempts,
+		attempts,
 		errors.Join(failures...)
 }
 
@@ -1517,7 +1821,10 @@ func (d *SwapDriver) simulate(
 func (d *SwapDriver) takePreparedSwap(
 	request execution.SequentialStageRequest,
 ) (preparedSwap, bool) {
-	if request.Stage.Ordinal != 1 && request.Stage.Ordinal != 3 {
+	if request.Stage.Ordinal != 1 &&
+		request.Stage.Ordinal != 2 &&
+		request.Stage.Ordinal != 3 &&
+		request.Stage.Ordinal != 5 {
 		return preparedSwap{}, false
 	}
 	d.preflightMu.Lock()
@@ -1527,8 +1834,7 @@ func (d *SwapDriver) takePreparedSwap(
 		request.Stage.Stage == execution.StageBuy {
 		bundle, ok = d.preflightBuys[request.Operation]
 		delete(d.preflightBuys, request.Operation)
-	} else if request.Stage.Ordinal == 3 &&
-		request.Stage.Stage == execution.StageSell {
+	} else if request.Stage.Stage == execution.StageSell {
 		bundle, ok = d.exitSells[request.Operation]
 		delete(d.exitSells, request.Operation)
 	}
@@ -1684,22 +1990,69 @@ func (d *SwapDriver) confirm(
 	step execution.OperationStep,
 	fallbackAfter time.Duration,
 ) (execution.Settlement, error) {
-	if binding.Confirmation != nil {
-		websocketCtx, cancel := context.WithTimeout(ctx, fallbackAfter)
+	if binding.Confirmation == nil {
+		return pollSwapSettlement(ctx, binding.TxManager, step)
+	}
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type confirmationResult struct {
+		settlement execution.Settlement
+		err        error
+	}
+	websocketResult := make(chan confirmationResult, 1)
+	rpcResult := make(chan confirmationResult, 1)
+	go func() {
+		websocketCtx, websocketCancel := context.WithTimeout(
+			raceCtx,
+			fallbackAfter,
+		)
+		defer websocketCancel()
 		settlement, err := binding.Confirmation.Await(websocketCtx, step)
-		cancel()
-		if err == nil && settlement.Technical == execution.StateConfirmedSuccess &&
-			settlement.Economic == execution.EconomicEffectVerified {
-			return settlement, nil
+		websocketResult <- confirmationResult{settlement: settlement, err: err}
+	}()
+	go func() {
+		settlement, err := pollSwapSettlement(
+			raceCtx,
+			binding.TxManager,
+			step,
+		)
+		rpcResult <- confirmationResult{settlement: settlement, err: err}
+	}()
+	websocket := (<-chan confirmationResult)(websocketResult)
+	for {
+		select {
+		case result := <-websocket:
+			websocket = nil
+			if result.err == nil &&
+				result.settlement.Technical ==
+					execution.StateConfirmedSuccess &&
+				result.settlement.Economic ==
+					execution.EconomicEffectVerified {
+				return result.settlement, nil
+			}
+			// Inclusion-only evidence deliberately does not settle the swap.
+			// Receipt reconciliation is already running concurrently.
+		case result := <-rpcResult:
+			return result.settlement, result.err
+		case <-ctx.Done():
+			return execution.Settlement{}, ctx.Err()
 		}
 	}
+}
+
+func pollSwapSettlement(
+	ctx context.Context,
+	manager chainport.TxManager,
+	step execution.OperationStep,
+) (execution.Settlement, error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		settlement, err := binding.TxManager.Reconcile(ctx, step)
+		settlement, err := manager.Reconcile(ctx, step)
 		if err == nil {
 			switch settlement.Technical {
-			case execution.StateConfirmedSuccess, execution.StateConfirmedRevert:
+			case execution.StateConfirmedSuccess,
+				execution.StateConfirmedRevert:
 				return settlement, nil
 			}
 		}
@@ -1719,3 +2072,5 @@ var _ executionport.SequentialPreflight = (*SwapDriver)(nil)
 var _ executionport.SequentialExitSelector = (*SwapDriver)(nil)
 var _ executionport.SequentialRecoveryExitSelector = (*SwapDriver)(nil)
 var _ executionport.SequentialRecoveryDriver = (*SwapDriver)(nil)
+var _ executionport.SequentialPrefundedExitSelector = (*SwapDriver)(nil)
+var _ executionport.SequentialInputConverter = (*SwapDriver)(nil)

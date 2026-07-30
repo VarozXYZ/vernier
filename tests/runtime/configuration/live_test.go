@@ -46,7 +46,7 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.ExecutionMode != "sequential_bridge_live" ||
+	if config.ExecutionMode != "transported_sequential" ||
 		config.Notional.RatString() != "750" ||
 		config.ExecutionInput.RatString() != "750" ||
 		config.CanaryInput != nil ||
@@ -68,6 +68,14 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 			config.DynamicSlippage,
 		)
 	}
+	if config.ExitValidationAttempts != 15 ||
+		config.ExitValidationRetryDelay != 100*time.Millisecond {
+		t.Fatalf(
+			"unexpected exit validation retry policy: attempts=%d delay=%s",
+			config.ExitValidationAttempts,
+			config.ExitValidationRetryDelay,
+		)
+	}
 	if config.Accounts["chain_a"].SellPreflightAddressEnv !=
 		"CHAIN_A_PREFLIGHT_ADDRESS" {
 		t.Fatalf("Solana sell preflight address was not resolved: %+v", config.Accounts)
@@ -78,6 +86,96 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 		evmOverride.BalanceSlot != 3 ||
 		evmOverride.AllowanceSlot != 4 {
 		t.Fatalf("EVM sell preflight state override was not resolved: %+v", config.Accounts)
+	}
+}
+
+func TestSchemaV2ActiveLiveSelectsCompiledPolicyAndInventoryProfile(t *testing.T) {
+	manifest := writeSequentialLiveConfig(t, "750")
+	directory := filepath.Dir(manifest)
+	policyPath := filepath.Join(directory, "policy.yaml")
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := string(data)
+	policy = strings.Replace(
+		policy,
+		"live:\n  synthetic_sequential_live:",
+		`execution_policies:
+  transported:
+    kind: transported_sequential
+    exit_policy: post_bridge_destination_with_return_fallback
+  prefunded:
+    kind: prefunded_sequential
+    exit_policy: destination_first_origin_circuit_breaker
+    inventory_restore: immediate_ordered
+inventory_profiles:
+  transported_inventory:
+    kind: transported
+    balances:
+      - {chain: chain_a, token: quote_a, allocation_cap: "1000", target: "800", buffer: "10"}
+      - {chain: chain_b, token: quote_b, allocation_cap: "1000", target: "800", buffer: "10"}
+  dual_prefunded:
+    kind: prefunded
+    balances:
+      - {chain: chain_a, token: base_a, allocation_cap: "1000", target: "800", buffer: "10"}
+      - {chain: chain_a, token: quote_a, allocation_cap: "1000", target: "800", buffer: "10"}
+      - {chain: chain_b, token: base_b, allocation_cap: "1000", target: "800", buffer: "10"}
+      - {chain: chain_b, token: quote_b, allocation_cap: "1000", target: "800", buffer: "10"}
+live:
+  transported_live: &live_defaults
+    execution_policy: transported
+    inventory_profile: transported_inventory`,
+		1,
+	)
+	policy += `
+  prefunded_live:
+    <<: *live_defaults
+    execution_policy: prefunded
+    inventory_profile: dual_prefunded
+`
+	if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifestData, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transportedManifest := strings.Replace(
+		string(manifestData),
+		"active_live: synthetic_sequential_live",
+		"active_live: transported_live",
+		1,
+	)
+	if err := os.WriteFile(manifest, []byte(transportedManifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	transported, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefundedManifest := strings.Replace(
+		transportedManifest,
+		"active_live: transported_live",
+		"active_live: prefunded_live",
+		1,
+	)
+	if err := os.WriteFile(manifest, []byte(prefundedManifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prefunded, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transported.ExecutionPolicyKind != "transported_sequential" ||
+		transported.InventoryKind != "transported" ||
+		len(transported.Inventory) != 2 {
+		t.Fatalf("unexpected transported profile: %+v", transported)
+	}
+	if prefunded.ExecutionPolicyKind != "prefunded_sequential" ||
+		prefunded.InventoryKind != "prefunded" ||
+		len(prefunded.Inventory) != 4 {
+		t.Fatalf("unexpected prefunded profile: %+v", prefunded)
 	}
 }
 
@@ -277,12 +375,12 @@ func TestLoadLiveConfigRejectsExternalEVMSellPreflightWallet(t *testing.T) {
 func writeLiveConfig(t *testing.T, cost string) string {
 	t.Helper()
 	directory := t.TempDir()
-	manifest := `schema_version: 1
+	manifest := `schema_version: 2
 topology: topology.yaml
 policy: policy.yaml
 active_live: synthetic_live
 `
-	topology := `schema_version: 1
+	topology := `schema_version: 2
 chains:
   chain_a:
     kind: solana
@@ -327,7 +425,7 @@ quote_sources:
     slippage_bps: 30
     max_accounts: 64
 `
-	policy := `schema_version: 1
+	policy := `schema_version: 2
 setups:
   synthetic_setup: {markets: [market_a, market_b]}
 live:
@@ -374,12 +472,12 @@ func writeSequentialLiveConfig(t *testing.T, executionInput string) string {
 	t.Helper()
 	directory := t.TempDir()
 	files := map[string]string{
-		"vernier.yaml": `schema_version: 1
+		"vernier.yaml": `schema_version: 2
 topology: topology.yaml
 policy: policy.yaml
 active_live: synthetic_sequential_live
 `,
-		"topology.yaml": `schema_version: 1
+		"topology.yaml": `schema_version: 2
 chains:
   chain_a:
     kind: solana
@@ -431,7 +529,7 @@ markets:
     quote_source: source_b
     trigger_pools: [pool_b]
 `,
-		"policy.yaml": `schema_version: 1
+		"policy.yaml": `schema_version: 2
 setups:
   synthetic_setup: {markets: [market_a, market_b]}
 live:

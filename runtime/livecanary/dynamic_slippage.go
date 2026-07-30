@@ -159,6 +159,13 @@ func (d *SwapDriver) dynamicSellSlippage(
 	if err != nil {
 		return nil, err
 	}
+	if expected.Units().Cmp(required.Units()) <= 0 {
+		return nil, &executionport.SlippageThresholdError{
+			Provider: "frozen_admission_budget",
+			Actual:   expected,
+			Required: required,
+		}
+	}
 	economicBPS := maximumSlippageBPS(
 		expected.Units(),
 		required.Units(),
@@ -169,6 +176,9 @@ func (d *SwapDriver) dynamicSellSlippage(
 		selectedBPS = d.DynamicSlippage.FixedSellBPS
 	}
 	minimumUnits := slippageMinimum(expected.Units(), selectedBPS)
+	if minimumUnits.Cmp(required.Units()) < 0 {
+		minimumUnits = required.Units()
+	}
 	minimum, err := market.NewTokenAmount(
 		expected.Token(),
 		minimumUnits,
