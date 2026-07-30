@@ -109,6 +109,60 @@ func TestLoadLiveConfigResolvesFixedEVMGasPolicy(t *testing.T) {
 		config.EVMGas.CostFixedLimit != 1_000_000 {
 		t.Fatalf("unexpected fixed EVM gas policy: %+v", config.EVMGas)
 	}
+	if config.GasRefuel.EVMGas != config.EVMGas {
+		t.Fatalf(
+			"refuel EVM gas policy did not inherit live policy: refuel=%+v live=%+v",
+			config.GasRefuel.EVMGas,
+			config.EVMGas,
+		)
+	}
+}
+
+func TestLoadLiveConfigResolvesIndependentRefuelEVMGasPolicy(t *testing.T) {
+	manifest := writeSequentialLiveConfig(t, "750")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withGasPolicies := strings.Replace(
+		string(data),
+		"    operational_store:",
+		"    evm_gas:\n"+
+			"      execution_mode: fixed\n"+
+			"      execution_fixed_limit: 1500000\n"+
+			"      cost_mode: fixed\n"+
+			"      cost_fixed_limit: 1000000\n"+
+			"    gas_refuel:\n"+
+			"      enabled: true\n"+
+			"      evm_gas:\n"+
+			"        execution_mode: estimate\n"+
+			"        estimation_multiplier_bps: 12500\n"+
+			"        cost_mode: estimated\n"+
+			"    operational_store:",
+		1,
+	)
+	if err := os.WriteFile(
+		policyPath,
+		[]byte(withGasPolicies),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	config, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.EVMGas.ExecutionMode != "fixed" ||
+		config.GasRefuel.EVMGas.ExecutionMode != "estimate" ||
+		config.GasRefuel.EVMGas.EstimationMultiplierBPS != 12_500 ||
+		config.GasRefuel.EVMGas.CostMode != "estimated" {
+		t.Fatalf(
+			"gas policies were not resolved independently: live=%+v refuel=%+v",
+			config.EVMGas,
+			config.GasRefuel.EVMGas,
+		)
+	}
 }
 
 func TestLoadLiveConfigResolvesGasRefuelDefaults(t *testing.T) {

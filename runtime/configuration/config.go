@@ -250,13 +250,14 @@ type EVMGasConfig struct {
 }
 
 type GasRefuelConfig struct {
-	Enabled         bool   `yaml:"enabled"`
-	ThresholdUSD    string `yaml:"threshold_usd"`
-	TargetUSD       string `yaml:"target_usd"`
-	PollSeconds     int    `yaml:"poll_seconds"`
-	CooldownSeconds int    `yaml:"cooldown_seconds"`
-	SlippageBPS     uint16 `yaml:"slippage_bps"`
-	MaxUSDC         string `yaml:"max_usdc"`
+	Enabled         bool          `yaml:"enabled"`
+	ThresholdUSD    string        `yaml:"threshold_usd"`
+	TargetUSD       string        `yaml:"target_usd"`
+	PollSeconds     int           `yaml:"poll_seconds"`
+	CooldownSeconds int           `yaml:"cooldown_seconds"`
+	SlippageBPS     uint16        `yaml:"slippage_bps"`
+	MaxUSDC         string        `yaml:"max_usdc"`
+	EVMGas          *EVMGasConfig `yaml:"evm_gas"`
 }
 
 type OperationalStoreConfig struct {
@@ -509,6 +510,7 @@ type ResolvedGasRefuel struct {
 	Cooldown     time.Duration
 	SlippageBPS  uint16
 	MaxUSDC      *big.Rat
+	EVMGas       ResolvedEVMGasPolicy
 }
 
 type LookupEnv func(string) (string, bool)
@@ -1048,8 +1050,22 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		config.CostCacheTTLMS < config.CostRefreshIntervalMS {
 		return ParsedLiveConfig{}, fmt.Errorf("live complete-flow cost cache policy is invalid")
 	}
-	refuel := ResolvedGasRefuel{Enabled: config.GasRefuel.Enabled}
+	refuel := ResolvedGasRefuel{
+		Enabled: config.GasRefuel.Enabled,
+		EVMGas:  evmGas,
+	}
 	if refuel.Enabled {
+		if hasEVM && config.GasRefuel.EVMGas != nil {
+			refuel.EVMGas, err = resolveEVMGasPolicy(
+				*config.GasRefuel.EVMGas,
+			)
+			if err != nil {
+				return ParsedLiveConfig{}, fmt.Errorf(
+					"live gas refuel EVM gas policy: %w",
+					err,
+				)
+			}
+		}
 		if strings.TrimSpace(config.GasRefuel.ThresholdUSD) == "" {
 			config.GasRefuel.ThresholdUSD = "5"
 		}
