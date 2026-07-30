@@ -438,18 +438,6 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
-	if forcedDirection == nil && !config.RefuelOnly {
-		costWarmTimeout := 2 * config.Live.CostRefreshInterval
-		if costWarmTimeout < 30*time.Second {
-			costWarmTimeout = 30 * time.Second
-		}
-		costWarmCtx, cancelCostWarm := context.WithTimeout(ctx, costWarmTimeout)
-		err = runner.WarmDirectionalCosts(costWarmCtx)
-		cancelCostWarm()
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	swapDriver := &SwapDriver{
 		Bindings: map[market.MarketID]SwapBinding{
