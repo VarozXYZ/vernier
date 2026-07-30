@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VarozXYZ/vernier/adapters/crosschain/across"
@@ -31,6 +32,9 @@ type LiveServiceConfig struct {
 
 type LiveService struct {
 	config LiveServiceConfig
+
+	mu       sync.RWMutex
+	trackers map[direction]DestinationWatcher
 }
 
 type CostApproval struct {
@@ -46,7 +50,76 @@ func NewLiveService(config LiveServiceConfig) (*LiveService, error) {
 	if config.Output == nil {
 		config.Output = io.Discard
 	}
-	return &LiveService{config: config}, nil
+	return &LiveService{
+		config: config, trackers: make(map[direction]DestinationWatcher),
+	}, nil
+}
+
+// Warm establishes both destination subscriptions before Live admits any
+// operation. Across status and direct balance reads remain independent
+// fallbacks if a provider drops a WebSocket notification.
+func (s *LiveService) Warm(ctx context.Context) error {
+	endpoints, err := s.config.Configuration.ResolveEndpoints(requiredEnvLookup)
+	if err != nil {
+		return err
+	}
+	opened := make(map[direction]DestinationWatcher, 2)
+	for _, selected := range []direction{evmToSolana, solanaToEVM} {
+		watcher, balance, destination, openErr := openDestinationWatcher(
+			ctx, s.config.Configuration, selected, endpoints,
+		)
+		if openErr != nil {
+			for _, candidate := range opened {
+				candidate.Close()
+			}
+			return fmt.Errorf(
+				"warm Across %s destination tracker: %w",
+				destinationChainForDirection(selected),
+				openErr,
+			)
+		}
+		opened[selected] = watcher
+		stream := "spl_account_websocket"
+		if destination == "polygon" {
+			stream = "erc20_transfer_websocket"
+		}
+		fmt.Fprintf(
+			s.config.Output,
+			"across_tracker=ready destination=%s stream=%s lifecycle=persistent fallback=across_status+balance_poll balance_units=%s\n",
+			destination, stream, balance,
+		)
+	}
+	s.mu.Lock()
+	old := s.trackers
+	s.trackers = opened
+	s.mu.Unlock()
+	for _, watcher := range old {
+		watcher.Close()
+	}
+	return nil
+}
+
+func (s *LiveService) Close() {
+	s.mu.Lock()
+	trackers := s.trackers
+	s.trackers = make(map[direction]DestinationWatcher)
+	s.mu.Unlock()
+	for _, watcher := range trackers {
+		watcher.Close()
+	}
+}
+
+func (s *LiveService) tracker(selected direction) (DestinationWatcher, error) {
+	s.mu.RLock()
+	watcher := s.trackers[selected]
+	s.mu.RUnlock()
+	if watcher == nil {
+		return nil, fmt.Errorf(
+			"across %s destination tracker is not initialized",
+			destinationChainForDirection(selected),
+		)
+	}
+	return watcher, nil
 }
 
 func (s *LiveService) Transfer(
@@ -72,6 +145,10 @@ func (s *LiveService) transfer(
 		return crosschainport.LiveTransferResult{}, err
 	}
 	selected, err := s.direction(request.Stage.SourceChain)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	watcher, err := s.tracker(selected)
 	if err != nil {
 		return crosschainport.LiveTransferResult{}, err
 	}
@@ -104,10 +181,10 @@ func (s *LiveService) transfer(
 		NativeAssets:     s.config.NativeAssets,
 		NonceCoordinator: s.config.NonceCoordinator,
 	}
-	err = executeArmed(
+	err = executeArmedWithWatcher(
 		ctx, s.config.Output, s.config.Configuration, s.config.Client,
 		approvalRequestValue, approval, selected, s.config.StorePath,
-		s.config.Timeout, hooks,
+		s.config.Timeout, hooks, watcher,
 	)
 	if err != nil {
 		disposition := executionport.DispositionRejected
@@ -237,8 +314,16 @@ func (s *LiveService) RecoverTransfer(
 				fmt.Errorf("across source transaction reverted"),
 			)
 	}
+	selected, err := s.direction(request.Stage.SourceChain)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	watcher, err := s.tracker(selected)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
 	operationID := acrossLiveOperationID(request)
-	if err := resumeArmed(
+	if err := resumeArmedWithWatcher(
 		ctx,
 		s.config.Output,
 		s.config.Configuration,
@@ -246,6 +331,7 @@ func (s *LiveService) RecoverTransfer(
 		operationID,
 		s.config.StorePath,
 		s.config.Timeout,
+		watcher,
 	); err != nil {
 		return crosschainport.LiveTransferResult{},
 			executionport.NewRecoveryError(
