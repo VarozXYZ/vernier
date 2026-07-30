@@ -78,9 +78,11 @@ func (e *SequentialExecutor) Execute(
 		e.mu.Unlock()
 	}()
 
-	if operationID == "" || plan.ID == "" || len(plan.Stages) != 4 ||
-		plan.InitialInput.IsZero() {
+	if operationID == "" {
 		return executionport.SequentialResult{}, fmt.Errorf("sequential execution plan is incomplete")
+	}
+	if err := plan.Validate(); err != nil {
+		return executionport.SequentialResult{}, err
 	}
 	if active, ok, err := e.journal.ActiveSequentialOperation(ctx); err != nil {
 		return executionport.SequentialResult{}, err
@@ -129,11 +131,20 @@ func (e *SequentialExecutor) Execute(
 
 	current := plan.InitialInput
 	stages := append([]domainexecution.SequentialStagePlan(nil), plan.Stages...)
+	outputs := make(map[int]market.TokenAmount, len(stages))
 	recoveryAttempts := make(map[int]int, 2)
 	for index := 0; index < len(stages); index++ {
 		stage := stages[index]
+		input, inputErr := e.resolveInput(plan, stage, current, outputs)
+		if inputErr != nil {
+			finishErr := e.finish(
+				ctx, operation, domainexecution.SequentialManualIntervention,
+				result, inputErr,
+			)
+			return result, errors.Join(inputErr, finishErr)
+		}
 		request := domainexecution.SequentialStageRequest{
-			Operation: operationID, Plan: plan.ID, Stage: stage, Input: current,
+			Operation: operationID, Plan: plan.ID, Stage: stage, Input: input,
 		}
 		if err := request.Validate(); err != nil {
 			finishErr := e.finish(
@@ -199,11 +210,37 @@ func (e *SequentialExecutor) Execute(
 				result.Costs = append(result.Costs, failureCosts...)
 			}
 			if e.canAutomaticallyRecoverSwap(
+				plan,
 				stage,
 				err,
 				recoveryAttempts[stage.Ordinal],
 			) {
 				recoveryAttempts[stage.Ordinal]++
+				if plan.EffectivePolicy() == domainexecution.PolicyPrefundedSequential &&
+					stage.Ordinal == 2 {
+					recoveredStages, decision, recoveryErr :=
+						e.selectOriginCircuitBreaker(
+							ctx, operationID, plan, outputs[1],
+							result.Costs, err,
+						)
+					if recoveryErr != nil {
+						stageErr := fmt.Errorf(
+							"destination sale failed and origin circuit breaker could not be prepared: %w",
+							errors.Join(err, recoveryErr),
+						)
+						finishErr := e.finish(
+							ctx, operation,
+							domainexecution.SequentialManualIntervention,
+							result, stageErr,
+						)
+						return result, errors.Join(stageErr, finishErr)
+					}
+					stages = recoveredStages
+					index = -1
+					result.ExitDecision = &decision
+					e.observeExit(decision)
+					continue
+				}
 				if stage.Ordinal == 3 {
 					recoveredStages, decision, recoveryErr :=
 						e.reselectPostBridgeExit(
@@ -265,6 +302,7 @@ func (e *SequentialExecutor) Execute(
 			return result, errors.Join(err, finishErr)
 		}
 		current = settlement.ActualOutput
+		outputs[stage.Ordinal] = settlement.ActualOutput
 		result.Settlements = append(result.Settlements, settlement)
 		result.Costs = append(result.Costs, settlement.Costs...)
 		operation.CurrentStage = stage.Ordinal
@@ -273,7 +311,46 @@ func (e *SequentialExecutor) Execute(
 		e.observe(func(observer executionport.SequentialObserver) {
 			observer.StageSettled(settlement)
 		})
-		if stage.Ordinal == 2 && e.drivers.ExitSelector != nil {
+		if plan.EffectivePolicy() == domainexecution.PolicyPrefundedSequential &&
+			stage.Ordinal == 1 {
+			prefunded, ok := e.drivers.ExitSelector.(executionport.SequentialPrefundedExitSelector)
+			if !ok {
+				err := fmt.Errorf("prefunded destination-first selector is unavailable")
+				finishErr := e.finish(
+					ctx, operation, domainexecution.SequentialManualIntervention,
+					result, err,
+				)
+				return result, errors.Join(err, finishErr)
+			}
+			decision, selectErr := prefunded.SelectPrefundedExit(
+				ctx, operationID, plan, current,
+				append([]domainexecution.CostComponent(nil), result.Costs...),
+			)
+			if selectErr != nil {
+				finishErr := e.finish(
+					ctx, operation, domainexecution.SequentialManualIntervention,
+					result, fmt.Errorf("prepare prefunded exit: %w", selectErr),
+				)
+				return result, errors.Join(selectErr, finishErr)
+			}
+			if err := e.persistExitDecision(ctx, decision); err != nil {
+				finishErr := e.finish(
+					ctx, operation, domainexecution.SequentialManualIntervention,
+					result, err,
+				)
+				return result, errors.Join(err, finishErr)
+			}
+			result.ExitDecision = &decision
+			if decision.Route == domainexecution.ExitSellAtOrigin {
+				stages = append(
+					stages[:index+1],
+					plan.CircuitBreaker...,
+				)
+			}
+			e.observeExit(decision)
+		}
+		if plan.EffectivePolicy() == domainexecution.PolicyTransportedSequential &&
+			stage.Ordinal == 2 && e.drivers.ExitSelector != nil {
 			decision, selectErr := e.drivers.ExitSelector.SelectExit(
 				ctx,
 				operationID,
@@ -299,23 +376,7 @@ func (e *SequentialExecutor) Execute(
 				)
 				return result, errors.Join(err, finishErr)
 			}
-			exitJournal, ok := e.journal.(executionport.SequentialExitDecisionJournal)
-			if !ok {
-				err := fmt.Errorf(
-					"sequential journal cannot persist the exit decision",
-				)
-				finishErr := e.finish(
-					ctx, operation,
-					domainexecution.SequentialManualIntervention,
-					result,
-					err,
-				)
-				return result, errors.Join(err, finishErr)
-			}
-			if err := exitJournal.RecordSequentialExitDecision(
-				ctx,
-				decision,
-			); err != nil {
+			if err := e.persistExitDecision(ctx, decision); err != nil {
 				finishErr := e.finish(
 					ctx, operation,
 					domainexecution.SequentialManualIntervention,
@@ -366,12 +427,110 @@ func (e *SequentialExecutor) Execute(
 	return result, nil
 }
 
+func (e *SequentialExecutor) resolveInput(
+	plan domainexecution.SequentialPlan,
+	stage domainexecution.SequentialStagePlan,
+	legacyCurrent market.TokenAmount,
+	outputs map[int]market.TokenAmount,
+) (market.TokenAmount, error) {
+	for _, dependency := range stage.DependsOn {
+		if _, settled := outputs[dependency]; !settled {
+			return market.TokenAmount{}, fmt.Errorf(
+				"stage %d awaits dependency %d", stage.Ordinal, dependency,
+			)
+		}
+	}
+	var input market.TokenAmount
+	if stage.InputFromOrdinal == 0 && stage.Ordinal > 1 {
+		// Transported plans created before dependent input references were
+		// introduced are intentionally interpreted as predecessor-linked.
+		input = legacyCurrent
+	} else {
+		var err error
+		input, err = plan.InputFor(stage, outputs)
+		if err != nil {
+			return market.TokenAmount{}, err
+		}
+	}
+	if input.Token() == stage.InputToken {
+		return input, nil
+	}
+	driver, err := e.drivers.Driver(stage.Stage)
+	if err != nil {
+		return market.TokenAmount{}, err
+	}
+	converter, ok := driver.(executionport.SequentialInputConverter)
+	if !ok {
+		return market.TokenAmount{}, fmt.Errorf(
+			"stage %d requires a chain-local input converter", stage.Ordinal,
+		)
+	}
+	return converter.ConvertStageInput(stage, input)
+}
+
+func (e *SequentialExecutor) persistExitDecision(
+	ctx context.Context,
+	decision domainexecution.SequentialExitDecision,
+) error {
+	if err := decision.Validate(); err != nil {
+		return err
+	}
+	journal, ok := e.journal.(executionport.SequentialExitDecisionJournal)
+	if !ok {
+		return fmt.Errorf("sequential journal cannot persist the exit decision")
+	}
+	return journal.RecordSequentialExitDecision(ctx, decision)
+}
+
+func (e *SequentialExecutor) selectOriginCircuitBreaker(
+	ctx context.Context,
+	operationID domainexecution.OperationID,
+	plan domainexecution.SequentialPlan,
+	bought market.TokenAmount,
+	costs []domainexecution.CostComponent,
+	cause error,
+) (
+	[]domainexecution.SequentialStagePlan,
+	domainexecution.SequentialExitDecision,
+	error,
+) {
+	selector, ok :=
+		e.drivers.ExitSelector.(executionport.SequentialPrefundedExitSelector)
+	if !ok {
+		return nil, domainexecution.SequentialExitDecision{},
+			fmt.Errorf("origin circuit-breaker selector is unavailable")
+	}
+	decision, err := selector.SelectOriginCircuitBreaker(
+		ctx, operationID, plan, bought,
+		append([]domainexecution.CostComponent(nil), costs...), cause,
+	)
+	if err != nil {
+		return nil, domainexecution.SequentialExitDecision{}, err
+	}
+	if decision.Route != domainexecution.ExitSellAtOrigin {
+		return nil, domainexecution.SequentialExitDecision{},
+			fmt.Errorf("circuit breaker selected invalid route %q", decision.Route)
+	}
+	if err := e.persistExitDecision(ctx, decision); err != nil {
+		return nil, domainexecution.SequentialExitDecision{}, err
+	}
+	return append(
+		[]domainexecution.SequentialStagePlan(nil),
+		plan.CircuitBreaker...,
+	), decision, nil
+}
+
 func (e *SequentialExecutor) canAutomaticallyRecoverSwap(
+	plan domainexecution.SequentialPlan,
 	stage domainexecution.SequentialStagePlan,
 	err error,
 	attempts int,
 ) bool {
 	if attempts >= 1 || stage.Stage != domainexecution.StageSell {
+		return false
+	}
+	if plan.EffectivePolicy() == domainexecution.PolicyPrefundedSequential &&
+		stage.Ordinal != 2 {
 		return false
 	}
 	switch executionport.ErrorDisposition(err) {

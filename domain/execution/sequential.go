@@ -9,9 +9,17 @@ import (
 	"github.com/VarozXYZ/vernier/domain/market"
 )
 
-// SequentialStage identifies the four economically dependent stages used by
-// an inventory-carrying cross-chain arbitrage. The output confirmed by one
-// stage is the only valid input for the next stage.
+// ExecutionPolicyKind selects one compiled economic lifecycle. It is durable
+// evidence, not a provider or a user-programmable workflow name.
+type ExecutionPolicyKind string
+
+const (
+	PolicyTransportedSequential ExecutionPolicyKind = "transported_sequential"
+	PolicyPrefundedSequential   ExecutionPolicyKind = "prefunded_sequential"
+	PolicyPrefundedParallel     ExecutionPolicyKind = "prefunded_parallel"
+)
+
+// SequentialStage identifies the typed capabilities used by dependent plans.
 type SequentialStage string
 
 const (
@@ -21,18 +29,28 @@ const (
 	StageBridgeQuoteReturn SequentialStage = "bridge_quote_return"
 )
 
-// SequentialExitRoute records the irreversible liquidation decision made
-// after the base token has reached the first bridge destination.
+type SequentialBranch string
+
+const (
+	BranchMain           SequentialBranch = "main"
+	BranchCircuitBreaker SequentialBranch = "circuit_breaker"
+)
+
+// SequentialExitRoute records the irreversible liquidation decision.
 type SequentialExitRoute string
 
 const (
 	ExitSellAtDestination SequentialExitRoute = "sell_at_destination"
 	ExitReturnToOrigin    SequentialExitRoute = "return_to_origin"
+	ExitSellAtOrigin      SequentialExitRoute = "sell_at_origin"
 )
 
 type SequentialStagePlan struct {
 	Ordinal          int
 	Stage            SequentialStage
+	Branch           SequentialBranch
+	DependsOn        []int
+	InputFromOrdinal int
 	SourceChain      market.ChainID
 	DestinationChain market.ChainID
 	InputToken       market.TokenID
@@ -41,9 +59,28 @@ type SequentialStagePlan struct {
 }
 
 func (s SequentialStagePlan) Validate() error {
-	if s.Ordinal < 1 || s.Ordinal > 4 || s.Stage == "" ||
+	if s.Ordinal < 1 || s.Stage == "" ||
 		s.SourceChain == "" || s.InputToken == "" || s.OutputToken == "" {
 		return fmt.Errorf("sequential stage %d is incomplete", s.Ordinal)
+	}
+	if s.Branch == "" {
+		s.Branch = BranchMain
+	}
+	if s.Branch != BranchMain && s.Branch != BranchCircuitBreaker {
+		return fmt.Errorf("sequential stage %d has unsupported branch %q", s.Ordinal, s.Branch)
+	}
+	if s.InputFromOrdinal < 0 || s.InputFromOrdinal >= s.Ordinal {
+		return fmt.Errorf("sequential stage %d has an invalid input reference", s.Ordinal)
+	}
+	seen := make(map[int]struct{}, len(s.DependsOn))
+	for _, dependency := range s.DependsOn {
+		if dependency < 1 || dependency >= s.Ordinal {
+			return fmt.Errorf("sequential stage %d has an invalid dependency", s.Ordinal)
+		}
+		if _, duplicate := seen[dependency]; duplicate {
+			return fmt.Errorf("sequential stage %d repeats dependency %d", s.Ordinal, dependency)
+		}
+		seen[dependency] = struct{}{}
 	}
 	switch s.Stage {
 	case StageBuy, StageSell:
@@ -71,11 +108,84 @@ func (s SequentialStagePlan) Validate() error {
 // payloads.
 type SequentialPlan struct {
 	ID              PlanID
+	Policy          ExecutionPolicyKind
 	Opportunity     arbitrage.Opportunity
 	InitialInput    market.TokenAmount
 	Stages          []SequentialStagePlan
+	CircuitBreaker  []SequentialStagePlan
 	DiscoveryAmount market.TokenAmount
 	CreatedAt       time.Time
+}
+
+func (p SequentialPlan) EffectivePolicy() ExecutionPolicyKind {
+	if p.Policy == "" {
+		return PolicyTransportedSequential
+	}
+	return p.Policy
+}
+
+func (p SequentialPlan) Validate() error {
+	if p.ID == "" || p.InitialInput.IsZero() || p.CreatedAt.IsZero() ||
+		len(p.Stages) == 0 {
+		return fmt.Errorf("dependent execution plan is incomplete")
+	}
+	switch p.EffectivePolicy() {
+	case PolicyTransportedSequential:
+		if len(p.Stages) != 4 {
+			return fmt.Errorf("transported sequential plan requires four main stages")
+		}
+	case PolicyPrefundedSequential:
+		if len(p.Stages) != 4 || len(p.CircuitBreaker) != 1 {
+			return fmt.Errorf("prefunded sequential plan requires four main stages and one circuit-breaker stage")
+		}
+	default:
+		return fmt.Errorf("unsupported dependent execution policy %q", p.Policy)
+	}
+	ordinals := make(map[int]struct{}, len(p.Stages)+len(p.CircuitBreaker))
+	for _, stages := range [][]SequentialStagePlan{p.Stages, p.CircuitBreaker} {
+		for _, stage := range stages {
+			if err := stage.Validate(); err != nil {
+				return err
+			}
+			if _, duplicate := ordinals[stage.Ordinal]; duplicate {
+				return fmt.Errorf("dependent execution plan repeats ordinal %d", stage.Ordinal)
+			}
+			ordinals[stage.Ordinal] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// InputFor resolves a typed stage input only from durable economic
+// settlements. The zero reference denotes the configured initial input.
+func (p SequentialPlan) InputFor(
+	stage SequentialStagePlan,
+	outputs map[int]market.TokenAmount,
+) (market.TokenAmount, error) {
+	if stage.InputFromOrdinal == 0 {
+		if stage.Ordinal != 1 {
+			return market.TokenAmount{}, fmt.Errorf(
+				"stage %d has no settlement input reference", stage.Ordinal,
+			)
+		}
+		if p.InitialInput.Token() != stage.InputToken {
+			return market.TokenAmount{}, fmt.Errorf("initial input token does not match stage 1")
+		}
+		return p.InitialInput, nil
+	}
+	source, ok := outputs[stage.InputFromOrdinal]
+	if !ok || source.IsZero() {
+		return market.TokenAmount{}, fmt.Errorf(
+			"stage %d awaits settlement %d", stage.Ordinal, stage.InputFromOrdinal,
+		)
+	}
+	if source.Token() == stage.InputToken {
+		return source, nil
+	}
+	// The executor delegates chain-local identity/decimal conversion to the
+	// selected stage driver. Returning the immutable source settlement here
+	// keeps that conversion explicit and deterministic.
+	return source, nil
 }
 
 // ReturnExitStages replaces the normal destination sale and quote-token
@@ -142,7 +252,7 @@ func (d SequentialExitDecision) Validate() error {
 		if d.DestinationOutput.IsZero() {
 			return fmt.Errorf("destination exit decision has no executable output")
 		}
-	case ExitReturnToOrigin:
+	case ExitReturnToOrigin, ExitSellAtOrigin:
 		if d.ReturnOutput.IsZero() ||
 			d.ReturnRecovery.Asset() != d.DestinationRecovery.Asset() {
 			return fmt.Errorf("return exit decision has no comparable recovery")
@@ -207,12 +317,76 @@ func NewSequentialPlan(
 			return SequentialPlan{}, err
 		}
 	}
-	return SequentialPlan{
+	plan := SequentialPlan{
 		ID: id, Opportunity: opportunity, InitialInput: initialInput,
+		Policy:          PolicyTransportedSequential,
 		DiscoveryAmount: candidate.BuyQuote.AmountIn,
 		Stages:          append([]SequentialStagePlan(nil), stages...),
 		CreatedAt:       createdAt.UTC(),
-	}, nil
+	}
+	return plan, plan.Validate()
+}
+
+// NewPrefundedSequentialPlan builds the compiled destination-first lifecycle:
+// buy -> sell destination -> bridge base -> bridge quote. The terminal origin
+// sale is a separate durable branch and consumes the buy settlement directly.
+func NewPrefundedSequentialPlan(
+	id PlanID,
+	opportunity arbitrage.Opportunity,
+	initialInput market.TokenAmount,
+	buyChain, sellChain market.ChainID,
+	createdAt time.Time,
+) (SequentialPlan, error) {
+	transported, err := NewSequentialPlan(
+		id, opportunity, initialInput, buyChain, sellChain, createdAt,
+	)
+	if err != nil {
+		return SequentialPlan{}, err
+	}
+	candidate := opportunity.Candidates[opportunity.SelectedIndex]
+	main := []SequentialStagePlan{
+		{
+			Ordinal: 1, Stage: StageBuy, Branch: BranchMain,
+			SourceChain: buyChain, InputToken: candidate.BuyQuote.AmountIn.Token(),
+			OutputToken: candidate.BuyQuote.AmountOut.Token(),
+			Market:      opportunity.Direction.BuyMarket,
+		},
+		{
+			Ordinal: 2, Stage: StageSell, Branch: BranchMain,
+			DependsOn: []int{1}, InputFromOrdinal: 1,
+			SourceChain: sellChain, InputToken: candidate.SellQuote.AmountIn.Token(),
+			OutputToken: candidate.SellQuote.AmountOut.Token(),
+			Market:      opportunity.Direction.SellMarket,
+		},
+		{
+			Ordinal: 3, Stage: StageBridgeBase, Branch: BranchMain,
+			DependsOn: []int{1, 2}, InputFromOrdinal: 1,
+			SourceChain: buyChain, DestinationChain: sellChain,
+			InputToken:  candidate.BuyQuote.AmountOut.Token(),
+			OutputToken: candidate.SellQuote.AmountIn.Token(),
+		},
+		{
+			Ordinal: 4, Stage: StageBridgeQuoteReturn, Branch: BranchMain,
+			DependsOn: []int{2, 3}, InputFromOrdinal: 2,
+			SourceChain: sellChain, DestinationChain: buyChain,
+			InputToken:  candidate.SellQuote.AmountOut.Token(),
+			OutputToken: candidate.BuyQuote.AmountIn.Token(),
+		},
+	}
+	circuit := []SequentialStagePlan{{
+		Ordinal: 5, Stage: StageSell, Branch: BranchCircuitBreaker,
+		DependsOn: []int{1}, InputFromOrdinal: 1,
+		SourceChain: buyChain, InputToken: candidate.BuyQuote.AmountOut.Token(),
+		OutputToken: candidate.BuyQuote.AmountIn.Token(),
+		Market:      opportunity.Direction.BuyMarket,
+	}}
+	transported.Policy = PolicyPrefundedSequential
+	transported.Stages = main
+	transported.CircuitBreaker = circuit
+	if err := transported.Validate(); err != nil {
+		return SequentialPlan{}, err
+	}
+	return transported, nil
 }
 
 type SequentialOperationState string
