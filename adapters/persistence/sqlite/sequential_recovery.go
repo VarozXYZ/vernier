@@ -22,11 +22,14 @@ func (s *SequentialLiveStore) CreateRecoverableSequentialOperation(
 	plan domainexecution.SequentialPlan,
 ) error {
 	if operation.ID == "" || operation.Plan == "" ||
-		operation.Plan != plan.ID || len(plan.Stages) != 4 ||
+		operation.Plan != plan.ID ||
 		operation.CurrentAmount.IsZero() ||
 		plan.Opportunity.SelectedIndex < 0 ||
 		plan.Opportunity.SelectedIndex >= len(plan.Opportunity.Candidates) {
 		return fmt.Errorf("recoverable sequential operation is incomplete")
+	}
+	if err := plan.Validate(); err != nil {
+		return err
 	}
 	candidate := plan.Opportunity.Candidates[plan.Opportunity.SelectedIndex]
 	if candidate.Input.Asset() == "" ||
@@ -58,14 +61,26 @@ func (s *SequentialLiveStore) CreateRecoverableSequentialOperation(
 			break
 		}
 	}
+	admissionCostID, admissionCostAsset := candidate.Cost.ID, ""
+	admissionCostValue, admissionCostCapturedAt := "", ""
+	if candidate.Cost.Amount.Asset() != "" {
+		admissionCostAsset = string(candidate.Cost.Amount.Asset())
+		admissionCostValue = candidate.Cost.Amount.String()
+	}
+	if !candidate.Cost.CapturedAt.IsZero() {
+		admissionCostCapturedAt =
+			candidate.Cost.CapturedAt.UTC().Format(time.RFC3339Nano)
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sequential_live_plan_snapshots (
 		operation_id, plan_id, evaluation_id, config_hash,
 		buy_market, sell_market, initial_token, initial_units,
 		discovery_token, discovery_units, input_asset, input_value,
 		buy_output_token, buy_output_units, sell_input_token,
 		sell_input_units, sell_output_token, sell_output_units,
-		forced_canary, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		forced_canary, execution_policy_kind, admission_cost_id,
+		admission_cost_asset, admission_cost_value,
+		admission_cost_captured_at, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		operation.ID, plan.ID, plan.Opportunity.Evaluation,
 		plan.Opportunity.ConfigHash, plan.Opportunity.Direction.BuyMarket,
 		plan.Opportunity.Direction.SellMarket, plan.InitialInput.Token(),
@@ -77,21 +92,29 @@ func (s *SequentialLiveStore) CreateRecoverableSequentialOperation(
 		candidate.SellQuote.AmountIn.Units().String(),
 		candidate.SellQuote.AmountOut.Token(),
 		candidate.SellQuote.AmountOut.Units().String(), forced,
+		plan.EffectivePolicy(), admissionCostID, admissionCostAsset,
+		admissionCostValue, admissionCostCapturedAt,
 		plan.CreatedAt.UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		return fmt.Errorf("persist sequential plan snapshot: %w", err)
 	}
-	for _, stage := range plan.Stages {
+	allStages := append(
+		append([]domainexecution.SequentialStagePlan(nil), plan.Stages...),
+		plan.CircuitBreaker...,
+	)
+	for _, stage := range allStages {
 		if err := stage.Validate(); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO sequential_live_plan_stages (
 			operation_id, ordinal, stage, source_chain, destination_chain,
-			input_token, output_token, market_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			input_token, output_token, market_id, branch, depends_on,
+			input_from_ordinal
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			operation.ID, stage.Ordinal, stage.Stage, stage.SourceChain,
 			stage.DestinationChain, stage.InputToken, stage.OutputToken,
-			stage.Market,
+			stage.Market, stageBranch(stage), encodeOrdinals(stage.DependsOn),
+			stage.InputFromOrdinal,
 		); err != nil {
 			return fmt.Errorf("persist sequential plan stage: %w", err)
 		}
@@ -273,13 +296,18 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		sellInputToken, sellInputUnits                             string
 		sellOutputToken, sellOutputUnits, created                  string
 		forced                                                     int
+		policyKind                                                 domainexecution.ExecutionPolicyKind
+		admissionCostID, admissionCostAsset, admissionCostValue    string
+		admissionCostCapturedAt                                    string
 	)
 	err := s.db.QueryRowContext(ctx, `SELECT plan_id, evaluation_id,
 		config_hash, buy_market, sell_market, initial_token, initial_units,
 		discovery_token, discovery_units, input_asset, input_value,
 		buy_output_token, buy_output_units, sell_input_token,
 		sell_input_units, sell_output_token, sell_output_units,
-		forced_canary, created_at
+		forced_canary, execution_policy_kind, admission_cost_id,
+		admission_cost_asset, admission_cost_value,
+		admission_cost_captured_at, created_at
 		FROM sequential_live_plan_snapshots WHERE operation_id=?`,
 		operation.ID,
 	).Scan(
@@ -287,7 +315,9 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		&initialToken, &initialUnits, &discoveryToken, &discoveryUnits,
 		&inputAsset, &inputValue, &buyOutputToken, &buyOutputUnits,
 		&sellInputToken, &sellInputUnits, &sellOutputToken,
-		&sellOutputUnits, &forced, &created,
+		&sellOutputUnits, &forced, &policyKind, &admissionCostID,
+		&admissionCostAsset, &admissionCostValue,
+		&admissionCostCapturedAt, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domainexecution.SequentialPlan{}, fmt.Errorf(
@@ -345,7 +375,8 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		return domainexecution.SequentialPlan{}, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT ordinal, stage,
-		source_chain, destination_chain, input_token, output_token, market_id
+		source_chain, destination_chain, input_token, output_token, market_id,
+		branch, depends_on, input_from_ordinal
 		FROM sequential_live_plan_stages
 		WHERE operation_id=? ORDER BY ordinal`,
 		operation.ID,
@@ -354,17 +385,27 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		return domainexecution.SequentialPlan{}, err
 	}
 	defer rows.Close()
-	var stages []domainexecution.SequentialStagePlan
+	var stages, circuit []domainexecution.SequentialStagePlan
 	for rows.Next() {
 		var stage domainexecution.SequentialStagePlan
+		var dependencies string
 		if err := rows.Scan(
 			&stage.Ordinal, &stage.Stage, &stage.SourceChain,
 			&stage.DestinationChain, &stage.InputToken, &stage.OutputToken,
-			&stage.Market,
+			&stage.Market, &stage.Branch, &dependencies,
+			&stage.InputFromOrdinal,
 		); err != nil {
 			return domainexecution.SequentialPlan{}, err
 		}
-		stages = append(stages, stage)
+		stage.DependsOn, err = decodeOrdinals(dependencies)
+		if err != nil {
+			return domainexecution.SequentialPlan{}, err
+		}
+		if stage.Branch == domainexecution.BranchCircuitBreaker {
+			circuit = append(circuit, stage)
+		} else {
+			stages = append(stages, stage)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return domainexecution.SequentialPlan{}, err
@@ -381,15 +422,37 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		Input: input,
 		BuyQuote: market.Quote{
 			Market:   market.MarketID(buyMarket),
-			AmountIn: initial, AmountOut: buyOutput,
+			AmountIn: discovery, AmountOut: buyOutput,
 		},
 		SellQuote: market.Quote{
 			Market:   market.MarketID(sellMarket),
 			AmountIn: sellInput, AmountOut: sellOutput,
 		},
 	}
-	return domainexecution.SequentialPlan{
-		ID: domainexecution.PlanID(planID),
+	if admissionCostID != "" || admissionCostAsset != "" ||
+		admissionCostValue != "" || admissionCostCapturedAt != "" {
+		if admissionCostID == "" || admissionCostAsset == "" ||
+			admissionCostValue == "" || admissionCostCapturedAt == "" {
+			return domainexecution.SequentialPlan{},
+				fmt.Errorf("durable admission cost snapshot is incomplete")
+		}
+		candidate.Cost.Amount, err = market.ParseAssetQuantity(
+			market.AssetID(admissionCostAsset), admissionCostValue,
+		)
+		if err != nil {
+			return domainexecution.SequentialPlan{}, err
+		}
+		candidate.Cost.ID = admissionCostID
+		candidate.Cost.CapturedAt, err = time.Parse(
+			time.RFC3339Nano, admissionCostCapturedAt,
+		)
+		if err != nil {
+			return domainexecution.SequentialPlan{}, err
+		}
+	}
+	plan := domainexecution.SequentialPlan{
+		ID:     domainexecution.PlanID(planID),
+		Policy: policyKind,
 		Opportunity: arbitrage.Opportunity{
 			Evaluation: arbitrage.EvaluationID(evaluation),
 			ConfigHash: configHash,
@@ -403,8 +466,44 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 			Reasons:        reasons,
 		},
 		InitialInput: initial, DiscoveryAmount: discovery,
-		Stages: stages, CreatedAt: createdAt.UTC(),
-	}, nil
+		Stages: stages, CircuitBreaker: circuit, CreatedAt: createdAt.UTC(),
+	}
+	if err := plan.Validate(); err != nil {
+		return domainexecution.SequentialPlan{}, err
+	}
+	return plan, nil
+}
+
+func stageBranch(stage domainexecution.SequentialStagePlan) domainexecution.SequentialBranch {
+	if stage.Branch == "" {
+		return domainexecution.BranchMain
+	}
+	return stage.Branch
+}
+
+func encodeOrdinals(values []int) string {
+	parts := make([]string, len(values))
+	for index, value := range values {
+		parts[index] = strconv.Itoa(value)
+	}
+	return strings.Join(parts, ",")
+}
+
+func decodeOrdinals(value string) ([]int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]int, 0, len(parts))
+	for _, part := range parts {
+		ordinal, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("invalid stage dependency %q", part)
+		}
+		result = append(result, ordinal)
+	}
+	return result, nil
 }
 
 func (s *SequentialLiveStore) loadSequentialTransactions(
@@ -510,7 +609,8 @@ func (s *SequentialLiveStore) loadSequentialSettlements(
 		); err != nil {
 			return nil, nil, err
 		}
-		if ordinal < 1 || ordinal > len(plan.Stages) {
+		stage, ok := sequentialStageByOrdinal(plan, ordinal)
+		if !ok {
 			return nil, nil, fmt.Errorf("settlement ordinal is invalid")
 		}
 		input, err := market.ParseTokenAmount(
@@ -553,7 +653,7 @@ func (s *SequentialLiveStore) loadSequentialSettlements(
 		settlements = append(settlements, domainexecution.SequentialStageSettlement{
 			Request: domainexecution.SequentialStageRequest{
 				Operation: operation.ID, Plan: plan.ID,
-				Stage: plan.Stages[ordinal-1], Input: input,
+				Stage: stage, Input: input,
 			},
 			ActualInput: input, ActualOutput: output,
 			SourceIdentity: source, DestinationIdentity: destination,
@@ -571,6 +671,22 @@ func (s *SequentialLiveStore) loadSequentialSettlements(
 		return nil, nil, err
 	}
 	return settlements, costs, nil
+}
+
+func sequentialStageByOrdinal(
+	plan domainexecution.SequentialPlan,
+	ordinal int,
+) (domainexecution.SequentialStagePlan, bool) {
+	for _, stages := range [][]domainexecution.SequentialStagePlan{
+		plan.Stages, plan.CircuitBreaker,
+	} {
+		for _, stage := range stages {
+			if stage.Ordinal == ordinal {
+				return stage, true
+			}
+		}
+	}
+	return domainexecution.SequentialStagePlan{}, false
 }
 
 func (s *SequentialLiveStore) loadSequentialCosts(

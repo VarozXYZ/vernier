@@ -9,6 +9,7 @@ import (
 	"time"
 
 	sqlitestore "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
+	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
@@ -153,6 +154,52 @@ func TestSequentialLiveStoreAcknowledgesRecoveryBlocked(t *testing.T) {
 	}
 }
 
+func TestSequentialLiveStoreExplicitlyRetriesRecoveryBlocked(t *testing.T) {
+	store, err := sqlitestore.OpenSequentialLive(
+		filepath.Join(t.TempDir(), "live.sqlite"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	input := mustTokenAmount(t, "quote-a", 1_000_000)
+	now := time.Now().UTC()
+	operation := domainexecution.SequentialOperation{
+		ID: "operation-retry-blocked", Plan: "plan-1",
+		OpportunityID: "opportunity-1", ConfigHash: "config",
+		State:         domainexecution.SequentialRunning,
+		CurrentAmount: input, StartedAt: now, UpdatedAt: now,
+	}
+	ctx := context.Background()
+	if err := store.CreateSequentialOperation(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetSequentialRecoveryState(
+		ctx,
+		operation.ID,
+		domainexecution.SequentialRecoveryBlocked,
+		context.DeadlineExceeded,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryBlockedSequentialRecovery(ctx, operation.ID); err != nil {
+		t.Fatal(err)
+	}
+	active, found, err := store.ActiveSequentialOperation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || active.State != domainexecution.SequentialRecovering ||
+		active.LastError == "" {
+		t.Fatalf("unexpected retried operation: %#v", active)
+	}
+	if err := store.RetryBlockedSequentialRecovery(
+		ctx, operation.ID,
+	); err == nil {
+		t.Fatal("expected a second retry authorization to be rejected")
+	}
+}
+
 func TestSequentialLiveStorePersistsRealizedCostsAndPnL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "live-costs.sqlite")
 	store, err := sqlitestore.OpenSequentialLive(path)
@@ -255,6 +302,111 @@ func TestSequentialLiveStorePersistsRealizedCostsAndPnL(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("cost count=%d", count)
+	}
+}
+
+func TestSequentialLiveStoreAcceptsPrefundedSettlementInputReference(t *testing.T) {
+	store, err := sqlitestore.OpenSequentialLive(
+		filepath.Join(t.TempDir(), "prefunded-live.sqlite"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	input := mustTokenAmount(t, "quote-a", 1_000_000)
+	discoveryInput := mustTokenAmount(t, "quote-a", 750_000_000)
+	discoveryBaseA := mustTokenAmount(t, "base-a", 3_614_009_167_212)
+	baseA := mustTokenAmount(t, "base-a", 4_825_799_926)
+	baseB := mustTokenAmount(t, "base-b", 4_825_799_926_000_000_000)
+	quoteB := mustTokenAmount(t, "quote-b", 994_662)
+	inputValue, _ := market.NewAssetQuantity("quote", big.NewRat(750, 1))
+	outputValue, _ := market.NewAssetQuantity("quote", big.NewRat(994_662, 1_000_000))
+	opportunity := arbitrage.Opportunity{
+		Evaluation: "prefunded-evaluation", ConfigHash: "config",
+		Classification: arbitrage.ClassificationPolicyQualified,
+		Direction: arbitrage.Direction{
+			BuyMarket: "market-a", SellMarket: "market-b",
+		},
+		Candidates: []arbitrage.Candidate{{
+			Input: inputValue, Output: outputValue,
+			BuyQuote: market.Quote{
+				AmountIn: discoveryInput, AmountOut: discoveryBaseA,
+			},
+			SellQuote: market.Quote{
+				AmountIn: baseB, AmountOut: quoteB,
+			},
+		}},
+		SelectedIndex: 0,
+	}
+	plan, err := domainexecution.NewPrefundedSequentialPlan(
+		"prefunded-plan", opportunity, input, "chain-a", "chain-b", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := domainexecution.SequentialOperation{
+		ID: "prefunded-operation", Plan: plan.ID,
+		OpportunityID: string(opportunity.Evaluation),
+		ConfigHash:    opportunity.ConfigHash,
+		State:         domainexecution.SequentialRunning,
+		CurrentAmount: input, StartedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateRecoverableSequentialOperation(
+		ctx, operation, plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.LoadSequentialRecovery(ctx, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableDiscovery := snapshot.Plan.Opportunity.Candidates[0].
+		BuyQuote.AmountIn
+	if durableDiscovery.Units().Cmp(discoveryInput.Units()) != 0 {
+		t.Fatalf(
+			"durable discovery input=%s want=%s",
+			durableDiscovery, discoveryInput,
+		)
+	}
+	settlements := []domainexecution.SequentialStageSettlement{
+		{
+			Request: domainexecution.SequentialStageRequest{
+				Operation: operation.ID, Plan: plan.ID,
+				Stage: plan.Stages[0], Input: input,
+			},
+			ActualInput: input, ActualOutput: baseA,
+			SourceIdentity: domainexecution.TransactionIdentity{
+				Chain: "chain-a", Account: "account-a", Hash: "buy",
+			},
+			ObservedAt: now.Add(time.Second), Evidence: "buy-receipt",
+		},
+		{
+			Request: domainexecution.SequentialStageRequest{
+				Operation: operation.ID, Plan: plan.ID,
+				Stage: plan.Stages[1], Input: baseB,
+			},
+			ActualInput: baseB, ActualOutput: quoteB,
+			SourceIdentity: domainexecution.TransactionIdentity{
+				Chain: "chain-b", Account: "account-b", Hash: "sell",
+			},
+			ObservedAt: now.Add(2 * time.Second), Evidence: "sell-receipt",
+		},
+	}
+	for _, settlement := range settlements {
+		if err := store.RecordStageSettlement(ctx, settlement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	active, found, err := store.ActiveSequentialOperation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || active.CurrentStage != 2 ||
+		active.CurrentAmount.Token() != quoteB.Token() ||
+		active.CurrentAmount.Units().Cmp(quoteB.Units()) != 0 {
+		t.Fatalf("unexpected prefunded durable state: %#v", active)
 	}
 }
 
