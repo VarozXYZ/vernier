@@ -297,7 +297,7 @@ func (v *retryingValidator) Validate(
 type fixedQuoteEstimator struct {
 	output *big.Int
 	err    error
-	calls  int
+	calls  atomic.Int32
 }
 
 func (e *fixedQuoteEstimator) QuoteExactInput(
@@ -305,7 +305,7 @@ func (e *fixedQuoteEstimator) QuoteExactInput(
 	_ market.TokenAmount,
 	output market.TokenID,
 ) (market.TokenAmount, error) {
-	e.calls++
+	e.calls.Add(1)
 	if e.err != nil {
 		return market.TokenAmount{}, e.err
 	}
@@ -1374,7 +1374,7 @@ func TestSwapDriverRecoveryComparesReturnEvenWhenDestinationRemainsQualified(t *
 	}
 	if decision.Route != execution.ExitReturnToOrigin ||
 		!decision.DestinationQualified ||
-		returnEstimator.calls != 1 ||
+		returnEstimator.calls.Load() != 1 ||
 		!strings.Contains(
 			decision.Evidence,
 			"automatic_recovery_comparison",
@@ -1703,8 +1703,11 @@ func TestForcedCanaryKeepsDestinationExitDespiteBetterReturn(t *testing.T) {
 			"fresh_destination_build+simulation+forced_canary_destination" {
 		t.Fatalf("forced destination decision=%+v", decision)
 	}
-	if returnEstimator.calls != 0 {
-		t.Fatalf("forced destination requested %d unnecessary return quotes", returnEstimator.calls)
+	if returnEstimator.calls.Load() != 0 {
+		t.Fatalf(
+			"forced destination requested %d unnecessary return quotes",
+			returnEstimator.calls.Load(),
+		)
 	}
 }
 
