@@ -10,6 +10,7 @@ import (
 )
 
 var envFileKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var envFileReference = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // LoadEnvFile loads local test/runtime secrets without overriding variables
 // already present in the process environment.
@@ -48,6 +49,22 @@ func LoadEnvFile(path string, lookup LookupEnv, set func(string, string) error) 
 					return fmt.Errorf("invalid quoted environment value")
 				}
 			}
+		}
+		missing := ""
+		value = envFileReference.ReplaceAllStringFunc(
+			value,
+			func(reference string) string {
+				name := reference[2 : len(reference)-1]
+				resolved, ok := lookup(name)
+				if !ok {
+					missing = name
+					return ""
+				}
+				return resolved
+			},
+		)
+		if missing != "" {
+			return fmt.Errorf("environment entry references unset variable %q", missing)
 		}
 		if err := set(key, value); err != nil {
 			return err
