@@ -239,17 +239,17 @@ func (m *TxManager) FeeSnapshot() (FeeSnapshot, bool) {
 	}, true
 }
 
-// EstimateArtifactNetworkCost values the validator's latest eth_estimateGas
-// result with the fee cap maintained by the background fee cache. It performs
-// no RPC call.
+// EstimateArtifactNetworkCost values the artifact's expected gas usage with the
+// fee inputs maintained by the background cache. The transaction gas limit is
+// deliberately independent and is not used as the expected economic cost.
 func (m *TxManager) EstimateArtifactNetworkCost(
 	_ context.Context,
 	artifact executionport.Artifact,
 ) (*big.Int, time.Time, error) {
-	text := strings.TrimSpace(artifact.Metadata["estimated_gas"])
+	text := strings.TrimSpace(artifact.Metadata["expected_gas_used"])
 	gas, err := strconv.ParseUint(text, 10, 64)
 	if err != nil || gas == 0 {
-		return nil, time.Time{}, fmt.Errorf("EVM artifact has no estimated gas evidence")
+		return nil, time.Time{}, fmt.Errorf("EVM artifact has no expected gas usage evidence")
 	}
 	fees, ok := m.FeeSnapshot()
 	if !ok {

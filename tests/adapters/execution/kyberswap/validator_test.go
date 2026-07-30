@@ -28,6 +28,7 @@ type routeBuilderStub struct {
 	routes    int
 	builds    int
 	buildErrs []error
+	lastBuild quoteadapter.BuildRequest
 }
 
 func (s *routeBuilderStub) Route(
@@ -46,10 +47,11 @@ func (s *routeBuilderStub) Route(
 }
 
 func (s *routeBuilderStub) Build(
-	context.Context,
-	quoteadapter.BuildRequest,
+	_ context.Context,
+	request quoteadapter.BuildRequest,
 ) (quoteadapter.BuildResult, error) {
 	s.builds++
+	s.lastBuild = request
 	if len(s.buildErrs) >= s.builds && s.buildErrs[s.builds-1] != nil {
 		return quoteadapter.BuildResult{}, s.buildErrs[s.builds-1]
 	}
@@ -63,8 +65,10 @@ func (s *routeBuilderStub) Build(
 }
 
 type simulatorStub struct {
-	callErrors []error
-	calls      int
+	callErrors    []error
+	calls         int
+	estimateGas   uint64
+	estimateCalls int
 }
 
 func (s *simulatorStub) CallContract(
@@ -79,11 +83,15 @@ func (s *simulatorStub) CallContract(
 	return nil, nil
 }
 
-func (*simulatorStub) EstimateGas(
+func (s *simulatorStub) EstimateGas(
 	context.Context,
 	geth.CallMsg,
 ) (uint64, error) {
-	return 250_000, nil
+	s.estimateCalls++
+	if s.estimateGas == 0 {
+		return 250_000, nil
+	}
+	return s.estimateGas, nil
 }
 
 func TestValidatorRefreshesRouteOnceAfterStaleBuild(t *testing.T) {
@@ -161,6 +169,66 @@ func TestValidatorRefreshesRouteAfterLocalMinReturnRevert(t *testing.T) {
 	}
 }
 
+func TestValidatorSeparatesTransactionGasLimitFromExpectedGasUsage(t *testing.T) {
+	source := &routeBuilderStub{}
+	simulator := &simulatorStub{}
+	validator := newValidatorWithGasPolicyForTest(
+		t,
+		source,
+		simulator,
+		"fixed",
+		1_500_000,
+		"fixed",
+		1_000_000,
+	)
+
+	artifact, err := validator.Validate(context.Background(), validationRequest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := artifact.Metadata["gas_limit"]; got != "1500000" {
+		t.Fatalf("gas_limit = %q; want 1500000", got)
+	}
+	if got := artifact.Metadata["expected_gas_used"]; got != "1000000" {
+		t.Fatalf("expected_gas_used = %q; want 1000000", got)
+	}
+	if source.lastBuild.EnableGasEstimation {
+		t.Fatal("KyberSwap build requested provider gas estimation")
+	}
+	if simulator.estimateCalls != 0 {
+		t.Fatalf(
+			"fixed policy made %d eth_estimateGas calls",
+			simulator.estimateCalls,
+		)
+	}
+}
+
+func TestValidatorEstimatesExecutionAndCostGasByDefault(t *testing.T) {
+	source := &routeBuilderStub{}
+	simulator := &simulatorStub{estimateGas: 250_000}
+	validator := newValidatorWithSimulatorForTest(t, source, simulator)
+
+	artifact, err := validator.Validate(
+		context.Background(),
+		validationRequest(t),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := artifact.Metadata["gas_limit"]; got != "300000" {
+		t.Fatalf("gas_limit = %q; want 300000", got)
+	}
+	if got := artifact.Metadata["expected_gas_used"]; got != "250000" {
+		t.Fatalf("expected_gas_used = %q; want 250000", got)
+	}
+	if simulator.estimateCalls != 1 {
+		t.Fatalf(
+			"estimated policy made %d eth_estimateGas calls; want 1",
+			simulator.estimateCalls,
+		)
+	}
+}
+
 func newValidatorForTest(
 	t *testing.T,
 	source kyberswapadapter.RouteBuilder,
@@ -182,11 +250,43 @@ func newValidatorWithSimulatorForTest(
 			"base":  validatorTokenIn,
 			"quote": validatorTokenOut,
 		},
-		SlippageBPS:         10,
-		EnableGasEstimation: true,
-		Source:              source,
-		Simulator:           simulator,
-		Clock:               time.Now,
+		SlippageBPS: 10,
+		Source:      source,
+		Simulator:   simulator,
+		Clock:       time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return validator
+}
+
+func newValidatorWithGasPolicyForTest(
+	t *testing.T,
+	source kyberswapadapter.RouteBuilder,
+	simulator kyberswapadapter.Simulator,
+	executionMode string,
+	executionLimit uint64,
+	costMode string,
+	costLimit uint64,
+) *kyberswapadapter.Validator {
+	t.Helper()
+	validator, err := kyberswapadapter.New(kyberswapadapter.Config{
+		ID:        "kyberswap/live",
+		ChainSlug: "polygon",
+		Sender:    common.HexToAddress(validatorSender),
+		TokenAddresses: map[market.TokenID]string{
+			"base":  validatorTokenIn,
+			"quote": validatorTokenOut,
+		},
+		SlippageBPS:            10,
+		GasExecutionMode:       executionMode,
+		FixedExecutionGasLimit: executionLimit,
+		GasCostMode:            costMode,
+		FixedCostGasLimit:      costLimit,
+		Source:                 source,
+		Simulator:              simulator,
+		Clock:                  time.Now,
 	})
 	if err != nil {
 		t.Fatal(err)

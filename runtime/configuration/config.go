@@ -234,10 +234,19 @@ type LiveConfig struct {
 	BlockhashSlotsToExpiry        uint16                       `yaml:"blockhash_slots_to_expiry"`
 	BuildToBroadcastTimeoutMS     int                          `yaml:"build_to_broadcast_timeout_ms"`
 	EVMDeadlineSeconds            int                          `yaml:"evm_deadline_seconds"`
+	EVMGas                        EVMGasConfig                 `yaml:"evm_gas"`
 	OperationalStore              OperationalStoreConfig       `yaml:"operational_store"`
 	Accounts                      map[string]LiveAccountConfig `yaml:"accounts"`
 	Inventory                     []InventoryBalanceConfig     `yaml:"inventory"`
 	GasRefuel                     GasRefuelConfig              `yaml:"gas_refuel"`
+}
+
+type EVMGasConfig struct {
+	ExecutionMode           string `yaml:"execution_mode"`
+	ExecutionFixedLimit     uint64 `yaml:"execution_fixed_limit"`
+	EstimationMultiplierBPS uint64 `yaml:"estimation_multiplier_bps"`
+	CostMode                string `yaml:"cost_mode"`
+	CostFixedLimit          uint64 `yaml:"cost_fixed_limit"`
 }
 
 type GasRefuelConfig struct {
@@ -476,11 +485,20 @@ type ParsedLiveConfig struct {
 	BlockhashSlotsToExpiry        uint16
 	BuildToBroadcastTimeout       time.Duration
 	EVMDeadline                   time.Duration
+	EVMGas                        ResolvedEVMGasPolicy
 	OperationalStorePath          string
 	SQLiteSynchronous             string
 	Accounts                      map[string]ResolvedLiveAccount
 	Inventory                     []ResolvedInventoryBalance
 	GasRefuel                     ResolvedGasRefuel
+}
+
+type ResolvedEVMGasPolicy struct {
+	ExecutionMode           string
+	ExecutionFixedLimit     uint64
+	EstimationMultiplierBPS uint64
+	CostMode                string
+	CostFixedLimit          uint64
 }
 
 type ResolvedGasRefuel struct {
@@ -982,6 +1000,13 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		hasSolana = hasSolana || chain.Kind == "solana"
 		hasEVM = hasEVM || chain.Kind == "evm"
 	}
+	evmGas := ResolvedEVMGasPolicy{}
+	if hasEVM {
+		evmGas, err = resolveEVMGasPolicy(config.EVMGas)
+		if err != nil {
+			return ParsedLiveConfig{}, err
+		}
+	}
 	if hasSolana {
 		tip, ok := new(big.Int).SetString(config.TipLamports, 10)
 		if !ok || tip.Sign() <= 0 {
@@ -1259,9 +1284,67 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		BlockhashSlotsToExpiry:  config.BlockhashSlotsToExpiry,
 		BuildToBroadcastTimeout: time.Duration(config.BuildToBroadcastTimeoutMS) * time.Millisecond,
 		EVMDeadline:             time.Duration(config.EVMDeadlineSeconds) * time.Second,
+		EVMGas:                  evmGas,
 		OperationalStorePath:    config.OperationalStore.Path, SQLiteSynchronous: synchronous,
 		Accounts: accounts, Inventory: inventoryBalances,
 		GasRefuel: refuel,
+	}, nil
+}
+
+func resolveEVMGasPolicy(
+	config EVMGasConfig,
+) (ResolvedEVMGasPolicy, error) {
+	executionMode := strings.TrimSpace(config.ExecutionMode)
+	if executionMode == "" {
+		executionMode = "estimate"
+	}
+	if executionMode != "estimate" && executionMode != "fixed" {
+		return ResolvedEVMGasPolicy{}, fmt.Errorf(
+			"live EVM gas execution_mode must be estimate or fixed",
+		)
+	}
+	if config.EstimationMultiplierBPS == 0 {
+		config.EstimationMultiplierBPS = 12_000
+	}
+	if config.EstimationMultiplierBPS < 10_000 {
+		return ResolvedEVMGasPolicy{}, fmt.Errorf(
+			"live EVM gas estimation_multiplier_bps cannot reduce estimated gas",
+		)
+	}
+	if executionMode == "fixed" && config.ExecutionFixedLimit == 0 {
+		return ResolvedEVMGasPolicy{}, fmt.Errorf(
+			"live EVM fixed execution gas requires execution_fixed_limit",
+		)
+	}
+	costMode := strings.TrimSpace(config.CostMode)
+	if costMode == "" {
+		costMode = "estimated"
+	}
+	switch costMode {
+	case "estimated":
+		if executionMode != "estimate" {
+			return ResolvedEVMGasPolicy{}, fmt.Errorf(
+				"live EVM estimated cost gas requires estimated execution gas",
+			)
+		}
+	case "transaction_limit":
+	case "fixed":
+		if config.CostFixedLimit == 0 {
+			return ResolvedEVMGasPolicy{}, fmt.Errorf(
+				"live EVM fixed cost gas requires cost_fixed_limit",
+			)
+		}
+	default:
+		return ResolvedEVMGasPolicy{}, fmt.Errorf(
+			"live EVM gas cost_mode must be estimated, transaction_limit, or fixed",
+		)
+	}
+	return ResolvedEVMGasPolicy{
+		ExecutionMode:           executionMode,
+		ExecutionFixedLimit:     config.ExecutionFixedLimit,
+		EstimationMultiplierBPS: config.EstimationMultiplierBPS,
+		CostMode:                costMode,
+		CostFixedLimit:          config.CostFixedLimit,
 	}, nil
 }
 

@@ -56,6 +56,11 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 	if config.ExecutionCost.Sign() != 0 {
 		t.Fatalf("dynamic sequential execution cost=%s, want zero placeholder", config.ExecutionCost)
 	}
+	if config.EVMGas.ExecutionMode != "estimate" ||
+		config.EVMGas.EstimationMultiplierBPS != 12_000 ||
+		config.EVMGas.CostMode != "estimated" {
+		t.Fatalf("unexpected default EVM gas policy: %+v", config.EVMGas)
+	}
 	if config.Accounts["chain_a"].SellPreflightAddressEnv !=
 		"CHAIN_A_PREFLIGHT_ADDRESS" {
 		t.Fatalf("Solana sell preflight address was not resolved: %+v", config.Accounts)
@@ -66,6 +71,43 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 		evmOverride.BalanceSlot != 3 ||
 		evmOverride.AllowanceSlot != 4 {
 		t.Fatalf("EVM sell preflight state override was not resolved: %+v", config.Accounts)
+	}
+}
+
+func TestLoadLiveConfigResolvesFixedEVMGasPolicy(t *testing.T) {
+	manifest := writeSequentialLiveConfig(t, "750")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withGasPolicy := strings.Replace(
+		string(data),
+		"    operational_store:",
+		"    evm_gas:\n"+
+			"      execution_mode: fixed\n"+
+			"      execution_fixed_limit: 1500000\n"+
+			"      cost_mode: fixed\n"+
+			"      cost_fixed_limit: 1000000\n"+
+			"    operational_store:",
+		1,
+	)
+	if err := os.WriteFile(
+		policyPath,
+		[]byte(withGasPolicy),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	config, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.EVMGas.ExecutionMode != "fixed" ||
+		config.EVMGas.ExecutionFixedLimit != 1_500_000 ||
+		config.EVMGas.CostMode != "fixed" ||
+		config.EVMGas.CostFixedLimit != 1_000_000 {
+		t.Fatalf("unexpected fixed EVM gas policy: %+v", config.EVMGas)
 	}
 }
 
