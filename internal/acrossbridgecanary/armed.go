@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	geth "github.com/ethereum/go-ethereum"
@@ -31,15 +32,23 @@ import (
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 )
 
-type destinationEvidence struct {
+type DestinationEvidence struct {
 	Identity string
 	Balance  *big.Int
 	Source   string
 }
 
-type destinationWatcher interface {
-	Await(context.Context, *big.Int) (destinationEvidence, error)
+type DestinationWatcher interface {
+	Await(context.Context, *big.Int) (DestinationEvidence, error)
+	Balance(context.Context) (*big.Int, error)
 	Close()
+}
+
+func destinationChainForDirection(selected direction) string {
+	if selected == evmToSolana {
+		return "solana"
+	}
+	return "polygon"
 }
 
 type liveExecutionResult struct {
@@ -171,6 +180,21 @@ func resumeArmed(
 	storePath string,
 	timeout time.Duration,
 ) error {
+	return resumeArmedWithWatcher(
+		ctx, output, config, client, operationID, storePath, timeout, nil,
+	)
+}
+
+func resumeArmedWithWatcher(
+	ctx context.Context,
+	output io.Writer,
+	config configuration.ParsedConfig,
+	client *across.Client,
+	operationID string,
+	storePath string,
+	timeout time.Duration,
+	sharedWatcher DestinationWatcher,
+) error {
 	if timeout <= 0 {
 		return fmt.Errorf("confirmation timeout must be positive")
 	}
@@ -219,11 +243,22 @@ func resumeArmed(
 	if err != nil {
 		return err
 	}
-	watcher, current, destinationChain, err := openDestinationWatcher(ctx, config, selected, endpoints)
-	if err != nil {
-		return err
+	watcher := sharedWatcher
+	var current *big.Int
+	destinationChain := destinationChainForDirection(selected)
+	if watcher == nil {
+		watcher, current, destinationChain, err =
+			openDestinationWatcher(ctx, config, selected, endpoints)
+		if err != nil {
+			return err
+		}
+		defer watcher.Close()
+	} else {
+		current, err = watcher.Balance(ctx)
+		if err != nil {
+			return fmt.Errorf("read shared destination tracker balance: %w", err)
+		}
 	}
-	defer watcher.Close()
 	fmt.Fprintf(
 		output,
 		"resume operation=%s source_tx=%s destination=%s balance_before=%s balance_current=%s target=%s\n",
@@ -249,50 +284,17 @@ func resumeArmed(
 
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	evidenceChannel := make(chan destinationEvidence, 2)
-	errorChannel := make(chan error, 1)
-	statusErrorChannel := make(chan error, 1)
-	go func() {
-		evidence, waitErr := watcher.Await(waitCtx, target)
-		if waitErr != nil {
-			errorChannel <- waitErr
-			return
-		}
-		evidenceChannel <- evidence
-	}()
-	go pollAcrossStatus(waitCtx, client, operation.SourceIdentity, evidenceChannel, statusErrorChannel)
-
-	var balanceEvidence *destinationEvidence
-	fillIdentity := ""
-	for {
-		select {
-		case evidence := <-evidenceChannel:
-			if evidence.Source == "across_status" {
-				fillIdentity = evidence.Identity
-			} else if evidence.Balance != nil && evidence.Balance.Cmp(target) >= 0 {
-				copy := evidence
-				balanceEvidence = &copy
-			}
-			if balanceEvidence != nil && fillIdentity != "" {
-				return completeResumedDestination(
-					ctx, output, store, operation.ID, destinationChain,
-					fillIdentity, before, balanceEvidence.Balance,
-				)
-			}
-		case waitErr := <-errorChannel:
-			_ = store.Mark(ctx, operation.ID, "outcome_unknown", waitErr)
-			return fmt.Errorf("await destination: %w", waitErr)
-		case statusErr := <-statusErrorChannel:
-			fmt.Fprintf(
-				output,
-				"tracking_warning source=across_status error=%q action=websocket_remains_primary\n",
-				statusErr,
-			)
-		case <-waitCtx.Done():
-			_ = store.Mark(ctx, operation.ID, "outcome_unknown", waitCtx.Err())
-			return fmt.Errorf("destination outcome is unknown: %w", waitCtx.Err())
-		}
+	evidence, err := AwaitDestinationConfirmation(
+		waitCtx, output, watcher, client, operation.SourceIdentity, target,
+	)
+	if err != nil {
+		_ = store.Mark(ctx, operation.ID, "outcome_unknown", err)
+		return fmt.Errorf("destination outcome is unknown: %w", err)
 	}
+	return completeResumedDestination(
+		ctx, output, store, operation.ID, destinationChain,
+		evidence.Identity, before, evidence.Balance,
+	)
 }
 
 func completeResumedDestination(
@@ -329,6 +331,25 @@ func executeArmed(
 	timeout time.Duration,
 	hooks *liveExecutionHooks,
 ) error {
+	return executeArmedWithWatcher(
+		ctx, output, config, client, request, approval, selected,
+		storePath, timeout, hooks, nil,
+	)
+}
+
+func executeArmedWithWatcher(
+	ctx context.Context,
+	output io.Writer,
+	config configuration.ParsedConfig,
+	client *across.Client,
+	request across.ApprovalRequest,
+	approval across.Approval,
+	selected direction,
+	storePath string,
+	timeout time.Duration,
+	hooks *liveExecutionHooks,
+	sharedWatcher DestinationWatcher,
+) error {
 	if timeout <= 0 {
 		return fmt.Errorf("confirmation timeout must be positive")
 	}
@@ -362,12 +383,24 @@ func executeArmed(
 	fmt.Fprintf(output, "operation=%s mode=armed journal=%s\n", operationID, storePath)
 
 	minimumOutput, _ := new(big.Int).SetString(approval.MinimumOutputAmount, 10)
-	watcher, before, destinationChain, err := openDestinationWatcher(ctx, config, selected, endpoints)
-	if err != nil {
-		_ = store.Mark(ctx, operationID, "failed", err)
-		return err
+	watcher := sharedWatcher
+	var before *big.Int
+	destinationChain := destinationChainForDirection(selected)
+	if watcher == nil {
+		watcher, before, destinationChain, err =
+			openDestinationWatcher(ctx, config, selected, endpoints)
+		if err != nil {
+			_ = store.Mark(ctx, operationID, "failed", err)
+			return err
+		}
+		defer watcher.Close()
+	} else {
+		before, err = watcher.Balance(ctx)
+		if err != nil {
+			_ = store.Mark(ctx, operationID, "failed", err)
+			return fmt.Errorf("read shared destination tracker balance: %w", err)
+		}
 	}
-	defer watcher.Close()
 
 	var sourceIdentity, sourceChain string
 	if selected == evmToSolana {
@@ -427,45 +460,13 @@ func executeArmed(
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	targetBalance := new(big.Int).Add(new(big.Int).Set(before), minimumOutput)
-	evidenceChannel := make(chan destinationEvidence, 1)
-	errorChannel := make(chan error, 1)
-	statusErrorChannel := make(chan error, 1)
-	go func() {
-		evidence, waitErr := watcher.Await(waitCtx, targetBalance)
-		if waitErr != nil {
-			errorChannel <- waitErr
-			return
-		}
-		evidenceChannel <- evidence
-	}()
-	go pollAcrossStatus(waitCtx, client, sourceIdentity, evidenceChannel, statusErrorChannel)
-
-	var evidence destinationEvidence
-	for {
-		select {
-		case evidence = <-evidenceChannel:
-			if evidence.Balance != nil && evidence.Balance.Cmp(new(big.Int).Add(before, minimumOutput)) >= 0 {
-				goto confirmed
-			}
-			if evidence.Source == "across_status" && evidence.Identity != "" {
-				continue
-			}
-		case waitErr := <-errorChannel:
-			_ = store.Mark(ctx, operationID, "outcome_unknown", waitErr)
-			return fmt.Errorf("await destination: %w", waitErr)
-		case statusErr := <-statusErrorChannel:
-			fmt.Fprintf(
-				output,
-				"tracking_warning source=across_status error=%q action=websocket_remains_primary\n",
-				statusErr,
-			)
-		case <-waitCtx.Done():
-			_ = store.Mark(ctx, operationID, "outcome_unknown", waitCtx.Err())
-			return fmt.Errorf("destination outcome is unknown: %w", waitCtx.Err())
-		}
+	evidence, err := AwaitDestinationConfirmation(
+		waitCtx, output, watcher, client, sourceIdentity, targetBalance,
+	)
+	if err != nil {
+		_ = store.Mark(ctx, operationID, "outcome_unknown", err)
+		return fmt.Errorf("destination outcome is unknown: %w", err)
 	}
-
-confirmed:
 	if evidence.Identity == "" {
 		statusCtx, statusCancel := context.WithTimeout(ctx, 10*time.Second)
 		evidence.Identity = awaitAcrossIdentity(statusCtx, client, sourceIdentity)
@@ -784,7 +785,7 @@ func openDestinationWatcher(
 	config configuration.ParsedConfig,
 	selected direction,
 	endpoints map[string]string,
-) (destinationWatcher, *big.Int, string, error) {
+) (DestinationWatcher, *big.Int, string, error) {
 	if selected == evmToSolana {
 		privateText, err := requiredEnv("SOLANA_PRIVATE_KEY")
 		if err != nil {
@@ -830,7 +831,14 @@ func openDestinationWatcher(
 			network.Close()
 			return nil, nil, "", err
 		}
-		return &solanaDestinationWatcher{network: network, subscription: subscription}, before, "solana", nil
+		watcher := &solanaDestinationWatcher{
+			network: network, subscription: subscription, account: ata.String(),
+			balances: make(chan *big.Int, 16),
+			errors:   make(chan error, 1),
+			done:     make(chan struct{}),
+		}
+		go watcher.run()
+		return watcher, before, "solana", nil
 	}
 	privateText, err := requiredEnv("POLYGON_PRIVATE_KEY")
 	if err != nil {
@@ -878,36 +886,77 @@ func openDestinationWatcher(
 		wsClient.Close()
 		return nil, nil, "", err
 	}
-	return &evmDestinationWatcher{
+	watcher := &evmDestinationWatcher{
 		http: httpClient, websocket: wsClient, subscription: subscription,
 		logs: logs, token: token, recipient: recipient,
-	}, before, "polygon", nil
+		events: make(chan types.Log, 16),
+		errors: make(chan error, 1),
+		done:   make(chan struct{}),
+	}
+	go watcher.run()
+	return watcher, before, "polygon", nil
 }
 
 type solanaDestinationWatcher struct {
 	network      *solana.ReadOnlyNetwork
 	subscription solana.AccountSubscription
+	account      string
+	balances     chan *big.Int
+	errors       chan error
+	done         chan struct{}
+	closeOnce    sync.Once
 }
 
-func (w *solanaDestinationWatcher) Await(ctx context.Context, target *big.Int) (destinationEvidence, error) {
+func (w *solanaDestinationWatcher) Await(ctx context.Context, target *big.Int) (DestinationEvidence, error) {
 	for {
 		select {
-		case notification := <-w.subscription.Notifications():
-			amount, err := splTokenAmount(notification.Value.Data)
-			if err == nil && amount.Cmp(target) >= 0 {
-				return destinationEvidence{Balance: amount, Source: "solana_account_websocket"}, nil
+		case amount := <-w.balances:
+			if amount != nil && amount.Cmp(target) >= 0 {
+				return DestinationEvidence{Balance: amount, Source: "solana_account_websocket"}, nil
 			}
-		case err := <-w.subscription.Err():
-			return destinationEvidence{}, err
+		case err := <-w.errors:
+			return DestinationEvidence{}, err
 		case <-ctx.Done():
-			return destinationEvidence{}, ctx.Err()
+			return DestinationEvidence{}, ctx.Err()
 		}
 	}
 }
 
 func (w *solanaDestinationWatcher) Close() {
-	w.subscription.Unsubscribe()
-	w.network.Close()
+	w.closeOnce.Do(func() {
+		close(w.done)
+		w.subscription.Unsubscribe()
+		w.network.Close()
+	})
+}
+
+func (w *solanaDestinationWatcher) Balance(ctx context.Context) (*big.Int, error) {
+	account, err := w.network.ReadAccount(ctx, w.account)
+	if err != nil {
+		return nil, err
+	}
+	return splTokenAmount(account.Data)
+}
+
+func (w *solanaDestinationWatcher) run() {
+	for {
+		select {
+		case notification := <-w.subscription.Notifications():
+			amount, err := splTokenAmount(notification.Value.Data)
+			if err != nil {
+				pushLatestError(w.errors, err)
+				continue
+			}
+			pushLatestBalance(w.balances, amount)
+		case err := <-w.subscription.Err():
+			if err != nil {
+				pushLatestError(w.errors, err)
+			}
+			return
+		case <-w.done:
+			return
+		}
+	}
 }
 
 type evmDestinationWatcher struct {
@@ -917,28 +966,95 @@ type evmDestinationWatcher struct {
 	logs         chan types.Log
 	token        common.Address
 	recipient    common.Address
+	events       chan types.Log
+	errors       chan error
+	done         chan struct{}
+	closeOnce    sync.Once
 }
 
-func (w *evmDestinationWatcher) Await(ctx context.Context, target *big.Int) (destinationEvidence, error) {
+func (w *evmDestinationWatcher) Await(ctx context.Context, target *big.Int) (DestinationEvidence, error) {
 	for {
 		select {
-		case event := <-w.logs:
+		case event := <-w.events:
 			balance, err := erc20Balance(ctx, w.http, w.token, w.recipient)
 			if err == nil && balance.Cmp(target) >= 0 {
-				return destinationEvidence{Identity: event.TxHash.Hex(), Balance: balance, Source: "evm_transfer_websocket"}, nil
+				return DestinationEvidence{Identity: event.TxHash.Hex(), Balance: balance, Source: "evm_transfer_websocket"}, nil
 			}
-		case err := <-w.subscription.Err():
-			return destinationEvidence{}, err
+		case err := <-w.errors:
+			return DestinationEvidence{}, err
 		case <-ctx.Done():
-			return destinationEvidence{}, ctx.Err()
+			return DestinationEvidence{}, ctx.Err()
 		}
 	}
 }
 
 func (w *evmDestinationWatcher) Close() {
-	w.subscription.Unsubscribe()
-	w.http.Close()
-	w.websocket.Close()
+	w.closeOnce.Do(func() {
+		close(w.done)
+		w.subscription.Unsubscribe()
+		w.http.Close()
+		w.websocket.Close()
+	})
+}
+
+func (w *evmDestinationWatcher) Balance(ctx context.Context) (*big.Int, error) {
+	return erc20Balance(ctx, w.http, w.token, w.recipient)
+}
+
+func (w *evmDestinationWatcher) run() {
+	for {
+		select {
+		case event := <-w.logs:
+			pushLatestLog(w.events, event)
+		case err := <-w.subscription.Err():
+			if err != nil {
+				pushLatestError(w.errors, err)
+			}
+			return
+		case <-w.done:
+			return
+		}
+	}
+}
+
+func pushLatestBalance(output chan *big.Int, value *big.Int) {
+	copy := new(big.Int).Set(value)
+	select {
+	case output <- copy:
+		return
+	default:
+	}
+	select {
+	case <-output:
+	default:
+	}
+	select {
+	case output <- copy:
+	default:
+	}
+}
+
+func pushLatestLog(output chan types.Log, value types.Log) {
+	select {
+	case output <- value:
+		return
+	default:
+	}
+	select {
+	case <-output:
+	default:
+	}
+	select {
+	case output <- value:
+	default:
+	}
+}
+
+func pushLatestError(output chan error, err error) {
+	select {
+	case output <- err:
+	default:
+	}
 }
 
 func erc20Balance(ctx context.Context, client *ethclient.Client, token, owner common.Address) (*big.Int, error) {
@@ -957,11 +1073,152 @@ func splTokenAmount(data []byte) (*big.Int, error) {
 	return new(big.Int).SetUint64(binary.LittleEndian.Uint64(data[64:72])), nil
 }
 
-func pollAcrossStatus(
+func AwaitDestinationConfirmation(
 	ctx context.Context,
-	client *across.Client,
+	output io.Writer,
+	watcher DestinationWatcher,
+	client interface {
+		DepositStatus(context.Context, string) (across.Status, error)
+	},
 	source string,
-	output chan<- destinationEvidence,
+	target *big.Int,
+) (DestinationEvidence, error) {
+	if watcher == nil || client == nil || strings.TrimSpace(source) == "" ||
+		target == nil || target.Sign() <= 0 {
+		return DestinationEvidence{}, fmt.Errorf(
+			"destination confirmation input is incomplete",
+		)
+	}
+	evidenceChannel := make(chan DestinationEvidence, 4)
+	watcherErrors := make(chan error, 1)
+	statusErrors := make(chan error, 1)
+	balanceErrors := make(chan error, 1)
+	go func() {
+		evidence, err := watcher.Await(ctx, target)
+		if err != nil {
+			watcherErrors <- err
+			return
+		}
+		evidenceChannel <- evidence
+	}()
+	go pollAcrossStatusReader(
+		ctx, client, source, evidenceChannel, statusErrors,
+	)
+	go pollDestinationBalance(
+		ctx, watcher, target, evidenceChannel, balanceErrors,
+	)
+
+	fillIdentity := ""
+	var balanceEvidence *DestinationEvidence
+	for {
+		select {
+		case evidence := <-evidenceChannel:
+			switch evidence.Source {
+			case "across_status":
+				fillIdentity = evidence.Identity
+				current, err := watcher.Balance(ctx)
+				if err != nil {
+					nonBlockingError(balanceErrors, err)
+					continue
+				}
+				if current.Cmp(target) >= 0 {
+					return DestinationEvidence{
+						Identity: fillIdentity,
+						Balance:  current,
+						Source:   "across_status+destination_balance",
+					}, nil
+				}
+			case "destination_balance_poll":
+				if evidence.Balance != nil && evidence.Balance.Cmp(target) >= 0 {
+					copy := evidence
+					balanceEvidence = &copy
+				}
+				if balanceEvidence != nil && fillIdentity != "" {
+					balanceEvidence.Identity = fillIdentity
+					balanceEvidence.Source =
+						"destination_balance_poll+across_status"
+					return *balanceEvidence, nil
+				}
+			default:
+				if evidence.Balance != nil && evidence.Balance.Cmp(target) >= 0 {
+					return evidence, nil
+				}
+			}
+		case err := <-watcherErrors:
+			fmt.Fprintf(
+				output,
+				"tracking_warning source=destination_websocket error=%q action=balance_and_across_fallback_remain_active\n",
+				err,
+			)
+			watcherErrors = nil
+		case err := <-statusErrors:
+			fmt.Fprintf(
+				output,
+				"tracking_warning source=across_status error=%q action=websocket_and_balance_fallback_remain_active\n",
+				err,
+			)
+		case err := <-balanceErrors:
+			fmt.Fprintf(
+				output,
+				"tracking_warning source=destination_balance error=%q action=websocket_and_across_fallback_remain_active\n",
+				err,
+			)
+		case <-ctx.Done():
+			return DestinationEvidence{}, ctx.Err()
+		}
+	}
+}
+
+func pollDestinationBalance(
+	ctx context.Context,
+	watcher DestinationWatcher,
+	target *big.Int,
+	output chan<- DestinationEvidence,
+	errors chan<- error,
+) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	lastError := ""
+	for {
+		balance, err := watcher.Balance(ctx)
+		if err == nil {
+			lastError = ""
+			if balance.Cmp(target) >= 0 {
+				select {
+				case output <- DestinationEvidence{
+					Balance: balance,
+					Source:  "destination_balance_poll",
+				}:
+				case <-ctx.Done():
+				}
+				return
+			}
+		} else if err.Error() != lastError {
+			lastError = err.Error()
+			nonBlockingError(errors, err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func nonBlockingError(output chan<- error, err error) {
+	select {
+	case output <- err:
+	default:
+	}
+}
+
+func pollAcrossStatusReader(
+	ctx context.Context,
+	client interface {
+		DepositStatus(context.Context, string) (across.Status, error)
+	},
+	source string,
+	output chan<- DestinationEvidence,
 	errors chan<- error,
 ) {
 	ticker := time.NewTicker(2 * time.Second)
@@ -971,14 +1228,14 @@ func pollAcrossStatus(
 		status, err := client.DepositStatus(ctx, source)
 		if err != nil && !isAcrossDepositAwaitingIndex(err) && err.Error() != lastError {
 			lastError = err.Error()
-			select {
-			case errors <- err:
-			default:
-			}
+			nonBlockingError(errors, err)
 		}
 		if err == nil && status.State == across.DepositFilled {
 			select {
-			case output <- destinationEvidence{Identity: status.FillTransaction, Source: "across_status"}:
+			case output <- DestinationEvidence{
+				Identity: status.FillTransaction,
+				Source:   "across_status",
+			}:
 			case <-ctx.Done():
 			}
 			return

@@ -326,6 +326,10 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
+	if err := quoteBridge.Warm(ctx); err != nil {
+		return nil, fmt.Errorf("warm Across destination trackers: %w", err)
+	}
+	cleanup = append(cleanup, quoteBridge.Close)
 	baseBridge, err := nttmanualcanary.NewLiveService(
 		nttmanualcanary.LiveServiceConfig{
 			ProfilePath: filepath.Join(
