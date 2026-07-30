@@ -144,3 +144,88 @@ func TestBuildSourceExposesRateLimitWithoutFallback(t *testing.T) {
 		t.Fatalf("error = %#v", err)
 	}
 }
+
+func TestBuildSourceAppliesExplicitZeroSlippageAndChecksThreshold(t *testing.T) {
+	threshold := "14550"
+	var receivedSlippage string
+	server := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, request *http.Request) {
+			receivedSlippage = request.URL.Query().Get("slippageBps")
+			blockhash := make([]byte, 32)
+			for index := range blockhash {
+				blockhash[index] = byte(index + 1)
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{
+				"inputMint": "quote-mint", "outputMint": "base-mint",
+				"inAmount": "1000000", "outAmount": "14550",
+				"otherAmountThreshold": threshold,
+				"swapInstruction": map[string]any{
+					"programId": "11111111111111111111111111111111",
+					"accounts":  []any{},
+					"data":      "",
+				},
+				"blockhashWithMetadata": map[string]any{
+					"blockhash":            blockhash,
+					"lastValidBlockHeight": 500,
+				},
+			})
+		},
+	))
+	defer server.Close()
+	now := time.Now().UTC()
+	source, err := jupiter.NewBuildSource(jupiter.BuildConfig{
+		ID: "jupiter-build", BaseURL: server.URL,
+		Taker: "wallet", APIKeys: []string{"key"},
+		TokenMints: map[market.TokenID]string{
+			"quote": "quote-mint",
+			"base":  "base-mint",
+		},
+		SlippageBPS: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := market.NewTokenAmount("quote", big.NewInt(1_000_000))
+	output, _ := market.NewTokenAmount("base", big.NewInt(14_550))
+	discovery, _ := market.NewQuote(market.Quote{
+		Source: "quote", Market: "market", SnapshotVersion: 1,
+		Purpose:  market.QuotePurposeLiveDiscovery,
+		Mode:     market.QuoteModeExactInput,
+		Quality:  market.QuoteQualityExact,
+		AmountIn: input, AmountOut: output, QuotedAt: now,
+	})
+	request := executionport.ValidationRequest{
+		Leg: execution.Leg{
+			ID: "buy", Side: execution.LegBuy,
+			Chain: "solana", Account: "wallet", Market: "market",
+			Input: input, ExpectedOutput: output,
+		},
+		Discovery: discovery,
+		Slippage: &executionport.SlippageConstraint{
+			BPS:           0,
+			MinimumOutput: output,
+			Reason:        "dynamic_buy_budget",
+		},
+		RequestedAt: now,
+	}
+	artifact, err := source.Validate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receivedSlippage != "0" ||
+		artifact.Metadata["slippage_bps"] != "0" ||
+		artifact.Metadata["required_minimum_output_units"] != "14550" {
+		t.Fatalf(
+			"dynamic slippage was not preserved: query=%q metadata=%+v",
+			receivedSlippage,
+			artifact.Metadata,
+		)
+	}
+
+	threshold = "14549"
+	_, err = source.Validate(context.Background(), request)
+	var thresholdErr *executionport.SlippageThresholdError
+	if !errors.As(err, &thresholdErr) {
+		t.Fatalf("error = %v; want slippage threshold error", err)
+	}
+}

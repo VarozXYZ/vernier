@@ -166,10 +166,11 @@ type compactingValidator struct {
 }
 
 type fixedOutputValidator struct {
-	now    time.Time
-	output *big.Int
-	calls  int
-	inputs []market.TokenAmount
+	now       time.Time
+	output    *big.Int
+	calls     int
+	inputs    []market.TokenAmount
+	slippages []*executionport.SlippageConstraint
 }
 
 type recordingSellPreflight struct {
@@ -287,6 +288,7 @@ func (v *fixedOutputValidator) Validate(
 ) (executionport.Artifact, error) {
 	v.calls++
 	v.inputs = append(v.inputs, request.Leg.Input)
+	v.slippages = append(v.slippages, request.Slippage)
 	output, _ := market.NewTokenAmount(
 		request.Leg.ExpectedOutput.Token(),
 		v.output,
@@ -630,6 +632,188 @@ func TestSwapDriverPreflightsBothTransactionsAndReusesSimulatedBuy(t *testing.T)
 	}
 }
 
+func TestSwapDriverAppliesDynamicBuyBudgetWithoutExtraQuote(t *testing.T) {
+	now := time.Now().UTC()
+	plan := dynamicPreflightPlan(t, now, "752", "1")
+	buyValidator := &fixedOutputValidator{
+		now: now, output: big.NewInt(3_000_000_000),
+	}
+	sellValidator := &fixedOutputValidator{
+		now: now, output: big.NewInt(752_000_000),
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account", Validator: buyValidator,
+				TxManager: &settledTxManager{},
+			},
+			"market-b": {
+				Account: "account", Validator: sellValidator,
+				TxManager: &settledTxManager{},
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9,
+			"base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8,
+		QuoteAsset:      "quote",
+		MinimumNet:      big.NewRat(1, 2),
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{
+			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+		},
+		Clock: func() time.Time { return now },
+	}
+	if err := driver.Preflight(
+		context.Background(),
+		"operation",
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(buyValidator.slippages) != 1 ||
+		buyValidator.slippages[0] == nil ||
+		buyValidator.slippages[0].BPS != 6 ||
+		buyValidator.slippages[0].MinimumOutput.String() !=
+			"2998005320" {
+		t.Fatalf(
+			"unexpected buy slippage: %+v",
+			buyValidator.slippages,
+		)
+	}
+	if len(sellValidator.slippages) != 1 ||
+		sellValidator.slippages[0] != nil {
+		t.Fatalf(
+			"preflight sell unexpectedly used dynamic slippage: %+v",
+			sellValidator.slippages,
+		)
+	}
+}
+
+func TestSwapDriverCapsDynamicBuySlippage(t *testing.T) {
+	now := time.Now().UTC()
+	plan := dynamicPreflightPlan(t, now, "800", "0")
+	buyValidator := &fixedOutputValidator{
+		now: now, output: big.NewInt(3_000_000_000),
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account", Validator: buyValidator,
+				TxManager: &settledTxManager{},
+			},
+			"market-b": {
+				Account: "account",
+				Validator: &fixedOutputValidator{
+					now: now, output: big.NewInt(800_000_000),
+				},
+				TxManager: &settledTxManager{},
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9,
+			"base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8,
+		QuoteAsset:      "quote",
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{
+			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+		},
+		Clock: func() time.Time { return now },
+	}
+	if err := driver.Preflight(
+		context.Background(),
+		"operation",
+		plan,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if buyValidator.slippages[0] == nil ||
+		buyValidator.slippages[0].BPS != 500 {
+		t.Fatalf(
+			"dynamic buy cap was not applied: %+v",
+			buyValidator.slippages,
+		)
+	}
+}
+
+func TestSwapDriverRecalculatesDynamicSellWithFixedFloor(t *testing.T) {
+	now := time.Now().UTC()
+	plan := dynamicPreflightPlan(t, now, "752", "0")
+	validator := &fixedOutputValidator{
+		now: now, output: big.NewInt(752_000_000),
+	}
+	zeroCost, _ := market.NewAssetQuantity("quote", new(big.Rat))
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-b": {
+				Account: "account", Validator: validator,
+				TxManager: &settledTxManager{},
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9,
+			"base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8,
+		QuoteAsset:      "quote",
+		MinimumNet:      big.NewRat(1, 2),
+		ExitCosts: fixedExitCostSource{
+			costs: map[execution.SequentialExitRoute]market.AssetQuantity{
+				execution.ExitSellAtDestination: zeroCost,
+			},
+		},
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{
+			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+		},
+		Clock: func() time.Time { return now },
+	}
+	bridged, _ := market.NewTokenAmount(
+		"base-b",
+		big.NewInt(3_000_000_000_000_000_000),
+	)
+	if _, err := driver.SelectExit(
+		context.Background(),
+		"operation",
+		plan,
+		bridged,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(validator.slippages) != 1 ||
+		validator.slippages[0] == nil ||
+		validator.slippages[0].BPS != 19 {
+		t.Fatalf(
+			"unexpected dynamic sell slippage: %+v",
+			validator.slippages,
+		)
+	}
+
+	oneCost, _ := market.NewAssetQuantity("quote", big.NewRat(1, 1))
+	driver.ExitCosts = fixedExitCostSource{
+		costs: map[execution.SequentialExitRoute]market.AssetQuantity{
+			execution.ExitSellAtDestination: oneCost,
+		},
+	}
+	if _, err := driver.SelectExit(
+		context.Background(),
+		"operation-floor",
+		plan,
+		bridged,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if validator.slippages[1] == nil ||
+		validator.slippages[1].BPS != 10 {
+		t.Fatalf(
+			"fixed sell floor was not applied: %+v",
+			validator.slippages,
+		)
+	}
+}
+
 func TestSwapDriverRejectsDeterioratedRoundTripBeforeFirstBroadcast(t *testing.T) {
 	now := time.Now().UTC()
 	plan := preflightPlan(t, now)
@@ -804,6 +988,9 @@ func TestSwapDriverRecoveryComparesReturnEvenWhenDestinationRemainsQualified(t *
 	plan := preflightPlan(t, now)
 	destinationManager := &settledTxManager{}
 	returnEstimator := &fixedQuoteEstimator{output: big.NewInt(1_100_000)}
+	destinationValidator := &fixedOutputValidator{
+		now: now, output: big.NewInt(1_080_000),
+	}
 	cost, _ := market.NewAssetQuantity("quote", big.NewRat(1, 100))
 	driver := &livecanary.SwapDriver{
 		Bindings: map[market.MarketID]livecanary.SwapBinding{
@@ -816,10 +1003,8 @@ func TestSwapDriverRecoveryComparesReturnEvenWhenDestinationRemainsQualified(t *
 				TxManager: &settledTxManager{},
 			},
 			"market-b": {
-				Account: "account",
-				Validator: &fixedOutputValidator{
-					now: now, output: big.NewInt(1_080_000),
-				},
+				Account:   "account",
+				Validator: destinationValidator,
 				TxManager: destinationManager,
 			},
 		},
@@ -835,6 +1020,9 @@ func TestSwapDriverRecoveryComparesReturnEvenWhenDestinationRemainsQualified(t *
 				execution.ExitSellAtDestination: cost,
 				execution.ExitReturnToOrigin:    cost,
 			},
+		},
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{
+			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
 		},
 		Clock: func() time.Time { return now },
 	}
@@ -859,6 +1047,13 @@ func TestSwapDriverRecoveryComparesReturnEvenWhenDestinationRemainsQualified(t *
 			"automatic_recovery_comparison",
 		) {
 		t.Fatalf("unexpected recovery decision: %+v", decision)
+	}
+	if len(destinationValidator.slippages) != 1 ||
+		destinationValidator.slippages[0] != nil {
+		t.Fatalf(
+			"recovery unexpectedly used dynamic slippage: %+v",
+			destinationValidator.slippages,
+		)
 	}
 }
 
@@ -1245,6 +1440,51 @@ func preflightPlan(
 		"plan",
 		opportunity,
 		initial,
+		"chain-a",
+		"chain-b",
+		now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func dynamicPreflightPlan(
+	t *testing.T,
+	now time.Time,
+	sellOutput string,
+	cost string,
+) execution.SequentialPlan {
+	t.Helper()
+	original := preflightPlan(t, now)
+	opportunity := original.Opportunity
+	opportunity.Candidates = append(
+		[]arbitrage.Candidate(nil),
+		opportunity.Candidates...,
+	)
+	candidate := opportunity.Candidates[opportunity.SelectedIndex]
+	sellUnits, ok := new(big.Int).SetString(sellOutput, 10)
+	if !ok {
+		t.Fatalf("invalid sell output %q", sellOutput)
+	}
+	sellUnits.Mul(sellUnits, big.NewInt(1_000_000))
+	candidate.SellQuote.AmountOut, _ = market.NewTokenAmount(
+		"quote-b",
+		sellUnits,
+	)
+	costQuantity, err := market.ParseAssetQuantity("quote", cost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Cost = arbitrage.CostSnapshot{
+		ID: "cost", Amount: costQuantity, CapturedAt: now,
+	}
+	opportunity.Candidates[opportunity.SelectedIndex] = candidate
+	plan, err := execution.NewSequentialPlan(
+		"dynamic-plan",
+		opportunity,
+		candidate.BuyQuote.AmountIn,
 		"chain-a",
 		"chain-b",
 		now,

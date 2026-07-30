@@ -179,11 +179,15 @@ func (s *BuildSource) validate(
 		return executionport.Artifact{}, fmt.Errorf("jupiter build token mint mapping is missing")
 	}
 	query := url.Values{}
+	slippageBPS := s.slippageBPS
+	if request.Slippage != nil {
+		slippageBPS = request.Slippage.BPS
+	}
 	query.Set("inputMint", inputMint)
 	query.Set("outputMint", outputMint)
 	query.Set("amount", discovery.AmountIn.String())
 	query.Set("taker", s.taker)
-	query.Set("slippageBps", strconv.FormatUint(uint64(s.slippageBPS), 10))
+	query.Set("slippageBps", strconv.FormatUint(uint64(slippageBPS), 10))
 	query.Set("maxAccounts", strconv.FormatUint(uint64(maxAccounts), 10))
 	query.Set("blockhashSlotsToExpiry", strconv.FormatUint(uint64(s.blockhashSlots), 10))
 	if s.payer != "" {
@@ -237,6 +241,37 @@ func (s *BuildSource) validate(
 	if err != nil {
 		return executionport.Artifact{}, err
 	}
+	thresholdUnits, ok := new(big.Int).SetString(
+		payload.OtherAmountThreshold,
+		10,
+	)
+	if !ok || thresholdUnits.Sign() < 0 {
+		if request.Slippage != nil {
+			return executionport.Artifact{}, fmt.Errorf(
+				"jupiter build response has invalid output threshold",
+			)
+		}
+		thresholdUnits = slippageOutputFloor(outputUnits, slippageBPS)
+	}
+	if request.Slippage != nil {
+		minimum := request.Slippage.MinimumOutput
+		if minimum.Token() != output.Token() ||
+			thresholdUnits.Cmp(minimum.Units()) < 0 {
+			actual, amountErr := market.NewTokenAmount(
+				output.Token(),
+				thresholdUnits,
+			)
+			if amountErr != nil {
+				return executionport.Artifact{}, amountErr
+			}
+			return executionport.Artifact{},
+				&executionport.SlippageThresholdError{
+					Provider: "jupiter",
+					Actual:   actual,
+					Required: minimum,
+				}
+		}
+	}
 	position := discovery.SourcePosition
 	if payload.ContextSlot > 0 {
 		position = market.SourcePosition{Kind: ContextSlotPositionKind, Value: payload.ContextSlot}
@@ -256,15 +291,39 @@ func (s *BuildSource) validate(
 	if blockhash == "" || payload.BlockhashWithMetadata.LastValidBlockHeight == 0 {
 		return executionport.Artifact{}, fmt.Errorf("jupiter build response has no blockhash metadata")
 	}
+	metadata := map[string]string{
+		"kind":                 "jupiter_build_v2",
+		"max_accounts":         strconv.FormatUint(uint64(maxAccounts), 10),
+		"slippage_bps":         strconv.FormatUint(uint64(slippageBPS), 10),
+		"minimum_output_units": thresholdUnits.String(),
+	}
+	if request.Slippage != nil {
+		metadata["slippage_reason"] = request.Slippage.Reason
+		metadata["required_minimum_output_units"] =
+			request.Slippage.MinimumOutput.String()
+		for key, value := range request.Slippage.Evidence {
+			metadata["slippage_"+key] = value
+		}
+	}
 	return executionport.Artifact{
 		Leg: request.Leg, ValidatedQuote: validated, Payload: append([]byte(nil), body...),
-		Metadata: map[string]string{
-			"kind":         "jupiter_build_v2",
-			"max_accounts": strconv.FormatUint(uint64(maxAccounts), 10),
-		},
-		BuiltAt: s.clock().UTC(), Blockhash: blockhash,
+		Metadata: metadata,
+		BuiltAt:  s.clock().UTC(), Blockhash: blockhash,
 		LastValidBlockHeight: payload.BlockhashWithMetadata.LastValidBlockHeight,
 	}, nil
+}
+
+func slippageOutputFloor(amount *big.Int, bps uint16) *big.Int {
+	if amount == nil || amount.Sign() <= 0 {
+		return new(big.Int)
+	}
+	return new(big.Int).Quo(
+		new(big.Int).Mul(
+			new(big.Int).Set(amount),
+			big.NewInt(int64(10_000-uint64(bps))),
+		),
+		big.NewInt(10_000),
+	)
 }
 
 func nextCompactAccountLimit(current uint16) uint16 {

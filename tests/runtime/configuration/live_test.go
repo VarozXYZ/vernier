@@ -61,6 +61,13 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 		config.EVMGas.CostMode != "estimated" {
 		t.Fatalf("unexpected default EVM gas policy: %+v", config.EVMGas)
 	}
+	if config.DynamicSlippage.Enabled ||
+		config.DynamicSlippage.MaxBPS != 0 {
+		t.Fatalf(
+			"dynamic slippage should be disabled by default: %+v",
+			config.DynamicSlippage,
+		)
+	}
 	if config.Accounts["chain_a"].SellPreflightAddressEnv !=
 		"CHAIN_A_PREFLIGHT_ADDRESS" {
 		t.Fatalf("Solana sell preflight address was not resolved: %+v", config.Accounts)
@@ -71,6 +78,40 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 		evmOverride.BalanceSlot != 3 ||
 		evmOverride.AllowanceSlot != 4 {
 		t.Fatalf("EVM sell preflight state override was not resolved: %+v", config.Accounts)
+	}
+}
+
+func TestLoadLiveConfigResolvesDynamicSlippageDefaults(t *testing.T) {
+	manifest := writeSequentialLiveConfig(t, "750")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withDynamic := strings.Replace(
+		string(data),
+		"    operational_store:",
+		"    dynamic_slippage: {enabled: true}\n"+
+			"    operational_store:",
+		1,
+	)
+	if err := os.WriteFile(
+		policyPath,
+		[]byte(withDynamic),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	config, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.DynamicSlippage.Enabled ||
+		config.DynamicSlippage.MaxBPS != 500 {
+		t.Fatalf(
+			"unexpected dynamic slippage policy: %+v",
+			config.DynamicSlippage,
+		)
 	}
 }
 

@@ -235,10 +235,16 @@ type LiveConfig struct {
 	BuildToBroadcastTimeoutMS     int                          `yaml:"build_to_broadcast_timeout_ms"`
 	EVMDeadlineSeconds            int                          `yaml:"evm_deadline_seconds"`
 	EVMGas                        EVMGasConfig                 `yaml:"evm_gas"`
+	DynamicSlippage               DynamicSlippageConfig        `yaml:"dynamic_slippage"`
 	OperationalStore              OperationalStoreConfig       `yaml:"operational_store"`
 	Accounts                      map[string]LiveAccountConfig `yaml:"accounts"`
 	Inventory                     []InventoryBalanceConfig     `yaml:"inventory"`
 	GasRefuel                     GasRefuelConfig              `yaml:"gas_refuel"`
+}
+
+type DynamicSlippageConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	MaxBPS  uint16 `yaml:"max_bps"`
 }
 
 type EVMGasConfig struct {
@@ -487,11 +493,17 @@ type ParsedLiveConfig struct {
 	BuildToBroadcastTimeout       time.Duration
 	EVMDeadline                   time.Duration
 	EVMGas                        ResolvedEVMGasPolicy
+	DynamicSlippage               ResolvedDynamicSlippage
 	OperationalStorePath          string
 	SQLiteSynchronous             string
 	Accounts                      map[string]ResolvedLiveAccount
 	Inventory                     []ResolvedInventoryBalance
 	GasRefuel                     ResolvedGasRefuel
+}
+
+type ResolvedDynamicSlippage struct {
+	Enabled bool
+	MaxBPS  uint16
 }
 
 type ResolvedEVMGasPolicy struct {
@@ -1009,6 +1021,18 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 			return ParsedLiveConfig{}, err
 		}
 	}
+	dynamicSlippage := ResolvedDynamicSlippage{
+		Enabled: config.DynamicSlippage.Enabled,
+		MaxBPS:  config.DynamicSlippage.MaxBPS,
+	}
+	if dynamicSlippage.Enabled && dynamicSlippage.MaxBPS == 0 {
+		dynamicSlippage.MaxBPS = 500
+	}
+	if dynamicSlippage.MaxBPS > 2_000 {
+		return ParsedLiveConfig{}, fmt.Errorf(
+			"live dynamic slippage max_bps must be <= 2000",
+		)
+	}
 	if hasSolana {
 		tip, ok := new(big.Int).SetString(config.TipLamports, 10)
 		if !ok || tip.Sign() <= 0 {
@@ -1301,6 +1325,7 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		BuildToBroadcastTimeout: time.Duration(config.BuildToBroadcastTimeoutMS) * time.Millisecond,
 		EVMDeadline:             time.Duration(config.EVMDeadlineSeconds) * time.Second,
 		EVMGas:                  evmGas,
+		DynamicSlippage:         dynamicSlippage,
 		OperationalStorePath:    config.OperationalStore.Path, SQLiteSynchronous: synchronous,
 		Accounts: accounts, Inventory: inventoryBalances,
 		GasRefuel: refuel,

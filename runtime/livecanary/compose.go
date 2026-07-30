@@ -459,9 +459,14 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		MinimumNet:      config.Live.MinimumNet,
 		ReturnMargin:    config.Live.ReturnBridgeSafetyMargin,
 		ExitCosts:       flowCosts,
-		FallbackAfter:   config.Live.ConfirmationTimeout,
-		ArtifactMaxAge:  config.Live.BuildToBroadcastTimeout,
-		Output:          config.Output, Costs: costValuator,
+		DynamicSlippage: DynamicSlippagePolicy{
+			Enabled:      config.Live.DynamicSlippage.Enabled,
+			MaxBPS:       config.Live.DynamicSlippage.MaxBPS,
+			FixedSellBPS: config.Live.SlippageBPS,
+		},
+		FallbackAfter:  config.Live.ConfirmationTimeout,
+		ArtifactMaxAge: config.Live.BuildToBroadcastTimeout,
+		Output:         config.Output, Costs: costValuator,
 	}
 	drivers := executionport.DriverSet{
 		Buy: swapDriver,
