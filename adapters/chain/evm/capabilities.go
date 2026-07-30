@@ -17,12 +17,17 @@ type BlockReference struct {
 
 type LogFilter struct {
 	Address       common.Address
+	Addresses     []common.Address
 	Topics        []common.Hash
 	IndexedTopics [][]common.Hash
 }
 
 func (f LogFilter) Query(blockHash *common.Hash) geth.FilterQuery {
-	query := geth.FilterQuery{Addresses: []common.Address{f.Address}}
+	addresses := append([]common.Address(nil), f.Addresses...)
+	if len(addresses) == 0 && f.Address != (common.Address{}) {
+		addresses = []common.Address{f.Address}
+	}
+	query := geth.FilterQuery{Addresses: addresses}
 	if len(f.Topics) > 0 {
 		query.Topics = [][]common.Hash{append([]common.Hash(nil), f.Topics...)}
 	}

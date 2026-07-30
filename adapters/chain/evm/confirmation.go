@@ -51,8 +51,8 @@ func NewConfirmationSource(config ConfirmationSourceConfig) (*ConfirmationSource
 		return nil, fmt.Errorf("EVM confirmation source requires network, decoder, and clock")
 	}
 	filter := config.Decoder.Filter()
-	if filter.Address == ([20]byte{}) || len(filter.Topics) == 0 {
-		return nil, fmt.Errorf("EVM settlement event filter requires contract address and topic")
+	if len(filter.Query(nil).Addresses) == 0 || len(filter.Topics) == 0 {
+		return nil, fmt.Errorf("EVM settlement event filter requires addresses and topic")
 	}
 	return &ConfirmationSource{
 		config:  config,
