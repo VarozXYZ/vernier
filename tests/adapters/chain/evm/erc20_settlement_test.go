@@ -45,12 +45,12 @@ func TestERC20TransferReceiptDecoderUsesNetWalletDeltas(t *testing.T) {
 	output, _ := market.NewTokenAmount("output", big.NewInt(4_000_000))
 	step := execution.OperationStep{
 		Leg: execution.Leg{
-			ID: "swap", Side: execution.LegBuy, Chain: "polygon",
+			ID: "swap", Side: execution.LegBuy, Chain: "chain-a",
 			Account: "wallet", Market: "market", Input: input,
 			ExpectedOutput: output,
 		},
 		Identity: execution.TransactionIdentity{
-			Chain: "polygon", Account: "wallet", Hash: "0x01",
+			Chain: "chain-a", Account: "wallet", Hash: "0x01",
 		},
 	}
 	receipt := &types.Receipt{
@@ -98,12 +98,12 @@ func TestERC20TransferReceiptDecoderRetainsGasCostOnConfirmedRevert(t *testing.T
 	settlement, err := decoder.DecodeReceipt(
 		execution.OperationStep{
 			Leg: execution.Leg{
-				ID: "swap", Side: execution.LegSell, Chain: "polygon",
+				ID: "swap", Side: execution.LegSell, Chain: "chain-a",
 				Account: "wallet", Market: "market", Input: input,
 				ExpectedOutput: output,
 			},
 			Identity: execution.TransactionIdentity{
-				Chain: "polygon", Account: "wallet", Hash: "0x02",
+				Chain: "chain-a", Account: "wallet", Hash: "0x02",
 			},
 		},
 		&types.Receipt{
@@ -152,12 +152,12 @@ func TestERC20TransferReceiptDecoderUsesInboundLogAsInclusionEvidence(t *testing
 	output, _ := market.NewTokenAmount("output", big.NewInt(4_000_000))
 	step := execution.OperationStep{
 		Leg: execution.Leg{
-			ID: "swap", Side: execution.LegSell, Chain: "polygon",
+			ID: "swap", Side: execution.LegSell, Chain: "chain-a",
 			Account: "wallet", Market: "market",
 			Input: input, ExpectedOutput: output,
 		},
 		Identity: execution.TransactionIdentity{
-			Chain: "polygon", Account: "wallet",
+			Chain: "chain-a", Account: "wallet",
 			Hash: common.HexToHash("0x01").Hex(),
 		},
 	}
