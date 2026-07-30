@@ -31,6 +31,26 @@ func (d *BridgeDriver) ExecuteStage(
 	}
 	result, err := d.Provider.Transfer(ctx, request, journal)
 	if err != nil {
+		costs := executionport.ErrorCosts(err)
+		if len(costs) > 0 {
+			valued, valueErr := valueCosts(d.Costs, costs)
+			if valueErr != nil {
+				return execution.SequentialStageSettlement{},
+					executionport.NewStageError(
+						executionport.DispositionPossible,
+						fmt.Errorf(
+							"value interrupted bridge costs: %w",
+							valueErr,
+						),
+					)
+			}
+			return execution.SequentialStageSettlement{},
+				executionport.NewStageErrorWithCosts(
+					executionport.ErrorDisposition(err),
+					valued,
+					err,
+				)
+		}
 		return execution.SequentialStageSettlement{}, err
 	}
 	valuedCosts, err := valueCosts(d.Costs, result.Costs)

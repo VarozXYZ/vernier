@@ -310,6 +310,81 @@ func (s *NTTCanaryStore) Create(
 	return nil
 }
 
+// CreateOrReuseUnbroadcast creates an operation or reuses the same
+// deterministic identity only when no transaction has ever been prepared.
+// This makes readiness retries idempotent without weakening no-resend rules.
+func (s *NTTCanaryStore) CreateOrReuseUnbroadcast(
+	ctx context.Context,
+	operation NTTCanaryOperation,
+) error {
+	if operation.ID == "" || operation.Direction == "" ||
+		operation.AmountUnits == "" || operation.Stage == "" ||
+		operation.CreatedAt.IsZero() {
+		return fmt.Errorf("NTT canary operation is incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var direction, amount, stage, source string
+	err = tx.QueryRowContext(ctx, `SELECT direction, amount_units, stage, source_tx
+		FROM ntt_canary_operations WHERE operation_id=?`,
+		operation.ID,
+	).Scan(&direction, &amount, &stage, &source)
+	if errors.Is(err, sql.ErrNoRows) {
+		operation.UpdatedAt = operation.CreatedAt
+		if _, err := tx.ExecContext(ctx, `INSERT INTO ntt_canary_operations (
+			operation_id, direction, amount_units, stage, source_tx,
+			emitter_chain, emitter_address, sequence, vaa_fingerprint,
+			last_error, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			operation.ID, operation.Direction, operation.AmountUnits,
+			operation.Stage, operation.SourceTx, operation.EmitterChain,
+			operation.EmitterAddress, operation.Sequence,
+			operation.VAAFingerprint, operation.LastError,
+			formatCanaryTime(operation.CreatedAt),
+			formatCanaryTime(operation.UpdatedAt),
+		); err != nil {
+			return fmt.Errorf("create NTT canary operation: %w", err)
+		}
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	if direction != operation.Direction ||
+		amount != operation.AmountUnits ||
+		source != operation.SourceTx ||
+		(stage != "created" && stage != "readiness_failed") {
+		return fmt.Errorf(
+			"NTT canary operation %s cannot be safely reused",
+			operation.ID,
+		)
+	}
+	var transactions int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM ntt_canary_transactions WHERE operation_id=?`,
+		operation.ID,
+	).Scan(&transactions); err != nil {
+		return err
+	}
+	if transactions != 0 {
+		return fmt.Errorf(
+			"NTT canary operation %s has durable transaction identities",
+			operation.ID,
+		)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE ntt_canary_operations
+		SET stage='created', last_error='', updated_at=?
+		WHERE operation_id=?`,
+		formatCanaryTime(operation.CreatedAt), operation.ID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *NTTCanaryStore) RecordPrepared(
 	ctx context.Context,
 	transaction NTTCanaryTransaction,

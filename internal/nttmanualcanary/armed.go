@@ -206,14 +206,6 @@ func executeArmed(
 	if storedAmount == "" {
 		storedAmount = "source-transaction-recovery"
 	}
-	now := time.Now().UTC()
-	if err := store.Create(ctx, sqlitestore.NTTCanaryOperation{
-		ID: operationID, Direction: string(route), AmountUnits: storedAmount,
-		Stage: "created", SourceTx: sourceTransaction,
-		CreatedAt: now,
-	}); err != nil {
-		return err
-	}
 	runtime := &armedRuntime{
 		config: config, solanaAdapter: solanaAdapter, evmAdapter: evmAdapter,
 		solanaKey: solanaKey, evmKey: evmKey,
@@ -231,10 +223,20 @@ func executeArmed(
 	)
 	readinessStarted := time.Now()
 	if err := runtime.validateNetworks(ctx); err != nil {
-		_ = store.Fail(ctx, operationID, "readiness_failed", err)
 		return err
 	}
 	readinessDuration := time.Since(readinessStarted)
+	now := time.Now().UTC()
+	if err := store.CreateOrReuseUnbroadcast(
+		ctx,
+		sqlitestore.NTTCanaryOperation{
+			ID: operationID, Direction: string(route), AmountUnits: storedAmount,
+			Stage: "created", SourceTx: sourceTransaction,
+			CreatedAt: now,
+		},
+	); err != nil {
+		return err
+	}
 
 	bridgeStarted := time.Now()
 	sourceStarted := time.Now()
@@ -387,10 +389,13 @@ func (r *armedRuntime) validateNetworks(ctx context.Context) error {
 		return fmt.Errorf("read Solana payer balance: %w", err)
 	}
 	if solanaBalance.Value < r.config.Solana.MinimumBalanceLamports {
-		return fmt.Errorf(
-			"solana payer has %d lamports; at least %d are required",
-			solanaBalance.Value,
-			r.config.Solana.MinimumBalanceLamports,
+		return executionport.NewRecoveryError(
+			executionport.RecoveryFailureInsufficientNative,
+			fmt.Errorf(
+				"solana payer has %d lamports; at least %d are required",
+				solanaBalance.Value,
+				r.config.Solana.MinimumBalanceLamports,
+			),
 		)
 	}
 	minimumEVM, ok := new(big.Int).SetString(
@@ -406,10 +411,13 @@ func (r *armedRuntime) validateNetworks(ctx context.Context) error {
 		return fmt.Errorf("read EVM sender balance: %w", err)
 	}
 	if evmBalance.Cmp(minimumEVM) < 0 {
-		return fmt.Errorf(
-			"EVM sender has %s wei; at least %s are required",
-			evmBalance,
-			minimumEVM,
+		return executionport.NewRecoveryError(
+			executionport.RecoveryFailureInsufficientNative,
+			fmt.Errorf(
+				"EVM sender has %s wei; at least %s are required",
+				evmBalance,
+				minimumEVM,
+			),
 		)
 	}
 	fmt.Fprintf(

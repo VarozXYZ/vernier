@@ -131,3 +131,52 @@ func TestNTTCanaryRejectsDuplicateTransactionIdentity(t *testing.T) {
 		t.Fatal("duplicate transaction identity was accepted")
 	}
 }
+
+func TestNTTCanaryReusesOnlyUnbroadcastReadinessFailure(t *testing.T) {
+	store, err := sqlitestore.OpenNTTCanary(
+		filepath.Join(t.TempDir(), "canary.sqlite"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	operation := sqlitestore.NTTCanaryOperation{
+		ID: "readiness-retry", Direction: "solana-to-evm",
+		AmountUnits: "1000", Stage: "created", CreatedAt: now,
+	}
+	if err := store.Create(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Fail(
+		ctx, operation.ID, "readiness_failed",
+		context.DeadlineExceeded,
+	); err != nil {
+		t.Fatal(err)
+	}
+	operation.CreatedAt = now.Add(time.Second)
+	if err := store.CreateOrReuseUnbroadcast(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	loaded, transactions, err := store.Load(ctx, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Stage != "created" || loaded.LastError != "" ||
+		len(transactions) != 0 {
+		t.Fatalf("unexpected reused operation: %#v %#v", loaded, transactions)
+	}
+	if err := store.RecordPrepared(ctx, sqlitestore.NTTCanaryTransaction{
+		OperationID: operation.ID, Ordinal: 1, Phase: "source_transfer",
+		Chain: "solana", Identity: "prepared-signature",
+		Status: "prepared", CreatedAt: now.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateOrReuseUnbroadcast(
+		ctx, operation,
+	); err == nil {
+		t.Fatal("operation with a durable identity was reused")
+	}
+}
