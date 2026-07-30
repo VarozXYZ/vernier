@@ -20,7 +20,7 @@ func TestNTTCanaryPersistsIdentityBeforeBroadcastState(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	operation := sqlitestore.NTTCanaryOperation{
-		ID: "synthetic-operation", Direction: "solana-to-evm",
+		ID: "synthetic-operation", Direction: "chain-a-to-chain-b",
 		AmountUnits: "1000", Stage: "created", CreatedAt: now,
 	}
 	if err := store.Create(ctx, operation); err != nil {
@@ -28,7 +28,7 @@ func TestNTTCanaryPersistsIdentityBeforeBroadcastState(t *testing.T) {
 	}
 	transaction := sqlitestore.NTTCanaryTransaction{
 		OperationID: operation.ID, Ordinal: 1, Phase: "source_transfer",
-		Chain: "solana", Identity: "synthetic-signature",
+		Chain: "chain-a", Identity: "synthetic-signature",
 		Blockhash: "synthetic-blockhash", LastValidBlockHeight: 123,
 		Status: "prepared", CreatedAt: now,
 	}
@@ -112,7 +112,7 @@ func TestNTTCanaryRejectsDuplicateTransactionIdentity(t *testing.T) {
 	now := time.Now().UTC()
 	for _, id := range []string{"operation-one", "operation-two"} {
 		if err := store.Create(ctx, sqlitestore.NTTCanaryOperation{
-			ID: id, Direction: "evm-to-solana", AmountUnits: "1",
+			ID: id, Direction: "chain-b-to-chain-a", AmountUnits: "1",
 			Stage: "created", CreatedAt: now,
 		}); err != nil {
 			t.Fatal(err)
@@ -143,7 +143,7 @@ func TestNTTCanaryReusesOnlyUnbroadcastReadinessFailure(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	operation := sqlitestore.NTTCanaryOperation{
-		ID: "readiness-retry", Direction: "solana-to-evm",
+		ID: "readiness-retry", Direction: "chain-a-to-chain-b",
 		AmountUnits: "1000", Stage: "created", CreatedAt: now,
 	}
 	if err := store.Create(ctx, operation); err != nil {
@@ -169,7 +169,7 @@ func TestNTTCanaryReusesOnlyUnbroadcastReadinessFailure(t *testing.T) {
 	}
 	if err := store.RecordPrepared(ctx, sqlitestore.NTTCanaryTransaction{
 		OperationID: operation.ID, Ordinal: 1, Phase: "source_transfer",
-		Chain: "solana", Identity: "prepared-signature",
+		Chain: "chain-a", Identity: "prepared-signature",
 		Status: "prepared", CreatedAt: now.Add(2 * time.Second),
 	}); err != nil {
 		t.Fatal(err)
