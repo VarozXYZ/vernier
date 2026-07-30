@@ -118,6 +118,7 @@ func (e *SequentialExecutor) Execute(
 
 	current := plan.InitialInput
 	stages := append([]domainexecution.SequentialStagePlan(nil), plan.Stages...)
+	recoveryAttempts := make(map[int]int, 2)
 	for index := 0; index < len(stages); index++ {
 		stage := stages[index]
 		request := domainexecution.SequentialStageRequest{
@@ -143,9 +144,93 @@ func (e *SequentialExecutor) Execute(
 		})
 		settlement, err := driver.ExecuteStage(ctx, request, e.journal)
 		if err != nil {
+			failureCosts := executionport.ErrorCosts(err)
+			if len(failureCosts) > 0 {
+				failureJournal, ok :=
+					e.journal.(executionport.SequentialStageFailureJournal)
+				if !ok {
+					stageErr := fmt.Errorf(
+						"stage %d (%s) failure costs cannot be persisted: %w",
+						stage.Ordinal,
+						stage.Stage,
+						err,
+					)
+					finishErr := e.finish(
+						ctx,
+						operation,
+						domainexecution.SequentialManualIntervention,
+						result,
+						stageErr,
+					)
+					return result, errors.Join(stageErr, finishErr)
+				}
+				if persistErr := failureJournal.RecordStageFailureCosts(
+					context.WithoutCancel(ctx),
+					operationID,
+					stage.Ordinal,
+					failureCosts,
+				); persistErr != nil {
+					stageErr := fmt.Errorf(
+						"persist stage %d (%s) failure costs: %w",
+						stage.Ordinal,
+						stage.Stage,
+						persistErr,
+					)
+					finishErr := e.finish(
+						ctx,
+						operation,
+						domainexecution.SequentialManualIntervention,
+						result,
+						stageErr,
+					)
+					return result, errors.Join(stageErr, finishErr)
+				}
+				result.Costs = append(result.Costs, failureCosts...)
+			}
+			if e.canAutomaticallyRecoverSwap(
+				stage,
+				err,
+				recoveryAttempts[stage.Ordinal],
+			) {
+				recoveryAttempts[stage.Ordinal]++
+				if stage.Ordinal == 3 {
+					recoveredStages, decision, recoveryErr :=
+						e.reselectPostBridgeExit(
+							ctx,
+							operationID,
+							plan,
+							current,
+							result.Costs,
+							err,
+						)
+					if recoveryErr != nil {
+						stageErr := fmt.Errorf(
+							"stage %d (%s) failed and automatic recovery could not be selected: %w",
+							stage.Ordinal,
+							stage.Stage,
+							errors.Join(err, recoveryErr),
+						)
+						finishErr := e.finish(
+							ctx,
+							operation,
+							domainexecution.SequentialManualIntervention,
+							result,
+							stageErr,
+						)
+						return result, errors.Join(stageErr, finishErr)
+					}
+					stages = append(stages[:2], recoveredStages...)
+					result.ExitDecision = &decision
+					e.observeExit(decision)
+				}
+				// Retry the same ordinal with a newly built and simulated
+				// transaction. The failed identity is never reused.
+				index--
+				continue
+			}
 			state := domainexecution.SequentialManualIntervention
 			if stage.Ordinal == 1 &&
-				executionport.ErrorDisposition(err) == executionport.DispositionRejected {
+				executionport.IsDefinitiveFailure(err) {
 				state = domainexecution.SequentialAborted
 			}
 			stageErr := fmt.Errorf(
@@ -268,6 +353,80 @@ func (e *SequentialExecutor) Execute(
 		return result, err
 	}
 	return result, nil
+}
+
+func (e *SequentialExecutor) canAutomaticallyRecoverSwap(
+	stage domainexecution.SequentialStagePlan,
+	err error,
+	attempts int,
+) bool {
+	if attempts >= 1 || stage.Stage != domainexecution.StageSell {
+		return false
+	}
+	switch executionport.ErrorDisposition(err) {
+	case executionport.DispositionRejected,
+		executionport.DispositionConfirmedFailure:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *SequentialExecutor) reselectPostBridgeExit(
+	ctx context.Context,
+	operationID domainexecution.OperationID,
+	plan domainexecution.SequentialPlan,
+	current market.TokenAmount,
+	costs []domainexecution.CostComponent,
+	cause error,
+) (
+	[]domainexecution.SequentialStagePlan,
+	domainexecution.SequentialExitDecision,
+	error,
+) {
+	recoverySelector, ok :=
+		e.drivers.ExitSelector.(executionport.SequentialRecoveryExitSelector)
+	if e.drivers.ExitSelector == nil || !ok {
+		return nil, domainexecution.SequentialExitDecision{},
+			fmt.Errorf(
+				"automatic recovery comparison selector is unavailable",
+			)
+	}
+	decision, err := recoverySelector.SelectRecoveryExit(
+		ctx,
+		operationID,
+		plan,
+		current,
+		append([]domainexecution.CostComponent(nil), costs...),
+	)
+	if err != nil {
+		return nil, domainexecution.SequentialExitDecision{}, err
+	}
+	decision.Evidence += "+automatic_recovery_after_" +
+		string(executionport.ErrorDisposition(cause))
+	if err := decision.Validate(); err != nil {
+		return nil, domainexecution.SequentialExitDecision{}, err
+	}
+	exitJournal, ok :=
+		e.journal.(executionport.SequentialExitDecisionJournal)
+	if !ok {
+		return nil, domainexecution.SequentialExitDecision{},
+			fmt.Errorf("sequential journal cannot persist the recovery exit decision")
+	}
+	if err := exitJournal.RecordSequentialExitDecision(
+		ctx,
+		decision,
+	); err != nil {
+		return nil, domainexecution.SequentialExitDecision{}, err
+	}
+	if decision.Route == domainexecution.ExitReturnToOrigin {
+		stages, err := plan.ReturnExitStages()
+		return stages, decision, err
+	}
+	return append(
+		[]domainexecution.SequentialStagePlan(nil),
+		plan.Stages[2:]...,
+	), decision, nil
 }
 
 func calculateSequentialEconomics(

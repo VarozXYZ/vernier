@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,12 +18,13 @@ import (
 )
 
 type sequentialJournal struct {
-	mu          sync.Mutex
-	operation   domainexecution.SequentialOperation
-	finished    domainexecution.SequentialOperationState
-	prepared    []executionport.PreparedTransaction
-	settlements []domainexecution.SequentialStageSettlement
-	exit        domainexecution.SequentialExitDecision
+	mu           sync.Mutex
+	operation    domainexecution.SequentialOperation
+	finished     domainexecution.SequentialOperationState
+	prepared     []executionport.PreparedTransaction
+	settlements  []domainexecution.SequentialStageSettlement
+	failureCosts []domainexecution.CostComponent
+	exit         domainexecution.SequentialExitDecision
 }
 
 func (j *sequentialJournal) CreateSequentialOperation(_ context.Context, operation domainexecution.SequentialOperation) error {
@@ -74,8 +76,22 @@ func (j *sequentialJournal) RecordSequentialExitDecision(
 	return nil
 }
 
+func (j *sequentialJournal) RecordStageFailureCosts(
+	_ context.Context,
+	_ domainexecution.OperationID,
+	_ int,
+	costs []domainexecution.CostComponent,
+) error {
+	j.failureCosts = append(
+		j.failureCosts,
+		costs...,
+	)
+	return nil
+}
+
 type sequentialExitSelector struct {
 	decision domainexecution.SequentialExitDecision
+	calls    *int
 }
 
 func (s sequentialExitSelector) SelectExit(
@@ -85,9 +101,22 @@ func (s sequentialExitSelector) SelectExit(
 	_ market.TokenAmount,
 	_ []domainexecution.CostComponent,
 ) (domainexecution.SequentialExitDecision, error) {
+	if s.calls != nil {
+		(*s.calls)++
+	}
 	result := s.decision
 	result.Operation = operation
 	return result, nil
+}
+
+func (s sequentialExitSelector) SelectRecoveryExit(
+	ctx context.Context,
+	operation domainexecution.OperationID,
+	plan domainexecution.SequentialPlan,
+	input market.TokenAmount,
+	costs []domainexecution.CostComponent,
+) (domainexecution.SequentialExitDecision, error) {
+	return s.SelectExit(ctx, operation, plan, input, costs)
 }
 
 type sequentialDriver struct {
@@ -95,6 +124,7 @@ type sequentialDriver struct {
 	costs          map[int][]domainexecution.CostComponent
 	failAt         int
 	failure        error
+	failures       map[int][]error
 	mu             sync.Mutex
 	inputs         []market.TokenAmount
 	preflightCalls int
@@ -177,6 +207,14 @@ func (d *sequentialDriver) ExecuteStage(
 	if request.Stage.Ordinal == d.failAt {
 		return domainexecution.SequentialStageSettlement{}, d.failure
 	}
+	d.mu.Lock()
+	if failures := d.failures[request.Stage.Ordinal]; len(failures) > 0 {
+		failure := failures[0]
+		d.failures[request.Stage.Ordinal] = failures[1:]
+		d.mu.Unlock()
+		return domainexecution.SequentialStageSettlement{}, failure
+	}
+	d.mu.Unlock()
 	identity := domainexecution.TransactionIdentity{
 		Chain: request.Stage.SourceChain, Account: "test",
 		Hash: fmt.Sprintf("source-%d", request.Stage.Ordinal),
@@ -220,10 +258,10 @@ func sequentialAmount(t *testing.T, token market.TokenID, units int64) market.To
 
 func sequentialPlan(t *testing.T) domainexecution.SequentialPlan {
 	t.Helper()
-	input := sequentialAmount(t, "quote-a", 1_000_000)
-	buyOutput := sequentialAmount(t, "base-a", 4_000_000_000)
-	sellInput := sequentialAmount(t, "base-b", 4_000_000_000_000_000_000)
-	sellOutput := sequentialAmount(t, "quote-b", 999_900)
+	input := sequentialAmount(t, "quote-solana", 1_000_000)
+	buyOutput := sequentialAmount(t, "base-solana", 4_000_000_000)
+	sellInput := sequentialAmount(t, "base-polygon", 4_000_000_000_000_000_000)
+	sellOutput := sequentialAmount(t, "quote-polygon", 999_900)
 	now := time.Now().UTC()
 	inputValue, _ := market.NewAssetQuantity("usdc", big.NewRat(1, 1))
 	outputValue, _ := market.NewAssetQuantity("usdc", big.NewRat(9999, 10_000))
@@ -231,7 +269,7 @@ func sequentialPlan(t *testing.T) domainexecution.SequentialPlan {
 		Evaluation: "evaluation-1", ConfigHash: "config",
 		Classification: arbitrage.ClassificationPolicyQualified,
 		Direction: arbitrage.Direction{
-			BuyMarket: "market-a", SellMarket: "market-b",
+			BuyMarket: "solana-market", SellMarket: "polygon-market",
 		},
 		Candidates: []arbitrage.Candidate{{
 			Input: inputValue, Output: outputValue,
@@ -241,7 +279,7 @@ func sequentialPlan(t *testing.T) domainexecution.SequentialPlan {
 		SelectedIndex: 0,
 	}
 	plan, err := domainexecution.NewSequentialPlan(
-		"plan-1", opportunity, input, "chain-a", "chain-b", now,
+		"plan-1", opportunity, input, "solana", "polygon", now,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -252,10 +290,10 @@ func sequentialPlan(t *testing.T) domainexecution.SequentialPlan {
 func TestSequentialExecutorUsesEveryConfirmedOutputAsTheNextInput(t *testing.T) {
 	plan := sequentialPlan(t)
 	outputs := map[int]market.TokenAmount{
-		1: sequentialAmount(t, "base-a", 4_052_168_781),
-		2: sequentialAmount(t, "base-b", 4_052_168_781_000_000_000),
-		3: sequentialAmount(t, "quote-b", 1_001_234),
-		4: sequentialAmount(t, "quote-a", 1_001_134),
+		1: sequentialAmount(t, "base-solana", 4_052_168_781),
+		2: sequentialAmount(t, "base-polygon", 4_052_168_781_000_000_000),
+		3: sequentialAmount(t, "quote-polygon", 1_001_234),
+		4: sequentialAmount(t, "quote-solana", 1_001_134),
 	}
 	networkAmount, _ := market.NewAssetQuantity("sol", big.NewRat(1, 100_000))
 	networkValue, _ := market.NewAssetQuantity("usdc", big.NewRat(4, 10_000))
@@ -264,11 +302,11 @@ func TestSequentialExecutorUsesEveryConfirmedOutputAsTheNextInput(t *testing.T) 
 		outputs: outputs,
 		costs: map[int][]domainexecution.CostComponent{
 			1: {{
-				Kind: "network_fee", Chain: "chain-a", Amount: networkAmount,
+				Kind: "network_fee", Chain: "solana", Amount: networkAmount,
 				QuoteValue: networkValue, Evidence: "receipt",
 			}},
 			4: {{
-				Kind: "bridge_spread", Chain: "chain-b", Amount: spreadAmount,
+				Kind: "bridge_spread", Chain: "polygon", Amount: spreadAmount,
 				QuoteValue: spreadAmount, IncludedInOutput: true, Evidence: "balance",
 			}},
 		},
@@ -352,10 +390,60 @@ func TestSequentialExecutorAbortsOnlyWhenFirstBroadcastIsKnownRejected(t *testin
 	}
 }
 
+func TestSequentialExecutorSafelyAbortsConfirmedFirstStageRevert(t *testing.T) {
+	plan := sequentialPlan(t)
+	nativeCost, _ := market.NewAssetQuantity("sol", big.NewRat(1, 1000))
+	quoteCost, _ := market.NewAssetQuantity("usdc", big.NewRat(1, 10))
+	driver := &sequentialDriver{
+		outputs: map[int]market.TokenAmount{},
+		failAt:  1,
+		failure: executionport.NewStageErrorWithCosts(
+			executionport.DispositionConfirmedFailure,
+			[]domainexecution.CostComponent{{
+				Kind: "network_fee", Chain: "solana",
+				Amount: nativeCost, QuoteValue: quoteCost,
+				Evidence: "solana_confirmed_revert",
+			}},
+			errors.New("confirmed slippage revert"),
+		),
+	}
+	journal := &sequentialJournal{}
+	executor, _ := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, BridgeBase: driver, Sell: driver, BridgeQuoteReturn: driver,
+		},
+		time.Now,
+	)
+	result, err := executor.Execute(
+		context.Background(),
+		"operation-confirmed-buy-revert",
+		plan,
+	)
+	if err == nil ||
+		executionport.ErrorDisposition(err) !=
+			executionport.DispositionConfirmedFailure {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if journal.finished != domainexecution.SequentialAborted {
+		t.Fatalf("expected safe abort, got %q", journal.finished)
+	}
+	if len(result.Settlements) != 0 ||
+		len(journal.failureCosts) != 1 ||
+		len(result.Costs) != 1 {
+		t.Fatalf(
+			"settlements=%d journal_costs=%d result_costs=%d",
+			len(result.Settlements),
+			len(journal.failureCosts),
+			len(result.Costs),
+		)
+	}
+}
+
 func TestSequentialExecutorRequiresManualInterventionAfterExposure(t *testing.T) {
 	plan := sequentialPlan(t)
 	outputs := map[int]market.TokenAmount{
-		1: sequentialAmount(t, "base-a", 4_052_168_781),
+		1: sequentialAmount(t, "base-solana", 4_052_168_781),
 	}
 	driver := &sequentialDriver{
 		outputs: outputs, failAt: 2,
@@ -382,13 +470,222 @@ func TestSequentialExecutorRequiresManualInterventionAfterExposure(t *testing.T)
 	}
 }
 
+func TestSequentialExecutorRecoversConfirmedSellRevertWithFreshExit(t *testing.T) {
+	plan := sequentialPlan(t)
+	outputs := map[int]market.TokenAmount{
+		1: sequentialAmount(t, "base-solana", 4_052_168_781),
+		2: sequentialAmount(t, "base-polygon", 4_052_168_781_000_000_000),
+		3: sequentialAmount(t, "quote-polygon", 1_001_234),
+		4: sequentialAmount(t, "quote-solana", 1_001_134),
+	}
+	nativeCost, _ := market.NewAssetQuantity("pol", big.NewRat(1, 1000))
+	quoteCost, _ := market.NewAssetQuantity("usdc", big.NewRat(1, 100))
+	revert := executionport.NewStageErrorWithCosts(
+		executionport.DispositionConfirmedFailure,
+		[]domainexecution.CostComponent{{
+			Kind: "network_fee", Chain: "polygon",
+			Amount: nativeCost, QuoteValue: quoteCost,
+			Evidence: "evm_receipt_gas",
+		}},
+		errors.New("confirmed revert: return amount is not enough"),
+	)
+	driver := &sequentialDriver{
+		outputs: outputs,
+		failures: map[int][]error{
+			3: {revert},
+		},
+	}
+	recovery, _ := market.NewAssetQuantity("usdc", big.NewRat(1001, 1000))
+	margin, _ := market.NewAssetQuantity("usdc", new(big.Rat))
+	selectorCalls := 0
+	selector := sequentialExitSelector{
+		calls: &selectorCalls,
+		decision: domainexecution.SequentialExitDecision{
+			Route: domainexecution.ExitSellAtDestination,
+			DestinationOutput: sequentialAmount(
+				t, "quote-polygon", 1_001_234,
+			),
+			DestinationRecovery: recovery,
+			SafetyMargin:        margin,
+			DecidedAt:           time.Now().UTC(),
+			Evidence:            "fresh_destination_build+simulation",
+		},
+	}
+	journal := &sequentialJournal{}
+	executor, err := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, BridgeBase: driver, Sell: driver,
+			BridgeQuoteReturn: driver, ExitSelector: selector,
+		},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(
+		context.Background(),
+		"operation-recovered-revert",
+		plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if journal.finished != domainexecution.SequentialCompleted ||
+		len(result.Settlements) != 4 ||
+		len(driver.inputs) != 5 {
+		t.Fatalf(
+			"state=%s settlements=%d attempts=%d",
+			journal.finished,
+			len(result.Settlements),
+			len(driver.inputs),
+		)
+	}
+	if selectorCalls != 2 {
+		t.Fatalf("exit selections=%d, want initial plus recovery", selectorCalls)
+	}
+	if len(journal.failureCosts) != 1 ||
+		len(result.Costs) != 1 ||
+		result.ExternalCost.Rat().Cmp(quoteCost.Rat()) != 0 {
+		t.Fatalf(
+			"failure costs journal=%+v result=%+v external=%s",
+			journal.failureCosts,
+			result.Costs,
+			result.ExternalCost,
+		)
+	}
+	if result.ExitDecision == nil ||
+		!strings.Contains(
+			result.ExitDecision.Evidence,
+			"automatic_recovery_after_confirmed_failure",
+		) {
+		t.Fatalf("recovery decision=%+v", result.ExitDecision)
+	}
+}
+
+func TestSequentialExecutorDoesNotRecoverUncertainSellOutcome(t *testing.T) {
+	plan := sequentialPlan(t)
+	driver := &sequentialDriver{
+		outputs: map[int]market.TokenAmount{
+			1: sequentialAmount(t, "base-solana", 4_052_168_781),
+			2: sequentialAmount(t, "base-polygon", 4_052_168_781_000_000_000),
+		},
+		failAt: 3,
+		failure: executionport.NewStageError(
+			executionport.DispositionPossible,
+			errors.New("sell outcome unknown"),
+		),
+	}
+	recovery, _ := market.NewAssetQuantity("usdc", big.NewRat(1, 1))
+	margin, _ := market.NewAssetQuantity("usdc", new(big.Rat))
+	selectorCalls := 0
+	journal := &sequentialJournal{}
+	executor, _ := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, BridgeBase: driver, Sell: driver,
+			BridgeQuoteReturn: driver,
+			ExitSelector: sequentialExitSelector{
+				calls: &selectorCalls,
+				decision: domainexecution.SequentialExitDecision{
+					Route: domainexecution.ExitSellAtDestination,
+					DestinationOutput: sequentialAmount(
+						t, "quote-polygon", 1_000_000,
+					),
+					DestinationRecovery: recovery,
+					SafetyMargin:        margin,
+					DecidedAt:           time.Now().UTC(),
+					Evidence:            "fresh_destination_build+simulation",
+				},
+			},
+		},
+		time.Now,
+	)
+	if _, err := executor.Execute(
+		context.Background(),
+		"operation-uncertain-sell",
+		plan,
+	); err == nil {
+		t.Fatal("expected uncertain sell error")
+	}
+	if journal.finished != domainexecution.SequentialManualIntervention ||
+		selectorCalls != 1 ||
+		len(driver.inputs) != 3 {
+		t.Fatalf(
+			"state=%s selections=%d attempts=%d",
+			journal.finished,
+			selectorCalls,
+			len(driver.inputs),
+		)
+	}
+}
+
+func TestSequentialExecutorStopsAfterOneAutomaticRecoveryAttempt(t *testing.T) {
+	plan := sequentialPlan(t)
+	revert := executionport.NewStageError(
+		executionport.DispositionConfirmedFailure,
+		errors.New("confirmed revert"),
+	)
+	driver := &sequentialDriver{
+		outputs: map[int]market.TokenAmount{
+			1: sequentialAmount(t, "base-solana", 4_052_168_781),
+			2: sequentialAmount(t, "base-polygon", 4_052_168_781_000_000_000),
+		},
+		failures: map[int][]error{
+			3: {revert, revert},
+		},
+	}
+	recovery, _ := market.NewAssetQuantity("usdc", big.NewRat(1, 1))
+	margin, _ := market.NewAssetQuantity("usdc", new(big.Rat))
+	selectorCalls := 0
+	journal := &sequentialJournal{}
+	executor, _ := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, BridgeBase: driver, Sell: driver,
+			BridgeQuoteReturn: driver,
+			ExitSelector: sequentialExitSelector{
+				calls: &selectorCalls,
+				decision: domainexecution.SequentialExitDecision{
+					Route: domainexecution.ExitSellAtDestination,
+					DestinationOutput: sequentialAmount(
+						t, "quote-polygon", 1_000_000,
+					),
+					DestinationRecovery: recovery,
+					SafetyMargin:        margin,
+					DecidedAt:           time.Now().UTC(),
+					Evidence:            "fresh_destination_build+simulation",
+				},
+			},
+		},
+		time.Now,
+	)
+	if _, err := executor.Execute(
+		context.Background(),
+		"operation-double-revert",
+		plan,
+	); err == nil {
+		t.Fatal("expected second sell revert")
+	}
+	if journal.finished != domainexecution.SequentialManualIntervention ||
+		selectorCalls != 2 ||
+		len(driver.inputs) != 4 {
+		t.Fatalf(
+			"state=%s selections=%d attempts=%d",
+			journal.finished,
+			selectorCalls,
+			len(driver.inputs),
+		)
+	}
+}
+
 func TestSequentialExecutorCanReturnBaseAndSellAtOriginWithoutAnotherBridge(t *testing.T) {
 	plan := sequentialPlan(t)
 	outputs := map[int]market.TokenAmount{
-		1: sequentialAmount(t, "base-a", 4_052_168_781),
-		2: sequentialAmount(t, "base-b", 4_052_168_781_000_000_000),
-		3: sequentialAmount(t, "base-a", 4_052_168_780),
-		4: sequentialAmount(t, "quote-a", 990_000),
+		1: sequentialAmount(t, "base-solana", 4_052_168_781),
+		2: sequentialAmount(t, "base-polygon", 4_052_168_781_000_000_000),
+		3: sequentialAmount(t, "base-solana", 4_052_168_780),
+		4: sequentialAmount(t, "quote-solana", 990_000),
 	}
 	recovery, _ := market.NewAssetQuantity("usdc", big.NewRat(99, 100))
 	margin, _ := market.NewAssetQuantity("usdc", big.NewRat(1, 100))
@@ -403,10 +700,10 @@ func TestSequentialExecutorCanReturnBaseAndSellAtOriginWithoutAnotherBridge(t *t
 				decision: domainexecution.SequentialExitDecision{
 					Route: domainexecution.ExitReturnToOrigin,
 					DestinationOutput: sequentialAmount(
-						t, "quote-b", 970_000,
+						t, "quote-polygon", 970_000,
 					),
 					ReturnOutput: sequentialAmount(
-						t, "quote-a", 990_000,
+						t, "quote-solana", 990_000,
 					),
 					DestinationRecovery: recovery,
 					ReturnRecovery:      recovery,
@@ -447,7 +744,7 @@ func TestSequentialExecutorCanReturnBaseAndSellAtOriginWithoutAnotherBridge(t *t
 	if fmt.Sprint(gotStages) != fmt.Sprint(wantStages) {
 		t.Fatalf("stages=%v want=%v", gotStages, wantStages)
 	}
-	if result.FinalAmount.Token() != "quote-a" ||
+	if result.FinalAmount.Token() != "quote-solana" ||
 		result.FinalAmount.Units().Cmp(big.NewInt(990_000)) != 0 {
 		t.Fatalf("unexpected terminal amount %s", result.FinalAmount)
 	}

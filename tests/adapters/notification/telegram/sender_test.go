@@ -129,28 +129,23 @@ func TestSenderPostsConfigurationWarningForAcceptedModeMismatch(t *testing.T) {
 	}
 }
 
-func TestSenderEditsOneMessageThroughoutLiveLifecycle(t *testing.T) {
-	var paths []string
-	var texts []string
+func TestSenderPostsConciseLiveProgressAndFailureMessages(t *testing.T) {
+	var messages []string
 	sender, err := telegram.New(telegram.Config{
-		BotToken: "synthetic-token",
-		ChatID:   "synthetic-chat",
-		BaseURL:  "https://telegram.test",
-		Client: clientFunc(func(
-			request *http.Request,
-		) (*http.Response, error) {
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
 			var payload struct {
 				Text string `json:"text"`
 			}
 			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 				t.Fatal(err)
 			}
-			paths = append(paths, request.URL.Path)
-			texts = append(texts, payload.Text)
+			messages = append(messages, payload.Text)
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Body: io.NopCloser(strings.NewReader(
-					`{"ok":true,"result":{"message_id":42}}`,
+					`{"ok":true,"result":{"message_id":3}}`,
 				)),
 			}, nil
 		}),
@@ -158,68 +153,334 @@ func TestSenderEditsOneMessageThroughoutLiveLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
+	err = sender.SendLiveExecution(
+		context.Background(),
+		notificationport.LiveExecutionEvent{
+			Kind:      notificationport.LiveExecutionStageCompleted,
+			Operation: "operation-synthetic-1234567890",
+			Stage:     "bridge_base", Ordinal: 2, TotalStages: 4,
+			SourceChain: "Solana", DestinationChain: "Polygon",
+			Input: "4.052168781 BASE", Output: "4.052168781 BASE",
+			SourceTransaction: "source-transaction-1234567890",
+			SourceURL:         "https://explorer.test/tx/source",
+			DestinationTx:     "destination-transaction-1234567890",
+			DestinationURL:    "https://explorer.test/tx/destination",
+			Evidence:          "destination_balance", Duration: 8 * time.Second,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = sender.SendLiveExecution(
+		context.Background(),
+		notificationport.LiveExecutionEvent{
+			Kind:      notificationport.LiveExecutionFailed,
+			Operation: "operation-synthetic-1234567890",
+			State:     "manual_intervention_required",
+			Stage:     "sell", Ordinal: 3, TotalStages: 4,
+			SourceChain: "Polygon",
+			Detail:      "receipt outcome is unknown",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("messages=%d, want 2", len(messages))
+	}
+	for _, expected := range []string{
+		"✅ <b>2/4 · BRIDGE BASE</b> · Solana → Polygon · 8.000 s",
+		`<a href="https://explorer.test/tx/source">Departure from Solana</a>`,
+		`<a href="https://explorer.test/tx/destination">Receipt on Polygon</a>`,
+	} {
+		if !strings.Contains(messages[0], expected) {
+			t.Fatalf("progress message does not contain %q: %s", expected, messages[0])
+		}
+	}
+	for _, forbidden := range []string{
+		"4.052168781 BASE",
+		"destination_balance",
+		"Costs",
+	} {
+		if strings.Contains(messages[0], forbidden) {
+			t.Fatalf("progress message contains %q: %s", forbidden, messages[0])
+		}
+	}
+	for _, expected := range []string{
+		"🚨 <b>LIVE · MANUAL ACTION</b>",
+		"3/4 · SELL · Polygon",
+		"⚠️ receipt outcome is unknown",
+	} {
+		if !strings.Contains(messages[1], expected) {
+			t.Fatalf("failure message does not contain %q: %s", expected, messages[1])
+		}
+	}
+}
+
+func TestSenderCreatesOneLiveMessageAndEditsItForEveryUpdate(t *testing.T) {
+	var paths []string
+	var messageIDs []int64
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				MessageID int64  `json:"message_id"`
+				Text      string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			paths = append(paths, request.URL.Path)
+			messageIDs = append(messageIDs, payload.MessageID)
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":37}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := "operation-synthetic-1234567890"
 	events := []notificationport.LiveExecutionEvent{
 		{
-			Kind:           notificationport.LiveExecutionStarted,
-			Operation:      "synthetic-operation",
-			State:          "live",
-			Direction:      "market-a -> market-b",
-			Input:          "100 QUOTE",
-			ExpectedBase:   "400 BASE",
-			ExpectedOutput: "102 QUOTE",
-			ExpectedNetPnL: "1 QUOTE",
-			BuyProvider:    "adapter-a",
-			SellProvider:   "adapter-b",
-			Trigger:        "chain-a/transaction",
+			Kind: notificationport.LiveExecutionStarted, Operation: operation,
+			Direction: "Solana -> Polygon", Input: "750 QUOTE",
+			BuyProvider: "Jupiter", SellProvider: "KyberSwap",
+			ExpectedBase: "3250 BASE", ExpectedOutput: "755 QUOTE",
+			ExpectedNetPnL: "4 QUOTE",
+			Trigger:        "solana/signature:synthetic",
 			TriggerURL:     "https://explorer.test/tx/trigger",
 		},
 		{
-			Kind:              notificationport.LiveExecutionStageCompleted,
-			Operation:         "synthetic-operation",
-			Stage:             "buy",
-			Ordinal:           1,
-			TotalStages:       4,
-			SourceChain:       "chain-a",
-			Input:             "100 QUOTE",
-			Output:            "401.123456 BASE",
-			SourceTransaction: "source-transaction",
-			SourceURL:         "https://explorer.test/tx/source",
-			Duration:          730 * time.Millisecond,
+			Kind: notificationport.LiveExecutionStageCompleted, Operation: operation,
+			Stage: "buy", Ordinal: 1, TotalStages: 4,
+			SourceChain: "Solana", Input: "750 QUOTE", Output: "3251 BASE",
+			SourceTransaction: "signature-synthetic",
+			SourceURL:         "https://explorer.test/tx/buy",
 		},
 		{
-			Kind:          notificationport.LiveExecutionCompleted,
-			Operation:     "synthetic-operation",
-			Output:        "101.500000 QUOTE",
-			ExecutionCost: "0.500000 QUOTE",
-			NetPnL:        "1.000000 QUOTE",
-			Duration:      2500 * time.Millisecond,
+			Kind: notificationport.LiveExecutionCompleted, Operation: operation,
+			Direction: "Solana -> Polygon", Input: "750 QUOTE",
+			Output: "754 QUOTE", NetPnL: "3 QUOTE",
 		},
 	}
 	for _, event := range events {
-		if err := sender.SendLiveExecution(ctx, event); err != nil {
+		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if len(paths) != 3 ||
-		paths[0] != "/botsynthetic-token/sendMessage" ||
-		paths[1] != "/botsynthetic-token/editMessageText" ||
-		paths[2] != "/botsynthetic-token/editMessageText" {
-		t.Fatalf("unexpected Telegram operations: %v", paths)
+	if len(paths) != 3 {
+		t.Fatalf("requests=%d, want 3", len(paths))
 	}
-	final := texts[len(texts)-1]
+	if paths[0] != "/botsynthetic-token/sendMessage" || messageIDs[0] != 0 {
+		t.Fatalf("initial request=%q message_id=%d", paths[0], messageIDs[0])
+	}
+	for index := 1; index < len(paths); index++ {
+		if paths[index] != "/botsynthetic-token/editMessageText" ||
+			messageIDs[index] != 37 {
+			t.Fatalf(
+				"update %d path=%q message_id=%d",
+				index, paths[index], messageIDs[index],
+			)
+		}
+	}
+	final := messages[len(messages)-1]
 	for _, expected := range []string{
-		"🏁 <b>LIVE · COMPLETE</b>",
-		"market-a → market-b",
-		"✅ <b>1/4 · BUY</b> · chain-a",
-		`<a href="https://explorer.test/tx/source">Swap on chain-a</a>`,
-		"Return   <b>101.5 QUOTE</b>",
-		"Costs    0.5 QUOTE",
-		"Net PnL  <b>1 QUOTE</b>",
-		"Total · 2.500 s",
+		"LIVE · COMPLETE",
+		"Solana → Polygon",
+		"750 QUOTE → 3,250 BASE → 755 QUOTE",
+		"Jupiter → KyberSwap · expected <b>+4 QUOTE</b>",
+		`<a href="https://explorer.test/tx/trigger">Trigger transaction</a>`,
+		"1/4 · BUY",
+		"750 QUOTE → <b>3,251 BASE</b>",
+		"💰 Return   <b>754 QUOTE</b>",
+		"📈 Net PnL  <b>3 QUOTE</b>",
 	} {
 		if !strings.Contains(final, expected) {
-			t.Fatalf("final message missing %q:\n%s", expected, final)
+			t.Fatalf("final Live message does not contain %q: %s", expected, final)
+		}
+	}
+}
+
+func TestSenderLabelsForcedCanaryWithoutDiscoverySizedOutputs(t *testing.T) {
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":41}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := "forced-canary-operation"
+	for _, event := range []notificationport.LiveExecutionEvent{
+		{
+			Kind: notificationport.LiveExecutionStarted, Operation: operation,
+			State: "forced_canary", Direction: "Solana -> Polygon",
+			Input: "1 QUOTE", BuyProvider: "Jupiter",
+			SellProvider: "KyberSwap",
+		},
+		{
+			Kind: notificationport.LiveExecutionCompleted, Operation: operation,
+			Input: "1 QUOTE", Output: "0.99 QUOTE",
+		},
+	} {
+		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(messages) != 2 ||
+		!strings.Contains(messages[0], "CANARY · FORCED") ||
+		!strings.Contains(messages[0], "1 QUOTE") ||
+		!strings.Contains(messages[1], "CANARY · COMPLETE") {
+		t.Fatalf("unexpected forced canary messages: %v", messages)
+	}
+	for _, forbidden := range []string{"750 QUOTE", "expected"} {
+		if strings.Contains(messages[0], forbidden) {
+			t.Fatalf("forced canary message contains %q: %s", forbidden, messages[0])
+		}
+	}
+}
+
+func TestSenderRendersCompactCompletedCanarySummary(t *testing.T) {
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":51}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := "sequential-operation-synthetic"
+	events := []notificationport.LiveExecutionEvent{
+		{
+			Kind: notificationport.LiveExecutionStarted, Operation: operation,
+			State: "forced_canary", Direction: "Solana -> Polygon",
+			Input: "1 USDC", BuyProvider: "Jupiter", SellProvider: "KyberSwap",
+			Trigger: "bootstrap", TriggerURL: "https://solscan.io/tx/bootstrap",
+		},
+		{
+			Kind: notificationport.LiveExecutionStageCompleted, Operation: operation,
+			Stage: "buy", Ordinal: 1, TotalStages: 4, SourceChain: "Solana",
+			Input: "1 QUOTE", Output: "4.983035 BASE",
+			ExecutionCost: "0.102409 QUOTE", Evidence: "balance_delta",
+			Duration:          754 * time.Millisecond,
+			SourceTransaction: "buy-signature",
+			SourceURL:         "https://solscan.io/tx/buy-signature",
+		},
+		{
+			Kind: notificationport.LiveExecutionStageCompleted, Operation: operation,
+			Stage: "bridge_base", Ordinal: 2, TotalStages: 4,
+			SourceChain: "Solana", DestinationChain: "Polygon",
+			Input: "4.983035 BASE", Output: "4.983035 BASE",
+			ExecutionCost: "0.37061 QUOTE", Evidence: "bridge_internal_tag",
+			Duration:          17032 * time.Millisecond,
+			SourceTransaction: "bridge-source",
+			SourceURL:         "https://solscan.io/tx/bridge-source",
+			DestinationTx:     "bridge-receipt",
+			DestinationURL:    "https://polygonscan.com/tx/bridge-receipt",
+		},
+		{
+			Kind: notificationport.LiveExecutionStageCompleted, Operation: operation,
+			Stage: "sell", Ordinal: 3, TotalStages: 4, SourceChain: "Polygon",
+			Input: "4.983035 BASE", Output: "1.00729 QUOTE",
+			Duration:          1934 * time.Millisecond,
+			SourceTransaction: "sell-transaction",
+			SourceURL:         "https://polygonscan.com/tx/sell-transaction",
+		},
+		{
+			Kind: notificationport.LiveExecutionStageCompleted, Operation: operation,
+			Stage: "bridge_quote_return", Ordinal: 4, TotalStages: 4,
+			SourceChain: "Polygon", DestinationChain: "Solana",
+			Input: "1.00729 QUOTE", Output: "1.00729 QUOTE",
+			Duration:          18187 * time.Millisecond,
+			SourceTransaction: "return-source",
+			SourceURL:         "https://polygonscan.com/tx/return-source",
+			DestinationTx:     "return-receipt",
+			DestinationURL:    "https://solscan.io/tx/return-receipt",
+		},
+		{
+			Kind: notificationport.LiveExecutionExitSelected, Operation: operation,
+			Stage: "sell_at_destination", DestinationValue: "1.007289 QUOTE",
+		},
+		{
+			Kind: notificationport.LiveExecutionCompleted, Operation: operation,
+			Input: "1 QUOTE", Output: "1.00729 QUOTE",
+			ExecutionCost: "0.492405 QUOTE", NetPnL: "-0.485115 QUOTE",
+			Duration: 38795 * time.Millisecond,
+		},
+	}
+	for _, event := range events {
+		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	final := messages[len(messages)-1]
+	for _, expected := range []string{
+		"🏁 <b>CANARY · COMPLETE</b>",
+		"✅ <b>1/4 · BUY</b> · Solana",
+		"1 QUOTE → <b>4.983 BASE</b> · 754 ms",
+		`>Swap on Solana</a>`,
+		"✅ <b>2/4 · BRIDGE BASE</b> · Solana → Polygon · 17.032 s",
+		`>Departure from Solana</a> → <a href="https://polygonscan.com/tx/bridge-receipt">Receipt on Polygon</a>`,
+		"✅ <b>3/4 · SELL</b> · Polygon",
+		"4.983 BASE → <b>1.007 QUOTE</b> · 1.934 s",
+		"✅ <b>4/4 · RETURN QUOTE</b> · Polygon → Solana · 18.187 s",
+		"<b>1.007 QUOTE</b> received",
+		"💰 Return   <b>1.007 QUOTE</b>",
+		"💸 Costs    0.4924 QUOTE",
+		"📉 Net PnL  <b>-0.4851 QUOTE</b>",
+		"⏱️ Total · 38.795 s",
+	} {
+		if !strings.Contains(final, expected) {
+			t.Fatalf("completed message does not contain %q:\n%s", expected, final)
+		}
+	}
+	for _, forbidden := range []string{
+		"bootstrap",
+		"bridge_internal_tag",
+		"0.102409 QUOTE",
+		"0.37061 QUOTE",
+		"SELL DESTINATION",
+		"sequenti",
+	} {
+		if strings.Contains(final, forbidden) {
+			t.Fatalf("completed message contains %q:\n%s", forbidden, final)
 		}
 	}
 }

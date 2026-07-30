@@ -84,7 +84,8 @@ func (s *Sender) SendOpening(ctx context.Context, alert notificationport.Opportu
 	if alert.TriggerURL == "" {
 		lines = append(lines, triggerLine(alert.Trigger))
 	}
-	return s.send(ctx, strings.Join(lines, "\n"))
+	_, err := s.send(ctx, strings.Join(lines, "\n"))
+	return err
 }
 
 func (s *Sender) SendConfigurationWarning(ctx context.Context, warning notificationport.ConfigurationWarning) error {
@@ -92,12 +93,13 @@ func (s *Sender) SendConfigurationWarning(ctx context.Context, warning notificat
 	if router == "" {
 		router = "not reported"
 	}
-	return s.send(ctx, strings.Join([]string{
+	_, err := s.send(ctx, strings.Join([]string{
 		"⚠️ <b>CONFIG · JUPITER</b>",
 		"📍 " + escape(warning.Market) + " · " + escape(warning.Provider),
 		"⚙️ " + escape(warning.Expected) + " → " + escape(warning.Observed) + " · " + escape(router),
 		"✅ Quote aceptado",
 	}, "\n"))
+	return err
 }
 
 func (s *Sender) SendLiveExecution(
@@ -117,7 +119,7 @@ func (s *Sender) SendLiveExecution(
 	state.apply(event)
 	text := strings.Join(liveSummaryLines(state), "\n")
 	if state.messageID == 0 {
-		messageID, err := s.sendWithID(ctx, text)
+		messageID, err := s.send(ctx, text)
 		if err != nil {
 			return err
 		}
@@ -241,7 +243,8 @@ func liveSummaryLines(state *liveMessageState) []string {
 	}
 	if state.exit != nil &&
 		(state.terminal == nil ||
-			state.terminal.Kind != notificationport.LiveExecutionCompleted) {
+			state.terminal.Kind != notificationport.LiveExecutionCompleted ||
+			strings.Contains(state.exit.Evidence, "automatic_recovery")) {
 		lines = append(lines, exitDecisionLine(*state.exit))
 	}
 	if state.terminal != nil {
@@ -309,14 +312,18 @@ func exitDecisionLine(event notificationport.LiveExecutionEvent) string {
 	if event.Stage == "return_to_origin" {
 		decision = "Return to origin"
 	}
+	prefix := "\U0001f500 "
+	if strings.Contains(event.Evidence, "automatic_recovery") {
+		prefix = "\U0001f6e1\ufe0f <b>RECOVERY</b> \u00b7 "
+	}
 	values := compactLines(
 		escape(compactLiveAmount(event.DestinationValue)),
 		escape(compactLiveAmount(event.ReturnValue)),
 	)
 	if len(values) == 0 {
-		return "\U0001f500 <b>" + escape(decision) + "</b>"
+		return prefix + "<b>" + escape(decision) + "</b>"
 	}
-	return "\U0001f500 <b>" + escape(decision) + "</b> · " +
+	return prefix + "<b>" + escape(decision) + "</b> · " +
 		strings.Join(values, " vs ")
 }
 
@@ -450,15 +457,7 @@ type telegramResponse struct {
 	} `json:"result"`
 }
 
-func (s *Sender) send(ctx context.Context, text string) error {
-	_, err := s.sendWithID(ctx, text)
-	return err
-}
-
-func (s *Sender) sendWithID(
-	ctx context.Context,
-	text string,
-) (int64, error) {
+func (s *Sender) send(ctx context.Context, text string) (int64, error) {
 	payload := struct {
 		ChatID                string `json:"chat_id"`
 		Text                  string `json:"text"`

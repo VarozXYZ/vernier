@@ -53,7 +53,7 @@ func newNonceTestManager(
 	}
 	client := nonceTestClient{nonce: nonce, sendErr: sendErr}
 	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
-		Chain: "chain-b", Account: "executor-b",
+		Chain: "polygon", Account: "polygon-executor",
 		ChainID: big.NewInt(137), PrivateKey: key,
 		Primary: client, Fanout: map[string]evmadapter.TxClient{"test": client},
 		Clock: time.Now,
@@ -137,8 +137,8 @@ func nonceTestPreparedTransaction(
 	}
 	return chainport.PreparedTransaction{
 		Leg: execution.Leg{
-			Chain:   market.ChainID("chain-b"),
-			Account: execution.AccountID("executor-b"),
+			Chain:   market.ChainID("polygon"),
+			Account: execution.AccountID("polygon-executor"),
 		},
 		SignedPayload: raw,
 	}

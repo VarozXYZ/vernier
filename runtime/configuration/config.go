@@ -211,6 +211,9 @@ type LiveConfig struct {
 	MaxOperationsPerRun           int                          `yaml:"max_operations_per_run"`
 	BaseTransferSource            string                       `yaml:"base_transfer_source"`
 	QuoteTransferSource           string                       `yaml:"quote_transfer_source"`
+	BaseBridgeProvider            string                       `yaml:"base_bridge_provider"`
+	QuoteBridgeProvider           string                       `yaml:"quote_bridge_provider"`
+	BaseBridgeProfile             string                       `yaml:"base_bridge_profile"`
 	ConfirmationTimeoutSeconds    int                          `yaml:"confirmation_timeout_seconds"`
 	ExecutionCost                 AmountConfig                 `yaml:"execution_cost"`
 	MaxExecutionCost              AmountConfig                 `yaml:"max_execution_cost"`
@@ -222,10 +225,12 @@ type LiveConfig struct {
 	CostCacheTTLMS                int                          `yaml:"cost_cache_ttl_ms"`
 	CostCalibrationStore          string                       `yaml:"cost_calibration_store"`
 	QuoteTransferCalibrationStore string                       `yaml:"quote_transfer_calibration_store"`
+	AcrossCostCalibrationStore    string                       `yaml:"across_cost_calibration_store"`
 	SlippageBPS                   uint16                       `yaml:"slippage_bps"`
 	TipLamports                   string                       `yaml:"tip_lamports"`
 	ComputeUnitPricePercentile    string                       `yaml:"compute_unit_price_percentile"`
 	ComputeUnitLimit              uint32                       `yaml:"compute_unit_limit"`
+	MaxPriorityFeeLamports        string                       `yaml:"max_priority_fee_lamports"`
 	BlockhashSlotsToExpiry        uint16                       `yaml:"blockhash_slots_to_expiry"`
 	BuildToBroadcastTimeoutMS     int                          `yaml:"build_to_broadcast_timeout_ms"`
 	EVMDeadlineSeconds            int                          `yaml:"evm_deadline_seconds"`
@@ -437,6 +442,9 @@ type ParsedLiveConfig struct {
 	MaxOperationsPerRun           int
 	BaseTransferSource            ResolvedTransferSource
 	QuoteTransferSource           ResolvedTransferSource
+	BaseBridgeProvider            string
+	QuoteBridgeProvider           string
+	BaseBridgeProfile             string
 	ConfirmationTimeout           time.Duration
 	ExecutionCost                 *big.Rat
 	MaximumExecutionCost          *big.Rat
@@ -448,10 +456,12 @@ type ParsedLiveConfig struct {
 	CostCacheTTL                  time.Duration
 	CostCalibrationStore          string
 	QuoteTransferCalibrationStore string
+	AcrossCostCalibrationStore    string
 	SlippageBPS                   uint16
 	TipLamports                   string
 	ComputeUnitPricePercentile    string
 	ComputeUnitLimit              uint32
+	MaxPriorityFeeLamports        string
 	BlockhashSlotsToExpiry        uint16
 	BuildToBroadcastTimeout       time.Duration
 	EVMDeadline                   time.Duration
@@ -831,6 +841,9 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	if !sequential && remoteMarkets != 1 {
 		return ParsedLiveConfig{}, fmt.Errorf("initial live vertical requires exactly one event-refreshed remote market")
 	}
+	if sequential && remoteMarkets != 2 {
+		return ParsedLiveConfig{}, fmt.Errorf("sequential bridge execution requires two event-refreshed remote markets")
+	}
 	if markets[0].Base.Token.Asset != markets[1].Base.Token.Asset ||
 		markets[0].Quote.Token.Asset != markets[1].Quote.Token.Asset {
 		return ParsedLiveConfig{}, fmt.Errorf("live setup markets must share base and quote assets")
@@ -876,6 +889,8 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		}
 	}
 	var baseTransfer, quoteTransfer ResolvedTransferSource
+	genericTransfers := false
+	legacyTransfers := false
 	if sequential {
 		var baseOK, quoteOK bool
 		baseTransfer, baseOK = transferSources[strings.TrimSpace(
@@ -884,13 +899,16 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		quoteTransfer, quoteOK = transferSources[strings.TrimSpace(
 			config.QuoteTransferSource,
 		)]
+		genericTransfers = baseOK && quoteOK
+		legacyTransfers = config.BaseBridgeProvider == "wormhole_ntt" &&
+			config.QuoteBridgeProvider == "across_cctp" &&
+			strings.TrimSpace(config.BaseBridgeProfile) != ""
 		if config.MaxOperationsPerRun != 1 {
 			return ParsedLiveConfig{}, fmt.Errorf("initial sequential execution requires max_operations_per_run: 1")
 		}
-		if !baseOK || !quoteOK || config.ConfirmationTimeoutSeconds <= 0 {
-			return ParsedLiveConfig{}, fmt.Errorf(
-				"sequential transfer and confirmation policy is incomplete",
-			)
+		if (!genericTransfers && !legacyTransfers) ||
+			config.ConfirmationTimeoutSeconds <= 0 {
+			return ParsedLiveConfig{}, fmt.Errorf("sequential bridge and confirmation policy is incomplete")
 		}
 	}
 	var executionCost *big.Rat
@@ -949,16 +967,24 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 				"live tip_lamports must be a positive integer",
 			)
 		}
-	}
-	if hasSolana &&
-		(strings.TrimSpace(config.ComputeUnitPricePercentile) == "" ||
+		if strings.TrimSpace(config.ComputeUnitPricePercentile) == "" ||
 			config.ComputeUnitLimit == 0 ||
 			config.ComputeUnitLimit > 1_400_000 ||
 			config.BlockhashSlotsToExpiry == 0 ||
-			config.BlockhashSlotsToExpiry > 300) {
-		return ParsedLiveConfig{}, fmt.Errorf(
-			"live Solana transaction policy is incomplete",
-		)
+			config.BlockhashSlotsToExpiry > 300 {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live Solana transaction policy is incomplete",
+			)
+		}
+		if strings.TrimSpace(config.MaxPriorityFeeLamports) == "" {
+			config.MaxPriorityFeeLamports = "18446744073709551615"
+		}
+		maxPriorityFee, ok := new(big.Int).SetString(config.MaxPriorityFeeLamports, 10)
+		if !ok || maxPriorityFee.Sign() <= 0 || !maxPriorityFee.IsUint64() {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live max_priority_fee_lamports must be a positive uint64 integer",
+			)
+		}
 	}
 	if config.FeeCacheMaxAgeMS <= 0 ||
 		config.BuildToBroadcastTimeoutMS <= 0 ||
@@ -985,6 +1011,7 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	accounts := make(map[string]ResolvedLiveAccount, len(config.Accounts))
 	for chainID := range chains {
 		account, exists := config.Accounts[chainID]
+		chain := chains[chainID]
 		if !exists || strings.TrimSpace(account.ID) == "" ||
 			!environmentName.MatchString(account.SignerEnv) {
 			return ParsedLiveConfig{}, fmt.Errorf(
@@ -1018,6 +1045,52 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 			return ParsedLiveConfig{}, fmt.Errorf(
 				"live account %q requires distinct state override slots",
 				account.ID,
+			)
+		}
+		if legacyTransfers {
+			switch chain.Kind {
+			case "solana":
+				if !environmentName.MatchString(account.SellPreflightAddressEnv) ||
+					account.SellPreflightStateOverride != nil {
+					return ParsedLiveConfig{}, fmt.Errorf(
+						"live Solana chain %q requires a sell preflight address environment",
+						chainID,
+					)
+				}
+				if !environmentName.MatchString(account.SenderURLEnv) ||
+					account.FanoutRPCURLEnv != "" ||
+					account.ContractAddressEnv != "" {
+					return ParsedLiveConfig{}, fmt.Errorf(
+						"live Solana account %q requires only sender_url_env",
+						account.ID,
+					)
+				}
+			case "evm":
+				if account.SellPreflightStateOverride == nil ||
+					account.SellPreflightAddressEnv != "" {
+					return ParsedLiveConfig{}, fmt.Errorf(
+						"live EVM chain %q requires an ERC-20 sell preflight state override",
+						chainID,
+					)
+				}
+				if !environmentName.MatchString(account.FanoutRPCURLEnv) ||
+					account.SenderURLEnv != "" {
+					return ParsedLiveConfig{}, fmt.Errorf(
+						"live EVM account %q has incomplete fanout environments",
+						account.ID,
+					)
+				}
+			default:
+				return ParsedLiveConfig{}, fmt.Errorf(
+					"live chain %q has unsupported kind %q",
+					chainID,
+					chain.Kind,
+				)
+			}
+		} else if !sequential && !environmentName.MatchString(account.PublicAddressEnv) {
+			return ParsedLiveConfig{}, fmt.Errorf(
+				"live chain %q requires a public address environment",
+				chainID,
 			)
 		}
 		accounts[chainID] = ResolvedLiveAccount{
@@ -1088,6 +1161,9 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		MaxOperationsPerRun:  config.MaxOperationsPerRun,
 		BaseTransferSource:   baseTransfer,
 		QuoteTransferSource:  quoteTransfer,
+		BaseBridgeProvider:   config.BaseBridgeProvider,
+		QuoteBridgeProvider:  config.QuoteBridgeProvider,
+		BaseBridgeProfile:    strings.TrimSpace(config.BaseBridgeProfile),
 		ConfirmationTimeout:  time.Duration(config.ConfirmationTimeoutSeconds) * time.Second,
 		ExecutionCost:        executionCost,
 		MaximumExecutionCost: maximumExecutionCost, MaximumBaseExposure: maximumBaseExposure,
@@ -1100,8 +1176,10 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		QuoteTransferCalibrationStore: strings.TrimSpace(
 			config.QuoteTransferCalibrationStore,
 		),
-		SlippageBPS: config.SlippageBPS, TipLamports: config.TipLamports,
+		AcrossCostCalibrationStore: strings.TrimSpace(config.AcrossCostCalibrationStore),
+		SlippageBPS:                config.SlippageBPS, TipLamports: config.TipLamports,
 		ComputeUnitPricePercentile: config.ComputeUnitPricePercentile, ComputeUnitLimit: config.ComputeUnitLimit,
+		MaxPriorityFeeLamports:  config.MaxPriorityFeeLamports,
 		BlockhashSlotsToExpiry:  config.BlockhashSlotsToExpiry,
 		BuildToBroadcastTimeout: time.Duration(config.BuildToBroadcastTimeoutMS) * time.Millisecond,
 		EVMDeadline:             time.Duration(config.EVMDeadlineSeconds) * time.Second,

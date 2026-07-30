@@ -173,7 +173,7 @@ func (s *SequentialLiveStore) RecordSequentialExitDecision(
 	if decision.CostEvidenceAvailable {
 		costsAvailable = 1
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO sequential_live_exit_decisions (
+	result, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO sequential_live_exit_decisions (
 		operation_id, route, destination_output_token,
 		destination_output_units, return_output_token, return_output_units,
 		recovery_asset, destination_recovery, return_recovery,
@@ -311,7 +311,7 @@ func (s *SequentialLiveStore) MarkTransaction(
 	phase, status string,
 ) error {
 	switch status {
-	case "broadcast", "confirmed", "rejected", "outcome_unknown":
+	case "broadcast", "confirmed", "confirmed_revert", "rejected", "outcome_unknown":
 	default:
 		return fmt.Errorf("invalid sequential transaction status %q", status)
 	}
@@ -329,6 +329,78 @@ func (s *SequentialLiveStore) MarkTransaction(
 		return fmt.Errorf("sequential transaction was not found")
 	}
 	return nil
+}
+
+func (s *SequentialLiveStore) RecordStageFailureCosts(
+	ctx context.Context,
+	operationID domainexecution.OperationID,
+	ordinal int,
+	costs []domainexecution.CostComponent,
+) error {
+	if operationID == "" || ordinal < 1 || len(costs) == 0 {
+		return fmt.Errorf("sequential stage failure costs are incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var state string
+	var currentStage int
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT state, current_stage FROM sequential_live_operations
+			WHERE operation_id=?`,
+		operationID,
+	).Scan(&state, &currentStage); err != nil {
+		return err
+	}
+	if state != string(domainexecution.SequentialRunning) ||
+		currentStage+1 != ordinal {
+		return fmt.Errorf(
+			"sequential stage failure does not extend the durable operation state",
+		)
+	}
+	var lowestIndex int
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(MIN(component_index), 0)
+			FROM sequential_live_costs
+			WHERE operation_id=? AND ordinal=? AND component_index<0`,
+		operationID,
+		ordinal,
+	).Scan(&lowestIndex); err != nil {
+		return err
+	}
+	for index, cost := range costs {
+		if err := cost.Validate(); err != nil {
+			return fmt.Errorf("stage failure cost %d: %w", index, err)
+		}
+		quoteAsset, quoteValue := "", ""
+		if cost.QuoteValue.Asset() != "" {
+			quoteAsset = string(cost.QuoteValue.Asset())
+			quoteValue = cost.QuoteValue.String()
+		}
+		included := 0
+		if cost.IncludedInOutput {
+			included = 1
+		}
+		// Negative component indices reserve a separate durable namespace
+		// from a later successful settlement of the same ordinal.
+		componentIndex := lowestIndex - index - 1
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sequential_live_costs (
+			operation_id, ordinal, component_index, kind, chain_name,
+			asset, amount_value, quote_asset, quote_value,
+			included_in_output, evidence
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			operationID, ordinal, componentIndex, cost.Kind, cost.Chain,
+			cost.Amount.Asset(), cost.Amount.String(), quoteAsset, quoteValue,
+			included, cost.Evidence,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *SequentialLiveStore) RecordStageSettlement(

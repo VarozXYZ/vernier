@@ -302,6 +302,29 @@ func TestSequentialLiveStorePersistsPostBridgeExitDecision(t *testing.T) {
 	if err := store.RecordSequentialExitDecision(ctx, decision); err != nil {
 		t.Fatal(err)
 	}
+	failedGas, _ := market.NewAssetQuantity("pol", big.NewRat(1, 100))
+	failedGasValue, _ := market.NewAssetQuantity("quote", big.NewRat(2, 100))
+	if err := store.RecordStageFailureCosts(
+		ctx,
+		operation.ID,
+		3,
+		[]domainexecution.CostComponent{{
+			Kind: "network_fee", Chain: "chain-b",
+			Amount: failedGas, QuoteValue: failedGasValue,
+			Evidence: "evm_receipt_gas",
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	decision.Route = domainexecution.ExitSellAtDestination
+	decision.ReturnOutput = market.TokenAmount{}
+	decision.ReturnRecovery = market.AssetQuantity{}
+	decision.DestinationQualified = true
+	decision.DecidedAt = now.Add(4 * time.Second)
+	decision.Evidence = "fresh-comparison+automatic-recovery"
+	if err := store.RecordSequentialExitDecision(ctx, decision); err != nil {
+		t.Fatal(err)
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -315,12 +338,23 @@ func TestSequentialLiveStorePersistsPostBridgeExitDecision(t *testing.T) {
 	).Scan(&route, &destination, &returned); err != nil {
 		t.Fatal(err)
 	}
-	if route != string(domainexecution.ExitReturnToOrigin) ||
-		destination != "97/100" || returned != "99/100" {
+	if route != string(domainexecution.ExitSellAtDestination) ||
+		destination != "97/100" || returned != "" {
 		t.Fatalf(
 			"route=%s destination=%s return=%s",
 			route, destination, returned,
 		)
+	}
+	var costIndex int
+	if err := db.QueryRow(
+		`SELECT component_index FROM sequential_live_costs
+			WHERE operation_id=? AND ordinal=3`,
+		operation.ID,
+	).Scan(&costIndex); err != nil {
+		t.Fatal(err)
+	}
+	if costIndex >= 0 {
+		t.Fatalf("failure cost index=%d, want negative", costIndex)
 	}
 }
 

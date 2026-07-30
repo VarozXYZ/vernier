@@ -22,6 +22,7 @@ const (
 
 type StageError struct {
 	Disposition BroadcastDisposition
+	Costs       []domainexecution.CostComponent
 	Err         error
 }
 
@@ -40,10 +41,22 @@ func (e *StageError) Unwrap() error {
 }
 
 func NewStageError(disposition BroadcastDisposition, err error) error {
+	return NewStageErrorWithCosts(disposition, nil, err)
+}
+
+func NewStageErrorWithCosts(
+	disposition BroadcastDisposition,
+	costs []domainexecution.CostComponent,
+	err error,
+) error {
 	if err == nil {
 		err = errors.New("sequential stage failed")
 	}
-	return &StageError{Disposition: disposition, Err: err}
+	return &StageError{
+		Disposition: disposition,
+		Costs:       append([]domainexecution.CostComponent(nil), costs...),
+		Err:         err,
+	}
 }
 
 func ErrorDisposition(err error) BroadcastDisposition {
@@ -52,6 +65,26 @@ func ErrorDisposition(err error) BroadcastDisposition {
 		return stageErr.Disposition
 	}
 	return DispositionPossible
+}
+
+// IsDefinitiveFailure reports whether the stage is known not to have produced
+// its intended economic effect. A confirmed on-chain revert may still incur
+// network costs, but its token/account state changes were rolled back.
+func IsDefinitiveFailure(err error) bool {
+	switch ErrorDisposition(err) {
+	case DispositionRejected, DispositionConfirmedFailure:
+		return true
+	default:
+		return false
+	}
+}
+
+func ErrorCosts(err error) []domainexecution.CostComponent {
+	var stageErr *StageError
+	if !errors.As(err, &stageErr) {
+		return nil
+	}
+	return append([]domainexecution.CostComponent(nil), stageErr.Costs...)
 }
 
 type PreparedTransaction struct {
@@ -92,6 +125,15 @@ type SequentialExitDecisionJournal interface {
 	) error
 }
 
+type SequentialStageFailureJournal interface {
+	RecordStageFailureCosts(
+		context.Context,
+		domainexecution.OperationID,
+		int,
+		[]domainexecution.CostComponent,
+	) error
+}
+
 type SequentialStageDriver interface {
 	ExecuteStage(
 		context.Context,
@@ -117,6 +159,19 @@ type SequentialPreflight interface {
 // base-token bridge back to the purchase chain.
 type SequentialExitSelector interface {
 	SelectExit(
+		context.Context,
+		domainexecution.OperationID,
+		domainexecution.SequentialPlan,
+		market.TokenAmount,
+		[]domainexecution.CostComponent,
+	) (domainexecution.SequentialExitDecision, error)
+}
+
+// SequentialRecoveryExitSelector performs the same post-bridge comparison
+// after a known-safe liquidation failure, but must evaluate both available
+// exits even when the destination sale remains policy-qualified.
+type SequentialRecoveryExitSelector interface {
+	SelectRecoveryExit(
 		context.Context,
 		domainexecution.OperationID,
 		domainexecution.SequentialPlan,
