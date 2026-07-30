@@ -985,15 +985,16 @@ func composeEVMSwap(
 	}
 	var refuelValidator executionport.Validator = validator
 	if config.Live.GasRefuel.Enabled {
+		refuelGas := config.Live.GasRefuel.EVMGas
 		refuelValidator, err = kyberexecution.New(kyberexecution.Config{
 			ID: "kyberswap/gas-refuel", ChainSlug: source.ChainSlug,
 			Sender: sender, TokenAddresses: tokens,
 			SlippageBPS:                config.Live.GasRefuel.SlippageBPS,
-			GasExecutionMode:           config.Live.EVMGas.ExecutionMode,
-			FixedExecutionGasLimit:     config.Live.EVMGas.ExecutionFixedLimit,
-			GasEstimationMultiplierBPS: config.Live.EVMGas.EstimationMultiplierBPS,
-			GasCostMode:                config.Live.EVMGas.CostMode,
-			FixedCostGasLimit:          config.Live.EVMGas.CostFixedLimit,
+			GasExecutionMode:           refuelGas.ExecutionMode,
+			FixedExecutionGasLimit:     refuelGas.ExecutionFixedLimit,
+			GasEstimationMultiplierBPS: refuelGas.EstimationMultiplierBPS,
+			GasCostMode:                refuelGas.CostMode,
+			FixedCostGasLimit:          refuelGas.CostFixedLimit,
 			Source:                     quoteSource,
 			Simulator:                  primary,
 			Clock:                      time.Now,
