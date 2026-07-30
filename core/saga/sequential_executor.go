@@ -109,8 +109,19 @@ func (e *SequentialExecutor) Execute(
 		CurrentStage:  0, CurrentAmount: plan.InitialInput,
 		StartedAt: now, UpdatedAt: now,
 	}
-	if err := e.journal.CreateSequentialOperation(ctx, operation); err != nil {
-		return executionport.SequentialResult{}, err
+	if recoveryJournal, ok :=
+		e.journal.(executionport.SequentialRecoveryJournal); ok {
+		if err := recoveryJournal.CreateRecoverableSequentialOperation(
+			ctx,
+			operation,
+			plan,
+		); err != nil {
+			return executionport.SequentialResult{}, err
+		}
+	} else {
+		if err := e.journal.CreateSequentialOperation(ctx, operation); err != nil {
+			return executionport.SequentialResult{}, err
+		}
 	}
 	e.observe(func(observer executionport.SequentialObserver) {
 		observer.OperationStarted(operation, plan)

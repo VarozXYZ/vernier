@@ -129,6 +129,130 @@ func TestSenderPostsConfigurationWarningForAcceptedModeMismatch(t *testing.T) {
 	}
 }
 
+func TestSenderPostsConciseLiveRuntimeLifecycle(t *testing.T) {
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":7}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
+	if err := sender.SendLiveRuntime(
+		context.Background(),
+		notificationport.LiveRuntimeEvent{
+			Kind: notificationport.LiveRuntimeStarted,
+			Mode: "live", StartedAt: startedAt, OccurredAt: startedAt,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.SendLiveRuntime(
+		context.Background(),
+		notificationport.LiveRuntimeEvent{
+			Kind: notificationport.LiveRuntimeStopped,
+			Mode: "live", Reason: "operator/system stop",
+			StartedAt: startedAt, OccurredAt: startedAt.Add(90 * time.Second),
+			Uptime: 90 * time.Second,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("messages=%d, want 2", len(messages))
+	}
+	for _, expected := range []string{
+		"\U0001f7e2 <b>LIVE \u00b7 STARTED</b>",
+		"\U0001f4cc Mode: <b>live</b>",
+		"2026-07-30 08:00:00 UTC",
+	} {
+		if !strings.Contains(messages[0], expected) {
+			t.Fatalf("startup does not contain %q:\n%s", expected, messages[0])
+		}
+	}
+	for _, expected := range []string{
+		"\U0001f6d1 <b>LIVE \u00b7 STOPPED</b>",
+		"\U0001f9ed Reason: operator/system stop",
+		"\u23f3 Uptime: 90.000 s",
+	} {
+		if !strings.Contains(messages[1], expected) {
+			t.Fatalf("shutdown does not contain %q:\n%s", expected, messages[1])
+		}
+	}
+}
+
+func TestSenderPostsRecoveryAndRefuelStates(t *testing.T) {
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":8}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.SendLiveExecution(
+		context.Background(),
+		notificationport.LiveExecutionEvent{
+			Kind:      notificationport.LiveExecutionRecoveryProgress,
+			Operation: "recovery-operation",
+			Detail:    "requote_rebuild_simulate_best_exit · attempt 4",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.SendLiveExecution(
+		context.Background(),
+		notificationport.LiveExecutionEvent{
+			Kind:          notificationport.LiveExecutionRefuelCompleted,
+			Operation:     "refuel-operation",
+			SourceChain:   "Polygon",
+			Input:         "10 USDC",
+			Output:        "20 POL",
+			ExecutionCost: "0.01 POL",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 ||
+		!strings.Contains(messages[0], "LIVE · RECOVERING") ||
+		!strings.Contains(messages[0], "attempt 4") ||
+		!strings.Contains(messages[1], "GAS · REFUELED") ||
+		!strings.Contains(messages[1], "Polygon") {
+		t.Fatalf("messages=%q", messages)
+	}
+}
+
 func TestSenderPostsConciseLiveProgressAndFailureMessages(t *testing.T) {
 	var messages []string
 	sender, err := telegram.New(telegram.Config{

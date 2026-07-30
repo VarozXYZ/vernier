@@ -142,6 +142,73 @@ func TestAwaitDestinationBalanceVisibilityTimesOutWithoutDelta(t *testing.T) {
 	}
 }
 
+func TestAwaitEVMSourceBalanceVisibilityWaitsForFreshRPCBlock(t *testing.T) {
+	t.Parallel()
+
+	type observation struct {
+		balance *big.Int
+		block   uint64
+	}
+	observations := []observation{
+		{balance: big.NewInt(97), block: 100},
+		{balance: big.NewInt(97), block: 100},
+		{balance: big.NewInt(3_802), block: 101},
+	}
+	index := 0
+	balance, block, attempts, err :=
+		nttmanualcanary.AwaitEVMSourceBalanceVisibility(
+			context.Background(),
+			big.NewInt(3_800),
+			time.Second,
+			time.Millisecond,
+			func(context.Context) (*big.Int, uint64, error) {
+				observation := observations[index]
+				if index < len(observations)-1 {
+					index++
+				}
+				return new(big.Int).Set(observation.balance),
+					observation.block,
+					nil
+			},
+		)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 || block != 101 || balance.String() != "3802" {
+		t.Fatalf(
+			"attempts=%d block=%d balance=%s",
+			attempts,
+			block,
+			balance,
+		)
+	}
+}
+
+func TestAwaitEVMSourceBalanceVisibilityReportsStaleBlock(t *testing.T) {
+	t.Parallel()
+
+	_, block, attempts, err :=
+		nttmanualcanary.AwaitEVMSourceBalanceVisibility(
+			context.Background(),
+			big.NewInt(3_800),
+			8*time.Millisecond,
+			time.Millisecond,
+			func(context.Context) (*big.Int, uint64, error) {
+				return big.NewInt(97), 100, nil
+			},
+		)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"latest=97 required=3800 observed_block=100",
+		) {
+		t.Fatalf("attempts=%d block=%d error=%v", attempts, block, err)
+	}
+	if attempts < 2 || block != 100 {
+		t.Fatalf("attempts=%d block=%d", attempts, block)
+	}
+}
+
 func mustBigInt(t *testing.T, value string) *big.Int {
 	t.Helper()
 	result, ok := new(big.Int).SetString(value, 10)

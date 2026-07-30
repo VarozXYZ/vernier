@@ -284,6 +284,20 @@ func discover(
 	if err != nil {
 		return discoveredSetup{}, err
 	}
+	if live.GasRefuel.Enabled {
+		refuelTarget, refuelErr := discoverKyberRefuelTarget(
+			ctx,
+			research,
+			*evmMarket,
+			owner,
+			probeAmount,
+			lookup,
+		)
+		if refuelErr != nil {
+			return discoveredSetup{}, refuelErr
+		}
+		targets = append(targets, refuelTarget)
+	}
 	nttPath := filepath.Join(filepath.Dir(manifestPath), live.BaseBridgeProfile)
 	nttTarget, err := nttmanualcanary.LoadEVMApprovalTarget(nttPath)
 	if err != nil {
@@ -321,6 +335,56 @@ func discover(
 		ChainID: new(big.Int).Set(evmChain.ChainID),
 		RPCURL:  endpoints[evmMarket.Chain], Targets: targets,
 		ProbeAmount: probeAmount,
+	}, nil
+}
+
+func discoverKyberRefuelTarget(
+	ctx context.Context,
+	config configuration.ParsedConfig,
+	configured configuration.ResolvedMarket,
+	owner common.Address,
+	quoteAmount *big.Int,
+	lookup configuration.LookupEnv,
+) (Target, error) {
+	const nativePseudoAddress = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+	sourceConfig, ok := config.QuoteSources[configured.QuoteSource]
+	if !ok || sourceConfig.Kind != "kyberswap" {
+		return Target{}, fmt.Errorf("EVM refuel market requires KyberSwap")
+	}
+	clientID, err := requiredEnv(lookup, sourceConfig.ClientIDEnv)
+	if err != nil {
+		return Target{}, err
+	}
+	source, err := kyberswap.New(kyberswap.Config{
+		BaseURL: sourceConfig.BaseURL, ClientID: clientID,
+		Timeout: 15 * time.Second,
+	})
+	if err != nil {
+		return Target{}, err
+	}
+	route, err := source.Route(ctx, kyberswap.RouteRequest{
+		Chain:   sourceConfig.ChainSlug,
+		TokenIn: configured.Quote.AddressText, TokenOut: nativePseudoAddress,
+		AmountIn: quoteAmount.String(), Origin: owner.Hex(),
+	})
+	if err != nil {
+		return Target{}, fmt.Errorf("discover KyberSwap refuel router: %w", err)
+	}
+	built, err := source.Build(ctx, kyberswap.BuildRequest{
+		Route: route, Sender: owner.Hex(), Recipient: owner.Hex(),
+		Origin: owner.Hex(), SlippageBPS: 20, EnableGasEstimation: false,
+	})
+	if err != nil {
+		return Target{}, fmt.Errorf("discover KyberSwap refuel spender: %w", err)
+	}
+	if !common.IsHexAddress(built.RouterAddress) {
+		return Target{}, fmt.Errorf("KyberSwap returned an invalid refuel router")
+	}
+	return Target{
+		Token:       configured.Quote.Address,
+		TokenSymbol: configured.Quote.Token.Symbol,
+		Spender:     common.HexToAddress(built.RouterAddress),
+		Purposes:    []string{"kyberswap_gas_refuel"},
 	}, nil
 }
 

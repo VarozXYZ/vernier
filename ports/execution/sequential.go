@@ -114,6 +114,65 @@ type SequentialJournal interface {
 	ActiveSequentialOperation(context.Context) (domainexecution.SequentialOperation, bool, error)
 }
 
+type SequentialTransactionRecord struct {
+	Operation           domainexecution.OperationID
+	Ordinal             int
+	Phase               string
+	Identity            domainexecution.TransactionIdentity
+	Status              string
+	LastError           string
+	PreparedAt          time.Time
+	UpdatedAt           time.Time
+	FirstUncertainAt    time.Time
+	RecoveryReason      string
+	RecoveryAttempts    int
+	NextRecoveryAttempt time.Time
+}
+
+type SequentialRecoverySnapshot struct {
+	Operation    domainexecution.SequentialOperation
+	Plan         domainexecution.SequentialPlan
+	Transactions []SequentialTransactionRecord
+	Settlements  []domainexecution.SequentialStageSettlement
+	Costs        []domainexecution.CostComponent
+	ExitDecision *domainexecution.SequentialExitDecision
+}
+
+type SequentialRecoveryAttempt struct {
+	Operation domainexecution.OperationID
+	Ordinal   int
+	Action    string
+	Reason    string
+	Detail    string
+	Attempt   int
+	CreatedAt time.Time
+	RetryAt   time.Time
+}
+
+// SequentialRecoveryJournal is implemented by production journals. Creation
+// of an operation and its neutral execution plan must be one durable commit.
+type SequentialRecoveryJournal interface {
+	CreateRecoverableSequentialOperation(
+		context.Context,
+		domainexecution.SequentialOperation,
+		domainexecution.SequentialPlan,
+	) error
+	LoadSequentialRecovery(
+		context.Context,
+		domainexecution.OperationID,
+	) (SequentialRecoverySnapshot, error)
+	SetSequentialRecoveryState(
+		context.Context,
+		domainexecution.OperationID,
+		domainexecution.SequentialOperationState,
+		error,
+	) error
+	RecordSequentialRecoveryAttempt(
+		context.Context,
+		SequentialRecoveryAttempt,
+	) error
+}
+
 type SequentialResultJournal interface {
 	RecordSequentialResult(context.Context, SequentialResult) error
 }
@@ -140,6 +199,72 @@ type SequentialStageDriver interface {
 		domainexecution.SequentialStageRequest,
 		SequentialJournal,
 	) (domainexecution.SequentialStageSettlement, error)
+}
+
+// SequentialRecoveryDriver resumes a stage from durable transaction
+// identities. Implementations must reconcile every possibly-broadcast
+// identity before constructing a replacement.
+type SequentialRecoveryDriver interface {
+	RecoverStage(
+		context.Context,
+		domainexecution.SequentialStageRequest,
+		[]SequentialTransactionRecord,
+		SequentialJournal,
+	) (domainexecution.SequentialStageSettlement, error)
+}
+
+type RecoveryFailureKind string
+
+const (
+	RecoveryFailureUncertain          RecoveryFailureKind = "uncertain"
+	RecoveryFailureTemporary          RecoveryFailureKind = "temporary"
+	RecoveryFailureStaleArtifact      RecoveryFailureKind = "stale_artifact"
+	RecoveryFailureBalanceMismatch    RecoveryFailureKind = "balance_mismatch"
+	RecoveryFailureAllowance          RecoveryFailureKind = "allowance"
+	RecoveryFailureSigner             RecoveryFailureKind = "signer"
+	RecoveryFailureConfiguration      RecoveryFailureKind = "configuration"
+	RecoveryFailureFeeCap             RecoveryFailureKind = "fee_cap"
+	RecoveryFailureInsufficientNative RecoveryFailureKind = "insufficient_native"
+)
+
+type RecoveryError struct {
+	Kind RecoveryFailureKind
+	Err  error
+}
+
+func (e *RecoveryError) Error() string {
+	if e == nil || e.Err == nil {
+		return "sequential recovery failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *RecoveryError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func NewRecoveryError(kind RecoveryFailureKind, err error) error {
+	if err == nil {
+		err = errors.New("sequential recovery failed")
+	}
+	return &RecoveryError{Kind: kind, Err: err}
+}
+
+func RecoveryKind(err error) RecoveryFailureKind {
+	if err == nil {
+		return ""
+	}
+	var recoveryErr *RecoveryError
+	if errors.As(err, &recoveryErr) {
+		return recoveryErr.Kind
+	}
+	if ErrorDisposition(err) == DispositionPossible {
+		return RecoveryFailureUncertain
+	}
+	return RecoveryFailureTemporary
 }
 
 // SequentialPreflight validates all dependent swap legs before the first

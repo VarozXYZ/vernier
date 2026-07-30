@@ -45,12 +45,19 @@ type ConfigurationWarningSender interface {
 type LiveExecutionEventKind string
 
 const (
-	LiveExecutionStarted        LiveExecutionEventKind = "started"
-	LiveExecutionStageStarted   LiveExecutionEventKind = "stage_started"
-	LiveExecutionStageCompleted LiveExecutionEventKind = "stage_completed"
-	LiveExecutionExitSelected   LiveExecutionEventKind = "exit_selected"
-	LiveExecutionCompleted      LiveExecutionEventKind = "completed"
-	LiveExecutionFailed         LiveExecutionEventKind = "failed"
+	LiveExecutionStarted           LiveExecutionEventKind = "started"
+	LiveExecutionStageStarted      LiveExecutionEventKind = "stage_started"
+	LiveExecutionStageCompleted    LiveExecutionEventKind = "stage_completed"
+	LiveExecutionExitSelected      LiveExecutionEventKind = "exit_selected"
+	LiveExecutionCompleted         LiveExecutionEventKind = "completed"
+	LiveExecutionFailed            LiveExecutionEventKind = "failed"
+	LiveExecutionRecoveryStarted   LiveExecutionEventKind = "recovery_started"
+	LiveExecutionRecoveryProgress  LiveExecutionEventKind = "recovery_progress"
+	LiveExecutionRecoveryCompleted LiveExecutionEventKind = "recovery_completed"
+	LiveExecutionRecoveryBlocked   LiveExecutionEventKind = "recovery_blocked"
+	LiveExecutionRefuelCompleted   LiveExecutionEventKind = "refuel_completed"
+	LiveExecutionRefuelFailed      LiveExecutionEventKind = "refuel_failed"
+	LiveExecutionRefuelUncertain   LiveExecutionEventKind = "refuel_uncertain"
 )
 
 // LiveExecutionEvent contains only concise operational evidence suitable for
@@ -93,4 +100,26 @@ type LiveExecutionEvent struct {
 
 type LiveExecutionSender interface {
 	SendLiveExecution(context.Context, LiveExecutionEvent) error
+}
+
+type LiveRuntimeEventKind string
+
+const (
+	LiveRuntimeStarted LiveRuntimeEventKind = "started"
+	LiveRuntimeStopped LiveRuntimeEventKind = "stopped"
+)
+
+// LiveRuntimeEvent reports only process lifecycle state. It deliberately
+// excludes setup identifiers, account addresses, endpoints, and credentials.
+type LiveRuntimeEvent struct {
+	Kind       LiveRuntimeEventKind
+	Mode       string
+	Reason     string
+	StartedAt  time.Time
+	OccurredAt time.Time
+	Uptime     time.Duration
+}
+
+type LiveRuntimeSender interface {
+	SendLiveRuntime(context.Context, LiveRuntimeEvent) error
 }

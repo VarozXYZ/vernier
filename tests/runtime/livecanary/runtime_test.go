@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/big"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
+	notificationport "github.com/VarozXYZ/vernier/ports/notification"
 	"github.com/VarozXYZ/vernier/runtime/livecanary"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
 )
@@ -48,6 +50,81 @@ func (successfulExecutor) Execute(
 	return executionport.SequentialResult{
 		Operation: operation, FinalAmount: plan.InitialInput,
 	}, nil
+}
+
+type failingStream struct{ err error }
+
+func (s failingStream) RunStream(
+	context.Context,
+	livecompare.StreamOptions,
+) error {
+	return s.err
+}
+
+func TestRuntimeReportsStartupAndFailureShutdown(t *testing.T) {
+	ctx := context.Background()
+	manager, err := livecanary.NewManagerWithLimit(
+		ctx,
+		livecanary.Planner{
+			MarketChains: map[market.MarketID]market.ChainID{
+				"market-a": "chain-a", "market-b": "chain-b",
+			},
+			ExecutionUnits: big.NewInt(1_000_000),
+		},
+		successfulExecutor{},
+		1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(
+		filepath.Join(t.TempDir(), "opportunities.sqlite"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := livecanary.NewRuntime(
+		failingStream{err: errors.New("synthetic stream failure")},
+		manager,
+		store,
+		nil,
+		io.Discard,
+		notifier,
+		nil,
+		true,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runErr := runtime.Run(ctx)
+	if runErr == nil || !strings.Contains(runErr.Error(), "synthetic stream failure") {
+		t.Fatalf("run error=%v", runErr)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.lifecycle) != 2 {
+		t.Fatalf("lifecycle events=%d, want 2", len(sender.lifecycle))
+	}
+	if sender.lifecycle[0].Kind != notificationport.LiveRuntimeStarted ||
+		sender.lifecycle[0].Mode != "live" {
+		t.Fatalf("unexpected startup event: %+v", sender.lifecycle[0])
+	}
+	stopped := sender.lifecycle[1]
+	if stopped.Kind != notificationport.LiveRuntimeStopped ||
+		!strings.Contains(stopped.Reason, "runtime error: synthetic stream failure") ||
+		stopped.Uptime < 0 {
+		t.Fatalf("unexpected shutdown event: %+v", stopped)
+	}
 }
 
 func TestProductionRuntimeContinuesAndReevaluatesAfterCompletion(t *testing.T) {

@@ -47,6 +47,7 @@ type FlowCostOracle struct {
 	clock      func() time.Time
 	logger     *slog.Logger
 	onReady    func()
+	gate       interface{ EvaluationAllowed() bool }
 
 	mu          sync.RWMutex
 	cache       map[arbitrage.Direction]cachedFlowCost
@@ -65,6 +66,7 @@ type FlowCostOracleConfig struct {
 	Clock           func() time.Time
 	Logger          *slog.Logger
 	OnReady         func()
+	Gate            interface{ EvaluationAllowed() bool }
 }
 
 func NewFlowCostOracle(config FlowCostOracleConfig) (*FlowCostOracle, error) {
@@ -96,6 +98,7 @@ func NewFlowCostOracle(config FlowCostOracleConfig) (*FlowCostOracle, error) {
 		refresh: config.Refresh, interval: config.RefreshInterval,
 		ttl: config.TTL, clock: config.Clock, logger: config.Logger,
 		onReady:    config.OnReady,
+		gate:       config.Gate,
 		cache:      make(map[arbitrage.Direction]cachedFlowCost, len(directions)),
 		refreshNow: make(chan struct{}, 1),
 	}, nil
@@ -121,6 +124,9 @@ func (o *FlowCostOracle) Run(ctx context.Context) {
 }
 
 func (o *FlowCostOracle) runRefresh(ctx context.Context) {
+	if o.gate != nil && !o.gate.EvaluationAllowed() {
+		return
+	}
 	refreshCtx, cancel := context.WithTimeout(ctx, o.interval)
 	err := o.refreshOnce(refreshCtx)
 	cancel()

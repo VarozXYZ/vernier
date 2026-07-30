@@ -38,6 +38,16 @@ type StreamOptions struct {
 	// definitively rejected first Live transaction and is ignored by local
 	// pool streams.
 	ReevaluationRequests <-chan time.Time
+	// EvaluationGate keeps feeds and local mirrors live while suppressing
+	// remote quotes, window transitions and reports during execution or
+	// maintenance. A newly opened gate is edge-triggered through
+	// EvaluationChanges.
+	EvaluationGate EvaluationGate
+}
+
+type EvaluationGate interface {
+	EvaluationAllowed() bool
+	EvaluationChanges() <-chan struct{}
 }
 
 // ReferenceReport is emitted independently from the local report. This keeps

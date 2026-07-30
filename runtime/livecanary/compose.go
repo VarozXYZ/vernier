@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	geth "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -42,6 +44,13 @@ import (
 
 const jupiterBuildBaseURL = "https://api.jup.ag"
 
+const (
+	solanaNativeTokenID    market.TokenID = "live_native_solana"
+	evmNativeTokenID       market.TokenID = "live_native_evm"
+	solanaNativeMint                      = "So11111111111111111111111111111111111111112"
+	evmNativePseudoAddress                = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+)
+
 type ComposeConfig struct {
 	ManifestPath     string
 	Research         configuration.ParsedConfig
@@ -50,12 +59,13 @@ type ComposeConfig struct {
 	Logger           *slog.Logger
 	Output           io.Writer
 	ObserveCostsOnly bool
+	RefuelOnly       bool
 	ForcedCanary     ForcedCanaryDirection
 }
 
-// ComposeArmed builds the signer-enabled sequential runtime. It performs only
-// startup reads and connection warming; it cannot broadcast until Run receives
-// a policy-qualified opportunity from Research.
+// ComposeArmed builds the signer-enabled sequential runtime. Normal execution
+// cannot broadcast until Run receives a qualified opportunity; the explicit
+// RefuelOnce path has its own arm barrier.
 func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err error) {
 	if strings.TrimSpace(config.ManifestPath) == "" || config.LookupEnv == nil ||
 		config.Output == nil ||
@@ -287,13 +297,6 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		return nil, err
 	}
 	cleanup = append(cleanup, func() { _ = journal.Close() })
-	if active, found, activeErr := journal.ActiveSequentialOperation(ctx); activeErr != nil {
-		return nil, activeErr
-	} else if found {
-		return nil, fmt.Errorf(
-			"operation %s requires reconciliation before Live can start", active.ID,
-		)
-	}
 
 	acrossClient, err := across.New(across.Config{
 		APIKey:       mustLookup(config.LookupEnv, "ACROSS_API_KEY"),
@@ -406,13 +409,18 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		{BuyMarket: solanaMarket.ID, SellMarket: evmMarket.ID},
 		{BuyMarket: evmMarket.ID, SellMarket: solanaMarket.ID},
 	}
+	runtimeGate := NewRuntimeGate()
 	reevaluate := make(chan time.Time, 1)
 	flowCosts, err := NewFlowCostOracle(FlowCostOracleConfig{
 		Directions: directions,
 		QuoteAsset: solanaMarket.Quote.Token.Asset,
 		Refresh:    flowRefresh, RefreshInterval: config.Live.CostRefreshInterval,
 		TTL: config.Live.CostCacheTTL, Clock: time.Now, Logger: config.Logger,
+		Gate: runtimeGate,
 		OnReady: func() {
+			if !runtimeGate.EvaluationAllowed() {
+				return
+			}
 			select {
 			case reevaluate <- time.Now().UTC():
 			default:
@@ -422,7 +430,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
-	if forcedDirection == nil {
+	if forcedDirection == nil && !config.RefuelOnly {
 		go flowCosts.Run(ctx)
 		runnerOptions.DirectionalCosts = flowCosts
 	}
@@ -430,7 +438,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
-	if forcedDirection == nil {
+	if forcedDirection == nil && !config.RefuelOnly {
 		costWarmTimeout := 2 * config.Live.CostRefreshInterval
 		if costWarmTimeout < 30*time.Second {
 			costWarmTimeout = 30 * time.Second
@@ -467,26 +475,87 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		ArtifactMaxAge:  config.Live.BuildToBroadcastTimeout,
 		Output:          config.Output, Costs: costValuator,
 	}
+	drivers := executionport.DriverSet{
+		Buy: swapDriver,
+		BridgeBase: &BridgeDriver{
+			Stage: execution.StageBridgeBase, Provider: baseBridge,
+			Costs: costValuator,
+		},
+		Sell: swapDriver,
+		BridgeQuoteReturn: &BridgeDriver{
+			Stage: execution.StageBridgeQuoteReturn, Provider: quoteBridge,
+			Costs: costValuator,
+		},
+		ExitSelector: swapDriver,
+	}
 	executor, err := saga.NewSequentialExecutorWithObserver(
 		journal,
-		executionport.DriverSet{
-			Buy: swapDriver,
-			BridgeBase: &BridgeDriver{
-				Stage: execution.StageBridgeBase, Provider: baseBridge,
-				Costs: costValuator,
-			},
-			Sell: swapDriver,
-			BridgeQuoteReturn: &BridgeDriver{
-				Stage: execution.StageBridgeQuoteReturn, Provider: quoteBridge,
-				Costs: costValuator,
-			},
-			ExitSelector: swapDriver,
-		},
+		drivers,
 		time.Now,
 		progressObserver,
 	)
 	if err != nil {
 		return nil, err
+	}
+	recovery, err := saga.NewSequentialRecoveryCoordinator(
+		saga.SequentialRecoveryConfig{
+			Journal: journal, RecoveryJournal: journal,
+			Drivers: drivers, Clock: time.Now,
+			Observer:         NewRecoveryObserver(liveNotifier, time.Now),
+			UncertainTimeout: 10 * time.Minute,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	var refuelService *RefuelService
+	if config.Live.GasRefuel.Enabled {
+		solanaRefuel, refuelErr := NewSwapRefuelExecutor(
+			SwapRefuelExecutorConfig{
+				Chain:       market.ChainID(solanaChain),
+				Market:      solanaMarket.ID,
+				Account:     solanaBinding.Account,
+				QuoteToken:  solanaMarket.Quote.Token,
+				NativeToken: solanaBinding.NativeToken,
+				NativeAsset: solanaBinding.NativeToken.Asset,
+				Binding:     solanaBinding,
+				Network:     solanaBinding.RefuelNetwork,
+				Prices:      costValuator, Clock: time.Now,
+				ConfirmTimeout: config.Live.ConfirmationTimeout,
+			},
+		)
+		if refuelErr != nil {
+			return nil, refuelErr
+		}
+		evmRefuel, refuelErr := NewSwapRefuelExecutor(
+			SwapRefuelExecutorConfig{
+				Chain:       market.ChainID(evmChain),
+				Market:      evmMarket.ID,
+				Account:     evmBinding.Account,
+				QuoteToken:  evmMarket.Quote.Token,
+				NativeToken: evmBinding.NativeToken,
+				NativeAsset: evmBinding.NativeToken.Asset,
+				Binding:     evmBinding,
+				Network:     evmBinding.RefuelNetwork,
+				Prices:      costValuator, Clock: time.Now,
+				ConfirmTimeout: config.Live.ConfirmationTimeout,
+			},
+		)
+		if refuelErr != nil {
+			return nil, refuelErr
+		}
+		refuelService, err = NewRefuelService(
+			config.Live.GasRefuel,
+			runtimeGate,
+			journal,
+			[]executionport.RefuelExecutor{solanaRefuel, evmRefuel},
+			liveNotifier,
+			time.Now,
+		)
+		if err != nil {
+			return nil, err
+		}
+		recovery.SetEmergencyRefuel(refuelService.EmergencyRefuel)
 	}
 	executionUnits, err := amountUnits(
 		config.Live.ExecutionInput,
@@ -522,14 +591,17 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := NewRuntime(
+	runtime, err := NewRuntimeWithGate(
 		runner, manager, opportunityStore, cleanup, config.Output, liveNotifier,
-		reevaluate, !config.ObserveCostsOnly, forcedDirection,
+		reevaluate, !config.ObserveCostsOnly, forcedDirection, runtimeGate,
 	)
 	if err != nil {
 		_ = opportunityStore.Close()
 		return nil, err
 	}
+	runtime.SetPostFlowRefresh(flowCosts.Warm)
+	runtime.SetRecovery(recovery)
+	runtime.SetRefuel(refuelService)
 	keep = true
 	return runtime, nil
 }
@@ -566,6 +638,7 @@ func composeSolanaSwap(
 	mints := map[market.TokenID]string{
 		configured.Base.Token.ID:  configured.Base.AddressText,
 		configured.Quote.Token.ID: configured.Quote.AddressText,
+		solanaNativeTokenID:       solanaNativeMint,
 	}
 	quoteClient, err := jupiter.NewQuoteSource(jupiter.QuoteConfig{
 		ID:      market.SourceID("jupiter/live-exit-quote"),
@@ -623,6 +696,21 @@ func composeSolanaSwap(
 	})
 	if err != nil {
 		return SwapBinding{}, err
+	}
+	var refuelValidator executionport.Validator = validator
+	if config.Live.GasRefuel.Enabled {
+		refuelValidator, err = jupiter.NewBuildSource(jupiter.BuildConfig{
+			ID: "jupiter/gas-refuel", BaseURL: jupiterBuildBaseURL,
+			Taker: privateKey.PublicKey().String(), APIKeys: keys,
+			TokenMints:             mints,
+			SlippageBPS:            config.Live.GasRefuel.SlippageBPS,
+			MaxAccounts:            source.MaxAccounts,
+			ComputePricePercentile: config.Live.ComputeUnitPricePercentile,
+			BlockhashSlotsToExpiry: config.Live.BlockhashSlotsToExpiry,
+		})
+		if err != nil {
+			return SwapBinding{}, err
+		}
 	}
 	decoder, err := solanaadapter.NewSPLBalanceDecoder(
 		solanaadapter.SPLBalanceDecoderConfig{
@@ -690,8 +778,54 @@ func composeSolanaSwap(
 	}
 	return SwapBinding{
 		Account: execution.AccountID(account.ID), Validator: validator,
-		Estimator: estimator, TxManager: manager,
+		RefuelValidator: refuelValidator,
+		Estimator:       estimator, TxManager: manager,
 		Confirmation: confirmationSource,
+		SpendableBalance: SpendableBalanceReaderFunc(func(
+			balanceCtx context.Context,
+			token market.TokenID,
+		) (*big.Int, error) {
+			mintText, exists := mints[token]
+			if !exists {
+				return nil, fmt.Errorf(
+					"solana spendable token mapping is unavailable",
+				)
+			}
+			mint, err := solanago.PublicKeyFromBase58(mintText)
+			if err != nil {
+				return nil, err
+			}
+			ata, _, err := solanago.FindAssociatedTokenAddress(
+				privateKey.PublicKey(),
+				mint,
+			)
+			if err != nil {
+				return nil, err
+			}
+			accountState, err := network.ReadAccount(
+				balanceCtx,
+				ata.String(),
+			)
+			if err != nil {
+				return nil, err
+			}
+			if len(accountState.Data) < 72 {
+				return new(big.Int), nil
+			}
+			return new(big.Int).SetUint64(
+				binary.LittleEndian.Uint64(accountState.Data[64:72]),
+			), nil
+		}),
+		RefuelNetwork: SolanaRefuelNetwork{
+			Network:                 network,
+			Address:                 privateKey.PublicKey().String(),
+			AdditionalDebitLamports: tip,
+		},
+		NativeToken: market.Token{
+			ID: solanaNativeTokenID, Asset: "sol",
+			Chain:    market.ChainID(configured.Chain),
+			Decimals: 9, Symbol: "SOL",
+		},
 	}, nil
 }
 
@@ -843,6 +977,7 @@ func composeEVMSwap(
 	tokens := map[market.TokenID]string{
 		configured.Base.Token.ID:  configured.Base.AddressText,
 		configured.Quote.Token.ID: configured.Quote.AddressText,
+		evmNativeTokenID:          evmNativePseudoAddress,
 	}
 	validator, err := kyberexecution.New(kyberexecution.Config{
 		ID: "kyberswap/live-build", ChainSlug: source.ChainSlug,
@@ -852,6 +987,19 @@ func composeEVMSwap(
 	})
 	if err != nil {
 		return fail(err)
+	}
+	var refuelValidator executionport.Validator = validator
+	if config.Live.GasRefuel.Enabled {
+		refuelValidator, err = kyberexecution.New(kyberexecution.Config{
+			ID: "kyberswap/gas-refuel", ChainSlug: source.ChainSlug,
+			Sender: sender, TokenAddresses: tokens,
+			SlippageBPS:         config.Live.GasRefuel.SlippageBPS,
+			EnableGasEstimation: true,
+			Source:              quoteSource, Simulator: primary, Clock: time.Now,
+		})
+		if err != nil {
+			return fail(err)
+		}
 	}
 	estimator := SwapQuoteEstimatorFunc(func(
 		quoteCtx context.Context,
@@ -924,8 +1072,92 @@ func composeEVMSwap(
 	}
 	return SwapBinding{
 		Account: execution.AccountID(account.ID), Validator: validator,
-		Estimator: estimator, TxManager: manager,
+		RefuelValidator: refuelValidator,
+		Estimator:       estimator, TxManager: manager,
 		NonceCoordinator: manager,
+		SpendableBalance: SpendableBalanceReaderFunc(func(
+			balanceCtx context.Context,
+			token market.TokenID,
+		) (*big.Int, error) {
+			tokenText, exists := tokens[token]
+			if !exists || !common.IsHexAddress(tokenText) {
+				return nil, fmt.Errorf(
+					"EVM spendable token mapping is unavailable",
+				)
+			}
+			tokenAddress := common.HexToAddress(tokenText)
+			selector := gethcrypto.Keccak256(
+				[]byte("balanceOf(address)"),
+			)[:4]
+			payload := append(
+				append([]byte(nil), selector...),
+				common.LeftPadBytes(sender.Bytes(), 32)...,
+			)
+			raw, err := primary.CallContract(
+				balanceCtx,
+				geth.CallMsg{To: &tokenAddress, Data: payload},
+				nil,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if len(raw) != 32 {
+				return nil, fmt.Errorf(
+					"EVM balance response has %d bytes",
+					len(raw),
+				)
+			}
+			return new(big.Int).SetBytes(raw), nil
+		}),
+		Allowance: AllowanceReaderFunc(func(
+			allowanceCtx context.Context,
+			token market.TokenID,
+			spenderText string,
+		) (*big.Int, error) {
+			tokenText, exists := tokens[token]
+			if !exists || !common.IsHexAddress(tokenText) ||
+				!common.IsHexAddress(spenderText) {
+				return nil, fmt.Errorf(
+					"EVM allowance mapping is unavailable",
+				)
+			}
+			tokenAddress := common.HexToAddress(tokenText)
+			spender := common.HexToAddress(spenderText)
+			selector := gethcrypto.Keccak256(
+				[]byte("allowance(address,address)"),
+			)[:4]
+			payload := append(
+				append(
+					append([]byte(nil), selector...),
+					common.LeftPadBytes(sender.Bytes(), 32)...,
+				),
+				common.LeftPadBytes(spender.Bytes(), 32)...,
+			)
+			raw, err := primary.CallContract(
+				allowanceCtx,
+				geth.CallMsg{To: &tokenAddress, Data: payload},
+				nil,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if len(raw) != 32 {
+				return nil, fmt.Errorf(
+					"EVM allowance response has %d bytes",
+					len(raw),
+				)
+			}
+			return new(big.Int).SetBytes(raw), nil
+		}),
+		RefuelNetwork: EVMRefuelNetwork{
+			Client:  primary,
+			Address: sender,
+		},
+		NativeToken: market.Token{
+			ID: evmNativeTokenID, Asset: "pol",
+			Chain:    market.ChainID(configured.Chain),
+			Decimals: 18, Symbol: "POL",
+		},
 	}, closers, nil
 }
 

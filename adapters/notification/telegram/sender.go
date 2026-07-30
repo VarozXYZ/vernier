@@ -102,6 +102,40 @@ func (s *Sender) SendConfigurationWarning(ctx context.Context, warning notificat
 	return err
 }
 
+func (s *Sender) SendLiveRuntime(
+	ctx context.Context,
+	event notificationport.LiveRuntimeEvent,
+) error {
+	mode := strings.TrimSpace(event.Mode)
+	if mode == "" {
+		mode = "live"
+	}
+	occurredAt := event.OccurredAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	lines := []string{
+		"\U0001f7e2 <b>LIVE \u00b7 STARTED</b>",
+		"\U0001f4cc Mode: <b>" + escape(mode) + "</b>",
+		"\u23f1\ufe0f " + escape(occurredAt.UTC().Format("2006-01-02 15:04:05 UTC")),
+	}
+	if event.Kind == notificationport.LiveRuntimeStopped {
+		reason := strings.TrimSpace(event.Reason)
+		if reason == "" {
+			reason = "stopped"
+		}
+		lines = []string{
+			"\U0001f6d1 <b>LIVE \u00b7 STOPPED</b>",
+			"\U0001f4cc Mode: <b>" + escape(mode) + "</b>",
+			"\U0001f9ed Reason: " + escape(reason),
+			"\u23f3 Uptime: " + escape(compactDuration(event.Uptime)),
+			"\u23f1\ufe0f " + escape(occurredAt.UTC().Format("2006-01-02 15:04:05 UTC")),
+		}
+	}
+	_, err := s.send(ctx, strings.Join(lines, "\n"))
+	return err
+}
+
 func (s *Sender) SendLiveExecution(
 	ctx context.Context,
 	event notificationport.LiveExecutionEvent,
@@ -136,6 +170,7 @@ type liveMessageState struct {
 	starting  map[int]notificationport.LiveExecutionEvent
 	completed map[int]notificationport.LiveExecutionEvent
 	exit      *notificationport.LiveExecutionEvent
+	recovery  *notificationport.LiveExecutionEvent
 	terminal  *notificationport.LiveExecutionEvent
 }
 
@@ -159,6 +194,22 @@ func (s *liveMessageState) apply(event notificationport.LiveExecutionEvent) {
 		delete(s.starting, event.Ordinal)
 	case notificationport.LiveExecutionExitSelected:
 		s.exit = &copyOf
+	case notificationport.LiveExecutionRecoveryStarted,
+		notificationport.LiveExecutionRecoveryProgress,
+		notificationport.LiveExecutionRecoveryCompleted,
+		notificationport.LiveExecutionRecoveryBlocked:
+		s.recovery = &copyOf
+		if event.Kind == notificationport.LiveExecutionRecoveryBlocked {
+			s.terminal = &copyOf
+		} else {
+			// Recovery supersedes the original failed terminal state while
+			// retaining the already-rendered stage evidence.
+			s.terminal = nil
+		}
+	case notificationport.LiveExecutionRefuelCompleted,
+		notificationport.LiveExecutionRefuelFailed,
+		notificationport.LiveExecutionRefuelUncertain:
+		s.terminal = &copyOf
 	case notificationport.LiveExecutionCompleted, notificationport.LiveExecutionFailed:
 		s.terminal = &copyOf
 	}
@@ -190,6 +241,21 @@ func liveSummaryLines(state *liveMessageState) []string {
 					title = "\u26d4 <b>CANARY · ABORTED</b>"
 				}
 			}
+		case notificationport.LiveExecutionRecoveryBlocked:
+			title = "\U0001f6d1 <b>LIVE · RECOVERY BLOCKED</b>"
+		case notificationport.LiveExecutionRefuelCompleted:
+			title = "\u26fd <b>GAS · REFUELED</b>"
+		case notificationport.LiveExecutionRefuelFailed:
+			title = "\u26a0\ufe0f <b>GAS · REFUEL FAILED</b>"
+		case notificationport.LiveExecutionRefuelUncertain:
+			title = "\U0001f6d1 <b>GAS · OUTCOME UNKNOWN</b>"
+		}
+	} else if state.recovery != nil {
+		switch state.recovery.Kind {
+		case notificationport.LiveExecutionRecoveryCompleted:
+			title = "\u2705 <b>LIVE · RECOVERED</b>"
+		default:
+			title = "\U0001f6e1\ufe0f <b>LIVE · RECOVERING</b>"
 		}
 	}
 	lines := []string{title}
@@ -246,6 +312,29 @@ func liveSummaryLines(state *liveMessageState) []string {
 			state.terminal.Kind != notificationport.LiveExecutionCompleted ||
 			strings.Contains(state.exit.Evidence, "automatic_recovery")) {
 		lines = append(lines, exitDecisionLine(*state.exit))
+	}
+	if state.recovery != nil {
+		switch state.recovery.Kind {
+		case notificationport.LiveExecutionRecoveryStarted:
+			lines = append(
+				lines,
+				"\U0001f504 Recovery started · "+
+					escape(compactDetail(state.recovery.Detail)),
+			)
+		case notificationport.LiveExecutionRecoveryProgress:
+			lines = append(
+				lines,
+				"\u23f3 Recovery · "+
+					escape(compactDetail(state.recovery.Detail)),
+			)
+		case notificationport.LiveExecutionRecoveryCompleted:
+			lines = append(lines, "\u2705 Recovery completed")
+		case notificationport.LiveExecutionRecoveryBlocked:
+			lines = append(
+				lines,
+				"\U0001f6d1 "+escape(compactDetail(state.recovery.Detail)),
+			)
+		}
 	}
 	if state.terminal != nil {
 		lines = append(lines, terminalLines(*state.terminal)...)
@@ -328,7 +417,18 @@ func exitDecisionLine(event notificationport.LiveExecutionEvent) string {
 }
 
 func terminalLines(event notificationport.LiveExecutionEvent) []string {
-	if event.Kind == notificationport.LiveExecutionFailed {
+	if event.Kind == notificationport.LiveExecutionRefuelCompleted {
+		return compactLines(
+			"\U0001f4cd "+escape(event.SourceChain),
+			"\U0001f4b1 "+escape(compactLiveAmount(event.Input))+
+				" \u2192 <b>"+escape(compactLiveAmount(event.Output))+"</b>",
+			"\U0001f4b8 Fee · "+escape(compactLiveMoney(event.ExecutionCost)),
+		)
+	}
+	if event.Kind == notificationport.LiveExecutionFailed ||
+		event.Kind == notificationport.LiveExecutionRecoveryBlocked ||
+		event.Kind == notificationport.LiveExecutionRefuelFailed ||
+		event.Kind == notificationport.LiveExecutionRefuelUncertain {
 		return compactLines(
 			"\U0001f4cd "+escape(stageHeading(event))+" · "+
 				escape(chainPath(event)),
@@ -642,3 +742,4 @@ func escape(value string) string { return html.EscapeString(value) }
 var _ notificationport.OpeningSender = (*Sender)(nil)
 var _ notificationport.ConfigurationWarningSender = (*Sender)(nil)
 var _ notificationport.LiveExecutionSender = (*Sender)(nil)
+var _ notificationport.LiveRuntimeSender = (*Sender)(nil)

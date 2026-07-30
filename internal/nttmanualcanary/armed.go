@@ -56,15 +56,19 @@ type nttLiveResult struct {
 }
 
 type nttLiveHooks struct {
-	Request           domainexecution.SequentialStageRequest
-	Journal           executionport.SequentialJournal
-	Accounts          map[market.ChainID]domainexecution.AccountID
-	SolanaChain       market.ChainID
-	EVMChain          market.ChainID
-	SolanaNativeAsset market.AssetID
-	EVMNativeAsset    market.AssetID
-	NonceCoordinator  chainport.EVMNonceCoordinator
-	Result            *nttLiveResult
+	Request                  domainexecution.SequentialStageRequest
+	Journal                  executionport.SequentialJournal
+	OperationID              string
+	PhasePrefix              string
+	Accounts                 map[market.ChainID]domainexecution.AccountID
+	SolanaChain              market.ChainID
+	EVMChain                 market.ChainID
+	SolanaNativeAsset        market.AssetID
+	EVMNativeAsset           market.AssetID
+	NonceCoordinator         chainport.EVMNonceCoordinator
+	BalanceVisibilityTimeout time.Duration
+	BalancePollInterval      time.Duration
+	Result                   *nttLiveResult
 }
 
 func (h *nttLiveHooks) prepared(
@@ -76,10 +80,11 @@ func (h *nttLiveHooks) prepared(
 	if h == nil {
 		return nil
 	}
+	persistedPhase := strings.TrimSpace(h.PhasePrefix) + phase
 	identity.Account = h.Accounts[chain]
 	if err := h.Journal.RecordPreparedTransaction(ctx, executionport.PreparedTransaction{
 		Operation: h.Request.Operation, Ordinal: h.Request.Stage.Ordinal,
-		Phase: phase, Identity: identity, PreparedAt: time.Now().UTC(),
+		Phase: persistedPhase, Identity: identity, PreparedAt: time.Now().UTC(),
 	}); err != nil {
 		return err
 	}
@@ -103,7 +108,11 @@ func (h *nttLiveHooks) mark(
 		return nil
 	}
 	return h.Journal.MarkTransaction(
-		ctx, h.Request.Operation, h.Request.Stage.Ordinal, phase, status,
+		ctx,
+		h.Request.Operation,
+		h.Request.Stage.Ordinal,
+		strings.TrimSpace(h.PhasePrefix)+phase,
+		status,
 	)
 }
 
@@ -183,9 +192,15 @@ func executeArmed(
 		return err
 	}
 	defer store.Close()
-	operationID, err := newCanaryOperationID()
-	if err != nil {
-		return err
+	operationID := ""
+	if hooks != nil {
+		operationID = strings.TrimSpace(hooks.OperationID)
+	}
+	if operationID == "" {
+		operationID, err = newCanaryOperationID()
+		if err != nil {
+			return err
+		}
 	}
 	storedAmount := amountText
 	if storedAmount == "" {
@@ -926,20 +941,71 @@ func (r *armedRuntime) checkEVMSource(ctx context.Context, amount *big.Int) erro
 	if err != nil {
 		return err
 	}
-	rawBalance, err := r.evmRPC.CallContract(
-		ctx,
-		geth.CallMsg{To: &balanceCall.To, Data: balanceCall.Data},
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("query source EVM token balance: %w", err)
-	}
-	balance, err := wormholentt.DecodeTokenBalance(rawBalance)
-	if err != nil {
-		return err
-	}
-	if balance.Cmp(amount) < 0 {
-		return fmt.Errorf("EVM token balance %s is below amount %s", balance, amount)
+	var balance *big.Int
+	if r.liveHooks == nil {
+		rawBalance, callErr := r.evmRPC.CallContract(
+			ctx,
+			geth.CallMsg{To: &balanceCall.To, Data: balanceCall.Data},
+			nil,
+		)
+		if callErr != nil {
+			return fmt.Errorf("query source EVM token balance: %w", callErr)
+		}
+		balance, err = wormholentt.DecodeTokenBalance(rawBalance)
+		if err != nil {
+			return err
+		}
+		if balance.Cmp(amount) < 0 {
+			return fmt.Errorf(
+				"EVM token balance %s is below amount %s",
+				balance,
+				amount,
+			)
+		}
+	} else {
+		var observedBlock uint64
+		var attempts int
+		balance, observedBlock, attempts, err =
+			AwaitEVMSourceBalanceVisibility(
+				ctx,
+				amount,
+				r.liveHooks.BalanceVisibilityTimeout,
+				r.liveHooks.BalancePollInterval,
+				func(readCtx context.Context) (*big.Int, uint64, error) {
+					block, blockErr := r.evmRPC.BlockNumber(readCtx)
+					if blockErr != nil {
+						return nil, 0, blockErr
+					}
+					raw, callErr := r.evmRPC.CallContract(
+						readCtx,
+						geth.CallMsg{
+							To:   &balanceCall.To,
+							Data: balanceCall.Data,
+						},
+						new(big.Int).SetUint64(block),
+					)
+					if callErr != nil {
+						return nil, block, callErr
+					}
+					value, decodeErr :=
+						wormholentt.DecodeTokenBalance(raw)
+					return value, block, decodeErr
+				},
+			)
+		if err != nil {
+			return fmt.Errorf(
+				"wait for source EVM token balance visibility: %w",
+				err,
+			)
+		}
+		fmt.Fprintf(
+			r.output,
+			"ntt_readiness phase=source_balance_visible chain=evm attempts=%d observed_block=%d token_balance=%s required_units=%s\n",
+			attempts,
+			observedBlock,
+			balance,
+			amount,
+		)
 	}
 	allowanceCall, err := r.evmAdapter.BuildAllowanceCall(sender)
 	if err != nil {

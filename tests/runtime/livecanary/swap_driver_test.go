@@ -1,6 +1,7 @@
 package livecanary_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math/big"
@@ -216,6 +217,37 @@ func (v failingValidator) Validate(
 	executionport.ValidationRequest,
 ) (executionport.Artifact, error) {
 	return executionport.Artifact{}, v.err
+}
+
+type retryingValidator struct {
+	now    time.Time
+	output *big.Int
+	err    error
+	calls  int
+}
+
+func (v *retryingValidator) Validate(
+	_ context.Context,
+	request executionport.ValidationRequest,
+) (executionport.Artifact, error) {
+	v.calls++
+	if v.calls == 1 {
+		return executionport.Artifact{}, v.err
+	}
+	output, _ := market.NewTokenAmount(
+		request.Leg.ExpectedOutput.Token(),
+		v.output,
+	)
+	quote, _ := market.NewQuote(market.Quote{
+		Source: "validator", Market: request.Leg.Market, SnapshotVersion: 1,
+		Purpose: market.QuotePurposeLiveValidation,
+		Mode:    market.QuoteModeExactInput, Quality: market.QuoteQualityExact,
+		AmountIn: request.Leg.Input, AmountOut: output, QuotedAt: v.now,
+	})
+	return executionport.Artifact{
+		Leg: request.Leg, ValidatedQuote: quote,
+		Metadata: map[string]string{"kind": "test"}, BuiltAt: v.now,
+	}, nil
 }
 
 type fixedQuoteEstimator struct {
@@ -909,6 +941,7 @@ func TestSwapDriverReturnsToOriginWhenDestinationLiquidationIsUnavailable(t *tes
 	now := time.Now().UTC()
 	plan := preflightPlan(t, now)
 	returnManager := &settledTxManager{}
+	var output bytes.Buffer
 	returnCost, _ := market.NewAssetQuantity(
 		"quote", big.NewRat(1, 100),
 	)
@@ -941,7 +974,8 @@ func TestSwapDriverReturnsToOriginWhenDestinationLiquidationIsUnavailable(t *tes
 				execution.ExitReturnToOrigin: returnCost,
 			},
 		},
-		Clock: func() time.Time { return now },
+		Clock:  func() time.Time { return now },
+		Output: &output,
 	}
 	bridged, _ := market.NewTokenAmount(
 		"base-b", big.NewInt(4_000_000_000_000_000_000),
@@ -956,6 +990,82 @@ func TestSwapDriverReturnsToOriginWhenDestinationLiquidationIsUnavailable(t *tes
 		!decision.DestinationOutput.IsZero() ||
 		decision.ReturnOutput.IsZero() {
 		t.Fatalf("unexpected forced-return decision: %+v", decision)
+	}
+	logged := output.String()
+	if strings.Count(logged, "status=failed") != 2 ||
+		!strings.Contains(logged, "quote/build preparation: route unavailable") ||
+		!strings.Contains(logged, "status=unavailable attempts=2") {
+		t.Fatalf("destination failure detail was not logged:\n%s", logged)
+	}
+}
+
+func TestSwapDriverRetriesDestinationQuoteBeforeReturningToOrigin(t *testing.T) {
+	now := time.Now().UTC()
+	plan := preflightPlan(t, now)
+	validator := &retryingValidator{
+		now: now, output: big.NewInt(1_100_000),
+		err: errors.New("temporary quote failure"),
+	}
+	destinationManager := &settledTxManager{}
+	returnEstimator := &fixedQuoteEstimator{output: big.NewInt(980_000)}
+	cost, _ := market.NewAssetQuantity("quote", big.NewRat(1, 100))
+	var output bytes.Buffer
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account",
+				Validator: &fixedOutputValidator{
+					now: now, output: big.NewInt(980_000),
+				},
+				Estimator: returnEstimator,
+				TxManager: &settledTxManager{},
+			},
+			"market-b": {
+				Account: "account", Validator: validator,
+				TxManager: destinationManager,
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9,
+			"base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8, QuoteAsset: "quote",
+		MinimumNet: new(big.Rat), ReturnMargin: new(big.Rat),
+		ExitCosts: fixedExitCostSource{
+			costs: map[execution.SequentialExitRoute]market.AssetQuantity{
+				execution.ExitSellAtDestination: cost,
+				execution.ExitReturnToOrigin:    cost,
+			},
+		},
+		Clock:  func() time.Time { return now },
+		Output: &output,
+	}
+	bridged, _ := market.NewTokenAmount(
+		"base-b", big.NewInt(4_000_000_000_000_000_000),
+	)
+	decision, err := driver.SelectRecoveryExit(
+		context.Background(), "operation", plan, bridged, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validator.calls != 2 ||
+		destinationManager.simulations != 1 ||
+		decision.Route != execution.ExitSellAtDestination {
+		t.Fatalf(
+			"calls=%d simulations=%d decision=%+v",
+			validator.calls,
+			destinationManager.simulations,
+			decision,
+		)
+	}
+	logged := output.String()
+	if !strings.Contains(
+		logged,
+		`status=failed attempt=1/2 error="quote/build preparation: temporary quote failure"`,
+	) ||
+		!strings.Contains(logged, "status=ready attempt=2/2") {
+		t.Fatalf("retry detail was not logged:\n%s", logged)
 	}
 }
 

@@ -5,6 +5,7 @@ package crosschain
 
 import (
 	"context"
+	"math/big"
 	"time"
 
 	"github.com/VarozXYZ/vernier/domain/execution"
@@ -51,19 +52,34 @@ type AttestationSource interface {
 // destination, but must record every prepared identity through the supplied
 // journal before broadcasting it.
 type LiveTransferResult struct {
-	ActualInput         market.TokenAmount
-	ActualOutput        market.TokenAmount
-	Costs               []execution.CostComponent
-	SourceIdentity      execution.TransactionIdentity
-	DestinationIdentity execution.TransactionIdentity
-	ObservedAt          time.Time
-	Evidence            string
+	ActualInput              market.TokenAmount
+	ActualOutput             market.TokenAmount
+	Costs                    []execution.CostComponent
+	SourceIdentity           execution.TransactionIdentity
+	DestinationIdentity      execution.TransactionIdentity
+	DestinationBalanceBefore *big.Int
+	DestinationBalanceAfter  *big.Int
+	ObservedAt               time.Time
+	Evidence                 string
 }
 
 type LiveTransferService interface {
 	Transfer(
 		context.Context,
 		execution.SequentialStageRequest,
+		executionport.SequentialJournal,
+	) (LiveTransferResult, error)
+}
+
+// RecoverableLiveTransferService resumes a bridge from its outer saga's
+// durable transaction identities. It must never emit a second source
+// transfer while the original source outcome is unknown or confirmed.
+type RecoverableLiveTransferService interface {
+	LiveTransferService
+	RecoverTransfer(
+		context.Context,
+		execution.SequentialStageRequest,
+		[]executionport.SequentialTransactionRecord,
 		executionport.SequentialJournal,
 	) (LiveTransferResult, error)
 }

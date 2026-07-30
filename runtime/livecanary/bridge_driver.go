@@ -3,6 +3,7 @@ package livecanary
 import (
 	"context"
 	"fmt"
+	"math/big"
 
 	"github.com/VarozXYZ/vernier/domain/execution"
 	crosschainport "github.com/VarozXYZ/vernier/ports/crosschain"
@@ -40,9 +41,11 @@ func (d *BridgeDriver) ExecuteStage(
 	settlement := execution.SequentialStageSettlement{
 		Request: request, ActualInput: result.ActualInput,
 		ActualOutput: result.ActualOutput, Costs: valuedCosts,
-		SourceIdentity:      result.SourceIdentity,
-		DestinationIdentity: &result.DestinationIdentity,
-		ObservedAt:          result.ObservedAt, Evidence: result.Evidence,
+		SourceIdentity:           result.SourceIdentity,
+		DestinationIdentity:      &result.DestinationIdentity,
+		DestinationBalanceBefore: cloneBigInt(result.DestinationBalanceBefore),
+		DestinationBalanceAfter:  cloneBigInt(result.DestinationBalanceAfter),
+		ObservedAt:               result.ObservedAt, Evidence: result.Evidence,
 	}
 	if err := settlement.Validate(); err != nil {
 		return execution.SequentialStageSettlement{},
@@ -51,4 +54,62 @@ func (d *BridgeDriver) ExecuteStage(
 	return settlement, nil
 }
 
+func (d *BridgeDriver) RecoverStage(
+	ctx context.Context,
+	request execution.SequentialStageRequest,
+	transactions []executionport.SequentialTransactionRecord,
+	journal executionport.SequentialJournal,
+) (execution.SequentialStageSettlement, error) {
+	provider, ok := d.Provider.(crosschainport.RecoverableLiveTransferService)
+	if !ok {
+		return execution.SequentialStageSettlement{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureConfiguration,
+				fmt.Errorf("bridge provider does not support durable recovery"),
+			)
+	}
+	result, err := provider.RecoverTransfer(
+		ctx,
+		request,
+		transactions,
+		journal,
+	)
+	if err != nil {
+		return execution.SequentialStageSettlement{}, err
+	}
+	valuedCosts, err := valueCosts(d.Costs, result.Costs)
+	if err != nil {
+		return execution.SequentialStageSettlement{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureTemporary,
+				fmt.Errorf("value recovered bridge costs: %w", err),
+			)
+	}
+	settlement := execution.SequentialStageSettlement{
+		Request: request, ActualInput: result.ActualInput,
+		ActualOutput: result.ActualOutput, Costs: valuedCosts,
+		SourceIdentity:           result.SourceIdentity,
+		DestinationIdentity:      &result.DestinationIdentity,
+		DestinationBalanceBefore: cloneBigInt(result.DestinationBalanceBefore),
+		DestinationBalanceAfter:  cloneBigInt(result.DestinationBalanceAfter),
+		ObservedAt:               result.ObservedAt, Evidence: result.Evidence,
+	}
+	if err := settlement.Validate(); err != nil {
+		return execution.SequentialStageSettlement{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureUncertain,
+				err,
+			)
+	}
+	return settlement, nil
+}
+
 var _ executionport.SequentialStageDriver = (*BridgeDriver)(nil)
+var _ executionport.SequentialRecoveryDriver = (*BridgeDriver)(nil)
+
+func cloneBigInt(value *big.Int) *big.Int {
+	if value == nil {
+		return nil
+	}
+	return new(big.Int).Set(value)
+}
