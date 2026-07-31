@@ -172,6 +172,24 @@ func TestFlowCostOracleSelectsOnlyPendingExitCosts(t *testing.T) {
 	if !ok || returned.Rat().Cmp(big.NewRat(9, 10)) != 0 {
 		t.Fatalf("return cost=%s ok=%t", returned, ok)
 	}
+	originSale, ok := oracle.ExitCost(
+		forward, execution.ExitSellAtOrigin, now,
+	)
+	if !ok || originSale.Rat().Cmp(big.NewRat(4, 10)) != 0 {
+		t.Fatalf("origin sale cost=%s ok=%t", originSale, ok)
+	}
+	prefundedDestination, ok := oracle.PrefundedExitCost(
+		forward, execution.ExitSellAtDestination, now,
+	)
+	if !ok || prefundedDestination.Rat().Cmp(big.NewRat(14, 100)) != 0 {
+		t.Fatalf("prefunded destination cost=%s ok=%t", prefundedDestination, ok)
+	}
+	prefundedOrigin, ok := oracle.PrefundedExitCost(
+		forward, execution.ExitSellAtOrigin, now,
+	)
+	if !ok || prefundedOrigin.Rat().Cmp(big.NewRat(4, 10)) != 0 {
+		t.Fatalf("prefunded origin cost=%s ok=%t", prefundedOrigin, ok)
+	}
 }
 
 func component(t *testing.T, kind, amount string, at time.Time) livecanary.FlowCostComponent {

@@ -306,9 +306,9 @@ type SequentialRecoveryExitSelector interface {
 }
 
 // SequentialPrefundedExitSelector prepares the destination sale after the buy
-// settlement is known. It may authorize the origin circuit breaker only when
-// destination preparation proves a safe failure or rejects the dynamic
-// economic threshold.
+// settlement is known. The normal destination sale uses fixed slippage. Only
+// a safe preparation or execution failure starts a fresh comparison of both
+// executable recovery sales.
 type SequentialPrefundedExitSelector interface {
 	SelectPrefundedExit(
 		context.Context,
@@ -317,7 +317,7 @@ type SequentialPrefundedExitSelector interface {
 		market.TokenAmount,
 		[]domainexecution.CostComponent,
 	) (domainexecution.SequentialExitDecision, error)
-	SelectOriginCircuitBreaker(
+	SelectPrefundedRecoveryExit(
 		context.Context,
 		domainexecution.OperationID,
 		domainexecution.SequentialPlan,

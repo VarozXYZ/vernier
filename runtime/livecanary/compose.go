@@ -463,9 +463,8 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		ReturnMargin:    config.Live.ReturnBridgeSafetyMargin,
 		ExitCosts:       flowCosts,
 		DynamicSlippage: DynamicSlippagePolicy{
-			Enabled:      config.Live.DynamicSlippage.Enabled,
-			MaxBPS:       config.Live.DynamicSlippage.MaxBPS,
-			FixedSellBPS: config.Live.SlippageBPS,
+			Enabled: config.Live.DynamicSlippage.Enabled,
+			MaxBPS:  config.Live.DynamicSlippage.MaxBPS,
 		},
 		ExitValidationAttempts:   config.Live.ExitValidationAttempts,
 		ExitValidationRetryDelay: config.Live.ExitValidationRetryDelay,

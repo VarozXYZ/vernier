@@ -95,7 +95,8 @@ type sequentialExitSelector struct {
 }
 
 type prefundedExitSelector struct {
-	route domainexecution.SequentialExitRoute
+	route         domainexecution.SequentialExitRoute
+	recoveryRoute domainexecution.SequentialExitRoute
 }
 
 func (s prefundedExitSelector) SelectExit(
@@ -118,7 +119,7 @@ func (s prefundedExitSelector) SelectPrefundedExit(
 	return prefundedDecision(operation, s.route), nil
 }
 
-func (s prefundedExitSelector) SelectOriginCircuitBreaker(
+func (s prefundedExitSelector) SelectPrefundedRecoveryExit(
 	_ context.Context,
 	operation domainexecution.OperationID,
 	_ domainexecution.SequentialPlan,
@@ -126,7 +127,11 @@ func (s prefundedExitSelector) SelectOriginCircuitBreaker(
 	_ []domainexecution.CostComponent,
 	_ error,
 ) (domainexecution.SequentialExitDecision, error) {
-	return prefundedDecision(operation, domainexecution.ExitSellAtOrigin), nil
+	route := s.recoveryRoute
+	if route == "" {
+		route = domainexecution.ExitSellAtOrigin
+	}
+	return prefundedDecision(operation, route), nil
 }
 
 func prefundedDecision(
@@ -481,7 +486,7 @@ func TestPrefundedSequentialUsesSettlementsByReference(t *testing.T) {
 	}
 }
 
-func TestPrefundedSequentialDefinitiveDestinationFailureUsesOriginOnly(t *testing.T) {
+func TestPrefundedSequentialDefinitiveDestinationFailureSelectsOriginWhenBest(t *testing.T) {
 	transported := sequentialPlan(t)
 	plan, err := domainexecution.NewPrefundedSequentialPlan(
 		"prefunded-plan", transported.Opportunity, transported.InitialInput,
@@ -530,6 +535,57 @@ func TestPrefundedSequentialDefinitiveDestinationFailureUsesOriginOnly(t *testin
 		result.ExitDecision == nil ||
 		result.ExitDecision.Route != domainexecution.ExitSellAtOrigin {
 		t.Fatalf("unexpected circuit-breaker result: %+v", result)
+	}
+}
+
+func TestPrefundedSequentialDefinitiveDestinationFailureMayReselectDestination(t *testing.T) {
+	transported := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedSequentialPlan(
+		"prefunded-plan", transported.Opportunity, transported.InitialInput,
+		"chain-a", "chain-b", time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &sequentialDriver{
+		outputs: map[int]market.TokenAmount{
+			1: sequentialAmount(t, "base-a", 4_052),
+			2: sequentialAmount(t, "quote-b", 1_010),
+			3: sequentialAmount(t, "base-b", 4_050),
+			4: sequentialAmount(t, "quote-a", 1_009),
+		},
+		failures: map[int][]error{2: {
+			executionport.NewStageError(
+				executionport.DispositionRejected,
+				errors.New("destination rejected before effect"),
+			),
+		}},
+	}
+	journal := &sequentialJournal{}
+	executor, err := saga.NewSequentialExecutor(
+		journal,
+		executionport.DriverSet{
+			Buy: driver, Sell: driver, BridgeBase: driver,
+			BridgeQuoteReturn: driver,
+			ExitSelector: prefundedExitSelector{
+				route:         domainexecution.ExitSellAtDestination,
+				recoveryRoute: domainexecution.ExitSellAtDestination,
+			},
+		},
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.Execute(
+		context.Background(), "prefunded-operation", plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Settlements) != 4 || result.ExitDecision == nil ||
+		result.ExitDecision.Route != domainexecution.ExitSellAtDestination {
+		t.Fatalf("destination was not reselected after safe failure: %+v", result)
 	}
 }
 

@@ -12,9 +12,8 @@ import (
 )
 
 type DynamicSlippagePolicy struct {
-	Enabled      bool
-	MaxBPS       uint16
-	FixedSellBPS uint16
+	Enabled bool
+	MaxBPS  uint16
 }
 
 func (d *SwapDriver) dynamicBuySlippage(
@@ -96,124 +95,6 @@ func (d *SwapDriver) dynamicBuySlippage(
 	}, nil
 }
 
-func (d *SwapDriver) dynamicSellSlippage(
-	plan execution.SequentialPlan,
-	bridged market.TokenAmount,
-	incurred []execution.CostComponent,
-	pending market.AssetQuantity,
-) (*executionport.SlippageConstraint, error) {
-	if !d.DynamicSlippage.Enabled ||
-		isForcedCanaryOpportunity(plan.Opportunity) {
-		return nil, nil
-	}
-	candidate, err := selectedCandidate(plan.Opportunity)
-	if err != nil {
-		return nil, err
-	}
-	referenceInput, err := d.convertAmount(
-		bridged,
-		candidate.SellQuote.AmountIn.Token(),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if candidate.SellQuote.AmountIn.IsZero() {
-		return nil, fmt.Errorf(
-			"dynamic sell slippage has no reference input",
-		)
-	}
-	expectedUnits := new(big.Int).Mul(
-		candidate.SellQuote.AmountOut.Units(),
-		referenceInput.Units(),
-	)
-	expectedUnits.Quo(
-		expectedUnits,
-		candidate.SellQuote.AmountIn.Units(),
-	)
-	expected, err := market.NewTokenAmount(
-		candidate.SellQuote.AmountOut.Token(),
-		expectedUnits,
-	)
-	if err != nil {
-		return nil, err
-	}
-	requiredInitialUnits, err := d.requiredFinalUnits(
-		plan,
-		pending,
-		incurred,
-	)
-	if err != nil {
-		return nil, err
-	}
-	requiredInitial, err := market.NewTokenAmount(
-		plan.InitialInput.Token(),
-		requiredInitialUnits,
-	)
-	if err != nil {
-		return nil, err
-	}
-	required, err := d.convertAmount(
-		requiredInitial,
-		expected.Token(),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if expected.Units().Cmp(required.Units()) <= 0 {
-		return nil, &executionport.SlippageThresholdError{
-			Provider: "frozen_admission_budget",
-			Actual:   expected,
-			Required: required,
-		}
-	}
-	economicBPS := maximumSlippageBPS(
-		expected.Units(),
-		required.Units(),
-		d.DynamicSlippage.MaxBPS,
-	)
-	selectedBPS := economicBPS
-	if selectedBPS < d.DynamicSlippage.FixedSellBPS {
-		selectedBPS = d.DynamicSlippage.FixedSellBPS
-	}
-	minimumUnits := slippageMinimum(expected.Units(), selectedBPS)
-	if minimumUnits.Cmp(required.Units()) < 0 {
-		minimumUnits = required.Units()
-	}
-	minimum, err := market.NewTokenAmount(
-		expected.Token(),
-		minimumUnits,
-	)
-	if err != nil {
-		return nil, err
-	}
-	budget := new(big.Int).Sub(expected.Units(), required.Units())
-	if budget.Sign() < 0 {
-		budget.SetInt64(0)
-	}
-	return &executionport.SlippageConstraint{
-		BPS:           selectedBPS,
-		MinimumOutput: minimum,
-		Reason:        "dynamic_sell_remaining_budget",
-		Evidence: map[string]string{
-			"expected_sell_output_units": expected.String(),
-			"required_final_units":       required.String(),
-			"remaining_budget_units":     budget.String(),
-			"economic_bps": strconv.FormatUint(
-				uint64(economicBPS),
-				10,
-			),
-			"fixed_floor_bps": strconv.FormatUint(
-				uint64(d.DynamicSlippage.FixedSellBPS),
-				10,
-			),
-			"max_bps": strconv.FormatUint(
-				uint64(d.DynamicSlippage.MaxBPS),
-				10,
-			),
-		},
-	}, nil
-}
-
 func (d *SwapDriver) requiredFinalUnits(
 	plan execution.SequentialPlan,
 	pending market.AssetQuantity,
@@ -286,19 +167,6 @@ func maximumSlippageBPS(
 		allowed = uint64(capBPS)
 	}
 	return uint16(allowed)
-}
-
-func slippageMinimum(expected *big.Int, bps uint16) *big.Int {
-	if expected == nil || expected.Sign() <= 0 {
-		return new(big.Int)
-	}
-	return new(big.Int).Quo(
-		new(big.Int).Mul(
-			new(big.Int).Set(expected),
-			big.NewInt(int64(10_000-uint64(bps))),
-		),
-		big.NewInt(10_000),
-	)
 }
 
 func ceilMulDiv(left, right, divisor *big.Int) *big.Int {

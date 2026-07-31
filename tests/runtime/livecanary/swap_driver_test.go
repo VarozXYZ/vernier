@@ -270,6 +270,39 @@ type retryingValidator struct {
 	calls  int
 }
 
+type constraintRejectingValidator struct {
+	now              time.Time
+	output           *big.Int
+	rejectConstraint bool
+	calls            int
+}
+
+func (v *constraintRejectingValidator) Validate(
+	_ context.Context,
+	request executionport.ValidationRequest,
+) (executionport.Artifact, error) {
+	v.calls++
+	output, _ := market.NewTokenAmount(
+		request.Leg.ExpectedOutput.Token(), v.output,
+	)
+	if v.rejectConstraint && request.Slippage != nil {
+		return executionport.Artifact{}, &executionport.SlippageThresholdError{
+			Provider: "synthetic", Actual: output,
+			Required: request.Slippage.MinimumOutput,
+		}
+	}
+	quote, _ := market.NewQuote(market.Quote{
+		Source: "validator", Market: request.Leg.Market, SnapshotVersion: 1,
+		Purpose: market.QuotePurposeLiveValidation,
+		Mode:    market.QuoteModeExactInput, Quality: market.QuoteQualityExact,
+		AmountIn: request.Leg.Input, AmountOut: output, QuotedAt: v.now,
+	})
+	return executionport.Artifact{
+		Leg: request.Leg, ValidatedQuote: quote,
+		Metadata: map[string]string{"kind": "test"}, BuiltAt: v.now,
+	}, nil
+}
+
 func (v *retryingValidator) Validate(
 	_ context.Context,
 	request executionport.ValidationRequest,
@@ -818,7 +851,7 @@ func TestSwapDriverAppliesDynamicBuyBudgetWithoutExtraQuote(t *testing.T) {
 		QuoteAsset:      "quote",
 		MinimumNet:      big.NewRat(1, 2),
 		DynamicSlippage: livecanary.DynamicSlippagePolicy{
-			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+			Enabled: true, MaxBPS: 500,
 		},
 		Clock: func() time.Time { return now },
 	}
@@ -875,7 +908,7 @@ func TestSwapDriverCapsDynamicBuySlippage(t *testing.T) {
 		BridgePrecision: 8,
 		QuoteAsset:      "quote",
 		DynamicSlippage: livecanary.DynamicSlippagePolicy{
-			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+			Enabled: true, MaxBPS: 500,
 		},
 		Clock: func() time.Time { return now },
 	}
@@ -895,7 +928,7 @@ func TestSwapDriverCapsDynamicBuySlippage(t *testing.T) {
 	}
 }
 
-func TestSwapDriverRecalculatesDynamicSellWithFixedFloor(t *testing.T) {
+func TestSwapDriverUsesFixedValidatorSlippageForSell(t *testing.T) {
 	now := time.Now().UTC()
 	plan := dynamicPreflightPlan(t, now, "752", "0")
 	validator := &fixedOutputValidator{
@@ -922,7 +955,7 @@ func TestSwapDriverRecalculatesDynamicSellWithFixedFloor(t *testing.T) {
 			},
 		},
 		DynamicSlippage: livecanary.DynamicSlippagePolicy{
-			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+			Enabled: true, MaxBPS: 500,
 		},
 		Clock: func() time.Time { return now },
 	}
@@ -939,11 +972,9 @@ func TestSwapDriverRecalculatesDynamicSellWithFixedFloor(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if len(validator.slippages) != 1 ||
-		validator.slippages[0] == nil ||
-		validator.slippages[0].BPS != 19 {
+	if len(validator.slippages) != 1 || validator.slippages[0] != nil {
 		t.Fatalf(
-			"unexpected dynamic sell slippage: %+v",
+			"sell unexpectedly received a dynamic constraint: %+v",
 			validator.slippages,
 		)
 	}
@@ -963,10 +994,9 @@ func TestSwapDriverRecalculatesDynamicSellWithFixedFloor(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if validator.slippages[1] == nil ||
-		validator.slippages[1].BPS != 10 {
+	if validator.slippages[1] != nil {
 		t.Fatalf(
-			"fixed sell floor was not applied: %+v",
+			"sell cost changed the fixed validator slippage: %+v",
 			validator.slippages,
 		)
 	}
@@ -1220,7 +1250,7 @@ func TestForcedPrefundedExitReportsFixedSlippageEvidence(t *testing.T) {
 		},
 		QuoteAsset: "quote",
 		DynamicSlippage: livecanary.DynamicSlippagePolicy{
-			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+			Enabled: true, MaxBPS: 500,
 		},
 		Clock: func() time.Time { return now },
 	}
@@ -1241,6 +1271,91 @@ func TestForcedPrefundedExitReportsFixedSlippageEvidence(t *testing.T) {
 	if !strings.Contains(decision.Evidence, "fixed_slippage") ||
 		strings.Contains(decision.Evidence, "dynamic_slippage") {
 		t.Fatalf("misleading exit evidence: %s", decision.Evidence)
+	}
+}
+
+func TestPrefundedSellDoesNotApplyDynamicProfitThreshold(t *testing.T) {
+	now := time.Now().UTC()
+	plan := prefundedPreflightPlan(t, now)
+	candidate := plan.Opportunity.Candidates[plan.Opportunity.SelectedIndex]
+	zeroCost, _ := market.NewAssetQuantity("quote", new(big.Rat))
+	candidate.Cost = arbitrage.CostSnapshot{
+		ID: "admission-cost", Amount: zeroCost, CapturedAt: now,
+	}
+	plan.Opportunity.Candidates[plan.Opportunity.SelectedIndex] = candidate
+	destination := &constraintRejectingValidator{
+		now: now, output: big.NewInt(1_010_000), rejectConstraint: true,
+	}
+	origin := &fixedOutputValidator{
+		now: now, output: big.NewInt(1_000_000),
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {Account: "account", Validator: origin, TxManager: &settledTxManager{}},
+			"market-b": {Account: "account", Validator: destination, TxManager: &settledTxManager{}},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9, "base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8, QuoteAsset: "quote", MinimumNet: big.NewRat(1, 2),
+		ExitCosts: fixedExitCostSource{costs: map[execution.SequentialExitRoute]market.AssetQuantity{
+			execution.ExitSellAtDestination: zeroCost,
+			execution.ExitSellAtOrigin:      zeroCost,
+		}},
+		DynamicSlippage:        livecanary.DynamicSlippagePolicy{Enabled: true, MaxBPS: 500},
+		ExitValidationAttempts: 2, ExitValidationRetryDelay: time.Nanosecond,
+		Clock: func() time.Time { return now },
+	}
+	bought, _ := market.NewTokenAmount("base-a", big.NewInt(4_836_579_243))
+	decision, err := driver.SelectPrefundedExit(
+		context.Background(), "operation", plan, bought, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Route != execution.ExitSellAtDestination ||
+		destination.calls != 1 || origin.calls != 0 ||
+		!strings.Contains(decision.Evidence, "fixed_slippage") {
+		t.Fatalf("unexpected fixed-slippage decision=%+v calls=%d/%d", decision, destination.calls, origin.calls)
+	}
+}
+
+func TestPrefundedRecoveryRetriesTransientOriginBuildBeforeComparison(t *testing.T) {
+	now := time.Now().UTC()
+	plan := prefundedPreflightPlan(t, now)
+	origin := &retryingValidator{
+		now: now, output: big.NewInt(1_020_000),
+		err: errors.New("provider HTTP 400: transient route build failure"),
+	}
+	destination := &fixedOutputValidator{now: now, output: big.NewInt(1_010_000)}
+	zeroCost, _ := market.NewAssetQuantity("quote", new(big.Rat))
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {Account: "account", Validator: origin, TxManager: &settledTxManager{}},
+			"market-b": {Account: "account", Validator: destination, TxManager: &settledTxManager{}},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9, "base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8, QuoteAsset: "quote",
+		ExitCosts: fixedExitCostSource{costs: map[execution.SequentialExitRoute]market.AssetQuantity{
+			execution.ExitSellAtDestination: zeroCost,
+			execution.ExitSellAtOrigin:      zeroCost,
+		}},
+		ExitValidationAttempts: 3, ExitValidationRetryDelay: time.Nanosecond,
+		Clock: func() time.Time { return now },
+	}
+	bought, _ := market.NewTokenAmount("base-a", big.NewInt(4_836_579_243))
+	decision, err := driver.SelectPrefundedRecoveryExit(
+		context.Background(), "operation", plan, bought, nil,
+		errors.New("safe destination failure"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if origin.calls != 2 || destination.calls != 1 ||
+		decision.Route != execution.ExitSellAtOrigin {
+		t.Fatalf("fresh retries/comparison failed: origin_calls=%d destination_calls=%d decision=%+v", origin.calls, destination.calls, decision)
 	}
 }
 
@@ -1355,7 +1470,7 @@ func TestSwapDriverRecoveryComparesReturnEvenWhenDestinationRemainsQualified(t *
 			},
 		},
 		DynamicSlippage: livecanary.DynamicSlippagePolicy{
-			Enabled: true, MaxBPS: 500, FixedSellBPS: 10,
+			Enabled: true, MaxBPS: 500,
 		},
 		Clock: func() time.Time { return now },
 	}

@@ -390,7 +390,7 @@ func (c *SequentialRecoveryCoordinator) resume(
 				)
 				if selectErr != nil {
 					blockErr := fmt.Errorf(
-						"%w: origin circuit breaker: %v",
+						"%w: prefunded recovery selection: %v",
 						ErrSequentialRecoveryBlocked, selectErr,
 					)
 					_ = c.block(context.WithoutCancel(ctx), operation, blockErr)
@@ -601,7 +601,7 @@ func (c *SequentialRecoveryCoordinator) selectPrefundedRecoveryExit(
 			append([]domainexecution.CostComponent(nil), costs...),
 		)
 	} else {
-		decision, err = selector.SelectOriginCircuitBreaker(
+		decision, err = selector.SelectPrefundedRecoveryExit(
 			ctx, operation, plan, bought,
 			append([]domainexecution.CostComponent(nil), costs...), cause,
 		)
