@@ -22,21 +22,28 @@ import (
 // executor. The detector never blocks on execution and production Live keeps
 // accepting opportunities after completed operations.
 type Runtime struct {
-	runner           streamRunner
-	manager          *Manager
-	opportunityStore *sqlitestore.Store
-	closers          []func()
-	output           io.Writer
-	notifier         *LiveNotifier
-	reevaluate       chan time.Time
-	gate             *RuntimeGate
-	postFlowRefresh  func(context.Context) error
-	recovery         sequentialRecovery
-	refuel           *RefuelService
-	execute          bool
-	forcedDirection  *arbitrage.Direction
+	runner             streamRunner
+	manager            *Manager
+	opportunityStore   *sqlitestore.Store
+	closers            []func()
+	output             io.Writer
+	notifier           *LiveNotifier
+	reevaluate         chan time.Time
+	gate               *RuntimeGate
+	postFlowRefresh    func(context.Context) error
+	recovery           sequentialRecovery
+	refuel             *RefuelService
+	execute            bool
+	forcedDirection    *arbitrage.Direction
+	exitAfterOperation bool
 
 	closeOnce sync.Once
+}
+
+// SetExitAfterOperation makes the runtime stop after the first admitted
+// operation reaches a terminal result. It must be configured before Run.
+func (r *Runtime) SetExitAfterOperation(enabled bool) {
+	r.exitAfterOperation = enabled
 }
 
 type streamRunner interface {
@@ -174,6 +181,10 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		); err != nil {
 			return err
 		}
+		if found && r.exitAfterOperation {
+			r.stopGate()
+			return nil
+		}
 	} else if err := r.gate.Transition(
 		startupState,
 		RuntimeGateIdle,
@@ -285,7 +296,7 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		})
 	}()
 	refuelResult := make(chan error, 1)
-	if r.refuel != nil {
+	if r.refuel != nil && !r.exitAfterOperation {
 		r.refuel.SetAfter(func(callbackCtx context.Context) {
 			r.requestPostFlowEvaluation(callbackCtx, reevaluate)
 		})
@@ -329,6 +340,14 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 						Detail:     event.Err.Error(),
 						OccurredAt: time.Now().UTC(),
 					})
+				}
+				if r.exitAfterOperation {
+					cancelStream()
+					<-streamResult
+					return fmt.Errorf(
+						"one-operation run ended before first settlement: %w",
+						event.Err,
+					)
 				}
 				if err := r.maintainAfterOperation(
 					ctx,
@@ -396,6 +415,11 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 					len(recovered.Settlements),
 					recovered.FinalAmount,
 				)
+				if r.exitAfterOperation {
+					cancelStream()
+					<-streamResult
+					return nil
+				}
 				if err := r.maintainAfterOperation(
 					ctx,
 					RuntimeGateRecovering,
@@ -426,6 +450,11 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				event.Result.RealizedGross,
 				event.Result.RealizedNetPnL,
 			)
+			if r.exitAfterOperation {
+				cancelStream()
+				<-streamResult
+				return nil
+			}
 			if r.forcedDirection != nil {
 				cancelStream()
 				<-streamResult

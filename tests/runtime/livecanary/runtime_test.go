@@ -52,6 +52,36 @@ func (successfulExecutor) Execute(
 	}, nil
 }
 
+type failedAfterSettlementExecutor struct{}
+
+func (failedAfterSettlementExecutor) Execute(
+	_ context.Context,
+	operation execution.OperationID,
+	plan execution.SequentialPlan,
+) (executionport.SequentialResult, error) {
+	return executionport.SequentialResult{
+		Operation: operation, FinalAmount: plan.InitialInput,
+		Settlements: []execution.SequentialStageSettlement{{}},
+	}, errors.New("synthetic recoverable failure")
+}
+
+type successfulRecovery struct {
+	calls      int
+	foundAfter int
+}
+
+func (r *successfulRecovery) RecoverActive(
+	context.Context,
+) (executionport.SequentialResult, bool, error) {
+	r.calls++
+	if r.calls < r.foundAfter {
+		return executionport.SequentialResult{}, false, nil
+	}
+	return executionport.SequentialResult{
+		Operation: "recovered-operation",
+	}, true, nil
+}
+
 type failingStream struct{ err error }
 
 func (s failingStream) RunStream(
@@ -199,6 +229,161 @@ func TestProductionRuntimeContinuesAndReevaluatesAfterCompletion(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("runtime did not stop after cancellation")
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOneOperationRuntimeExitsWithoutPostFlowReevaluation(t *testing.T) {
+	ctx := context.Background()
+	manager, err := livecanary.NewManagerWithLimit(
+		ctx,
+		livecanary.Planner{
+			MarketChains: map[market.MarketID]market.ChainID{
+				"market-a": "chain-a", "market-b": "chain-b",
+			},
+			ExecutionUnits: big.NewInt(1_000_000),
+		},
+		successfulExecutor{},
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "opportunities.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &continuingStream{started: make(chan struct{}), reevaluate: make(chan struct{})}
+	runtime, err := livecanary.NewRuntime(
+		stream, manager, store, nil, io.Discard, nil,
+		make(chan time.Time, 1), true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetExitAfterOperation(true)
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(ctx) }()
+	<-stream.started
+	accepted, err := manager.Offer(runtimeOpportunity(t))
+	if err != nil || !accepted {
+		t.Fatalf("offer: accepted=%t err=%v", accepted, err)
+	}
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("one-operation run error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("one-operation runtime did not exit")
+	}
+	select {
+	case <-stream.reevaluate:
+		t.Fatal("one-operation runtime requested a post-flow reevaluation")
+	default:
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOneOperationRuntimeExitsAfterCompletedRecovery(t *testing.T) {
+	ctx := context.Background()
+	manager, err := livecanary.NewManagerWithLimit(
+		ctx,
+		livecanary.Planner{
+			MarketChains: map[market.MarketID]market.ChainID{
+				"market-a": "chain-a", "market-b": "chain-b",
+			},
+			ExecutionUnits: big.NewInt(1_000_000),
+		},
+		failedAfterSettlementExecutor{},
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "opportunities.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &continuingStream{started: make(chan struct{}), reevaluate: make(chan struct{})}
+	recovery := &successfulRecovery{foundAfter: 2}
+	runtime, err := livecanary.NewRuntime(
+		stream, manager, store, nil, io.Discard, nil,
+		make(chan time.Time, 1), true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetRecovery(recovery)
+	runtime.SetExitAfterOperation(true)
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(ctx) }()
+	<-stream.started
+	accepted, err := manager.Offer(runtimeOpportunity(t))
+	if err != nil || !accepted {
+		t.Fatalf("offer: accepted=%t err=%v", accepted, err)
+	}
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("one-operation recovery run error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("one-operation runtime did not exit after recovery")
+	}
+	if recovery.calls != 2 {
+		// One startup reconciliation plus one recovery for the admitted operation.
+		t.Fatalf("recovery calls=%d", recovery.calls)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOneOperationRuntimeCountsStartupRecoveryAsItsSingleOperation(t *testing.T) {
+	ctx := context.Background()
+	manager, err := livecanary.NewManagerWithLimit(
+		ctx,
+		livecanary.Planner{
+			MarketChains: map[market.MarketID]market.ChainID{
+				"market-a": "chain-a", "market-b": "chain-b",
+			},
+			ExecutionUnits: big.NewInt(1_000_000),
+		},
+		successfulExecutor{}, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "opportunities.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &continuingStream{started: make(chan struct{}), reevaluate: make(chan struct{})}
+	recovery := &successfulRecovery{foundAfter: 1}
+	runtime, err := livecanary.NewRuntime(
+		stream, manager, store, nil, io.Discard, nil,
+		make(chan time.Time, 1), true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetRecovery(recovery)
+	runtime.SetExitAfterOperation(true)
+	if err := runtime.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if recovery.calls != 1 {
+		t.Fatalf("recovery calls=%d", recovery.calls)
+	}
+	select {
+	case <-stream.started:
+		t.Fatal("one-operation runtime started discovery after recovering an active operation")
+	default:
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
