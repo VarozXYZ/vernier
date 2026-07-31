@@ -60,3 +60,19 @@ func TestRecoverOnlyRequiresArmBeforeLoadingSecrets(t *testing.T) {
 		t.Fatalf("output=%s", output)
 	}
 }
+
+func TestOnceRequiresArmBeforeLoadingSecrets(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("go", "run", "./cmd/live", "-once")
+	command.Dir = root
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected one-operation mode without arm to fail")
+	}
+	if !strings.Contains(string(output), "-once requires -arm") {
+		t.Fatalf("output=%s", output)
+	}
+}

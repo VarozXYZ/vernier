@@ -40,6 +40,10 @@ type recoveryOnlyRuntime interface {
 	RecoverOnly(context.Context) error
 }
 
+type oneOperationRuntime interface {
+	SetExitAfterOperation(bool)
+}
+
 type runMode string
 
 const (
@@ -122,6 +126,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		false,
 		"resume one durable operation and exit before admitting new work",
 	)
+	once := flags.Bool(
+		"once",
+		false,
+		"admit at most one normal Live operation and exit after its terminal result",
+	)
 	retryBlockedRecovery := flags.String(
 		"retry-blocked-recovery",
 		"",
@@ -146,6 +155,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if strings.TrimSpace(*acknowledgeReconciled) != "" &&
 		(*arm || *dryRun || *costObserve ||
 			*recoverOnly || strings.TrimSpace(*retryBlockedRecovery) != "" ||
+			*once ||
 			strings.TrimSpace(*confirmCanary) != "" ||
 			strings.TrimSpace(*confirmLive) != "" ||
 			strings.TrimSpace(*forceCanaryDirection) != "" ||
@@ -160,6 +170,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "live: -recover-only requires -arm")
 		return 2
 	}
+	if *once && !*arm {
+		fmt.Fprintln(stderr, "live: -once requires -arm")
+		return 2
+	}
 	if strings.TrimSpace(*retryBlockedRecovery) != "" &&
 		(!*recoverOnly || !*arm) {
 		fmt.Fprintln(
@@ -170,6 +184,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if *recoverOnly &&
 		(*dryRun || *costObserve ||
+			*once ||
 			strings.TrimSpace(*confirmCanary) != "" ||
 			strings.TrimSpace(*confirmLive) != "" ||
 			strings.TrimSpace(*forceCanaryDirection) != "" ||
@@ -207,6 +222,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "live: -force-canary-direction requires -arm")
 		return 2
 	}
+	if *once && forcedDirection != "" {
+		fmt.Fprintln(stderr, "live: -once cannot be combined with -force-canary-direction")
+		return 2
+	}
 	refuelChain := market.ChainID(strings.ToLower(strings.TrimSpace(*refuelOnce)))
 	if refuelChain != "" &&
 		refuelChain != market.ChainID("solana") &&
@@ -216,6 +235,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if refuelChain != "" &&
 		(*dryRun || *costObserve || forcedDirection != "" ||
+			*once ||
 			strings.TrimSpace(*confirmCanary) != "" ||
 			strings.TrimSpace(*confirmLive) != "") {
 		fmt.Fprintln(
@@ -389,6 +409,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer runtime.Close()
+	if *once {
+		controller, ok := runtime.(oneOperationRuntime)
+		if !ok {
+			fmt.Fprintln(stderr, "live: selected runtime does not support -once")
+			return 2
+		}
+		controller.SetExitAfterOperation(true)
+		fmt.Fprintln(stdout, "live_mode once=true status=armed")
+	}
 	if *recoverOnly {
 		recoveryRuntime, ok := runtime.(recoveryOnlyRuntime)
 		if !ok {

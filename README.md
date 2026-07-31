@@ -290,6 +290,17 @@ Research binaries do not contain a signing or broadcast path. Live is composed
 separately and fails closed when its private signer, broadcaster, or
 setup-specific execution components are absent.
 
+An armed sequential runtime can be bounded to one admitted operation with
+`-once`. This does not change sizing, economic policy, or confirmation input.
+The process exits after that operation completes, aborts safely before its
+first settlement, or finishes automatic recovery. It does not request a
+post-flow reevaluation or run scheduled refuel maintenance:
+
+```text
+vernier-live -config /path/to/manifest.yaml -env-file /path/to/environment \
+  -arm -confirm-live-input <configured-input> -once
+```
+
 A sequential Live policy refers to market and transfer capabilities by stable
 IDs rather than naming adapters in the economic plan:
 
