@@ -208,7 +208,60 @@ func (o *FlowCostOracle) ExitCost(
 			"base_bridge_solana": true,
 			"swap_sell":          true,
 		}
+	} else if route == execution.ExitSellAtOrigin {
+		costDirection = arbitrage.Direction{
+			BuyMarket:  direction.SellMarket,
+			SellMarket: direction.BuyMarket,
+		}
+		kinds = map[string]bool{"swap_sell": true}
 	} else if route != execution.ExitSellAtDestination {
+		return market.AssetQuantity{}, false
+	}
+	components, ok := o.Components(costDirection, at)
+	if !ok {
+		return market.AssetQuantity{}, false
+	}
+	total, _ := market.NewAssetQuantity(o.quoteAsset, new(big.Rat))
+	matched := 0
+	for _, component := range components {
+		if !kinds[component.Kind] {
+			continue
+		}
+		var err error
+		total, err = total.Add(component.Amount)
+		if err != nil {
+			return market.AssetQuantity{}, false
+		}
+		matched++
+	}
+	return total, matched > 0
+}
+
+// PrefundedExitCost values all effects that remain after the buy settles.
+// Destination still owes its sale and both inventory-restoration transfers;
+// origin owes only the local recovery sale.
+func (o *FlowCostOracle) PrefundedExitCost(
+	direction arbitrage.Direction,
+	route execution.SequentialExitRoute,
+	at time.Time,
+) (market.AssetQuantity, bool) {
+	costDirection := direction
+	var kinds map[string]bool
+	switch route {
+	case execution.ExitSellAtDestination:
+		kinds = map[string]bool{
+			"base_bridge_evm":     true,
+			"base_bridge_solana":  true,
+			"swap_sell":           true,
+			"quote_bridge_spread": true,
+			"quote_bridge_source": true,
+		}
+	case execution.ExitSellAtOrigin:
+		costDirection = arbitrage.Direction{
+			BuyMarket: direction.SellMarket, SellMarket: direction.BuyMarket,
+		}
+		kinds = map[string]bool{"swap_sell": true}
+	default:
 		return market.AssetQuantity{}, false
 	}
 	components, ok := o.Components(costDirection, at)

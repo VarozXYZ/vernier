@@ -141,6 +141,14 @@ type ExitCostSource interface {
 	) (market.AssetQuantity, bool)
 }
 
+type PrefundedExitCostSource interface {
+	PrefundedExitCost(
+		arbitrage.Direction,
+		execution.SequentialExitRoute,
+		time.Time,
+	) (market.AssetQuantity, bool)
+}
+
 type SwapDriver struct {
 	Bindings                 map[market.MarketID]SwapBinding
 	SellPreflights           map[market.MarketID]SellPreflight
@@ -160,6 +168,7 @@ type SwapDriver struct {
 	Costs                    executionport.CostValuator
 
 	preflightMu   sync.Mutex
+	outputMu      sync.Mutex
 	preflightBuys map[execution.OperationID]preparedSwap
 	exitSells     map[execution.OperationID]preparedSwap
 	swapAttempts  map[execution.OperationID]map[int]int
@@ -175,6 +184,16 @@ type preparedSwap struct {
 type exitReturnQuote struct {
 	output market.TokenAmount
 	err    error
+}
+
+type prefundedRecoveryCandidate struct {
+	route    execution.SequentialExitRoute
+	bundle   preparedSwap
+	output   market.TokenAmount
+	recovery market.AssetQuantity
+	costOK   bool
+	attempts int
+	err      error
 }
 
 func (d *SwapDriver) ExecuteStage(
@@ -918,10 +937,10 @@ func (d *SwapDriver) SelectRecoveryExit(
 	return d.selectExit(ctx, operation, plan, bridged, incurred, true)
 }
 
-// SelectPrefundedExit always prepares the destination sale first. Because no
-// transaction has been committed at this point, a failed build/simulation or
-// a typed economic-threshold rejection is proof of no destination effect and
-// may safely authorize the origin branch.
+// SelectPrefundedExit always prepares the destination sale first with the
+// validator's configured fixed slippage. A preparation failure may open
+// recovery only after its retries prove that no destination transaction was
+// committed.
 func (d *SwapDriver) SelectPrefundedExit(
 	ctx context.Context,
 	operation execution.OperationID,
@@ -945,29 +964,15 @@ func (d *SwapDriver) SelectPrefundedExit(
 	}
 	binding, err := d.binding(request)
 	if err != nil {
-		return d.SelectOriginCircuitBreaker(
-			ctx, operation, plan, bought, incurred, err,
-		)
-	}
-	pending, err := d.prefundedPendingCost(plan, incurred)
-	if err != nil {
-		return d.SelectOriginCircuitBreaker(
-			ctx, operation, plan, bought, incurred, err,
-		)
-	}
-	constraint, err := d.dynamicSellSlippage(
-		plan, bought, incurred, pending,
-	)
-	if err != nil {
-		return d.SelectOriginCircuitBreaker(
+		return d.SelectPrefundedRecoveryExit(
 			ctx, operation, plan, bought, incurred, err,
 		)
 	}
 	bundle, attempts, err := d.prepareExitWithRetry(
-		ctx, operation, request, binding, constraint,
+		ctx, operation, request, binding, nil,
 	)
 	if err != nil {
-		return d.SelectOriginCircuitBreaker(
+		return d.SelectPrefundedRecoveryExit(
 			ctx, operation, plan, bought, incurred,
 			fmt.Errorf("destination preparation failed after %d attempt(s): %w", attempts, err),
 		)
@@ -982,25 +987,24 @@ func (d *SwapDriver) SelectPrefundedExit(
 		return execution.SequentialExitDecision{}, err
 	}
 	zero, _ := market.NewAssetQuantity(quoteAsset, new(big.Rat))
-	slippageEvidence := "fixed_slippage"
-	if constraint != nil {
-		slippageEvidence = "dynamic_slippage"
-	}
 	decision := execution.SequentialExitDecision{
 		Operation: operation, Route: execution.ExitSellAtDestination,
 		DestinationOutput:   bundle.artifact.ValidatedQuote.AmountOut,
 		DestinationRecovery: recovery, SafetyMargin: zero,
 		DestinationQualified: true, CostEvidenceAvailable: true,
 		DecidedAt: d.now(),
-		Evidence: "prefunded_destination_first+fresh_build+simulation+" +
-			slippageEvidence,
+		Evidence:  "prefunded_destination_first+fresh_build+simulation+fixed_slippage",
 	}
 	d.storeExitSell(operation, bundle)
 	d.logExitDecision(decision, 0)
 	return decision, nil
 }
 
-func (d *SwapDriver) SelectOriginCircuitBreaker(
+// SelectPrefundedRecoveryExit rebuilds and simulates both sales independently.
+// It is only called before any destination effect or after non-execution has
+// been proved. A failed preparation is retried with a fresh quote/build and
+// makes that branch unavailable only after the retry budget is exhausted.
+func (d *SwapDriver) SelectPrefundedRecoveryExit(
 	ctx context.Context,
 	operation execution.OperationID,
 	plan execution.SequentialPlan,
@@ -1009,91 +1013,156 @@ func (d *SwapDriver) SelectOriginCircuitBreaker(
 	cause error,
 ) (execution.SequentialExitDecision, error) {
 	if plan.EffectivePolicy() != execution.PolicyPrefundedSequential ||
-		len(plan.CircuitBreaker) != 1 || bought.IsZero() {
+		len(plan.Stages) != 4 || len(plan.CircuitBreaker) != 1 || bought.IsZero() {
 		return execution.SequentialExitDecision{},
-			fmt.Errorf("origin circuit-breaker input is incomplete")
+			fmt.Errorf("prefunded recovery input is incomplete")
 	}
-	stage := plan.CircuitBreaker[0]
+	quoteAsset := d.planQuoteAsset(plan)
+	if quoteAsset == "" {
+		return execution.SequentialExitDecision{}, fmt.Errorf("prefunded recovery quote asset is unavailable")
+	}
+	results := make(chan prefundedRecoveryCandidate, 2)
+	for _, candidate := range []struct {
+		route execution.SequentialExitRoute
+		stage execution.SequentialStagePlan
+		log   string
+	}{
+		{execution.ExitSellAtDestination, plan.Stages[1], "live_prefunded_recovery_destination"},
+		{execution.ExitSellAtOrigin, plan.CircuitBreaker[0], "live_prefunded_recovery_origin"},
+	} {
+		candidate := candidate
+		go func() {
+			results <- d.preparePrefundedRecoveryCandidate(
+				ctx, operation, plan, bought, quoteAsset,
+				candidate.route, candidate.stage, candidate.log,
+			)
+		}()
+	}
+	first, second := <-results, <-results
+	var destination, origin prefundedRecoveryCandidate
+	for _, result := range []prefundedRecoveryCandidate{first, second} {
+		if result.route == execution.ExitSellAtDestination {
+			destination = result
+		} else {
+			origin = result
+		}
+	}
+	if destination.err != nil && origin.err != nil {
+		return execution.SequentialExitDecision{}, errors.Join(
+			fmt.Errorf("destination recovery unavailable after %d attempt(s): %w", destination.attempts, destination.err),
+			fmt.Errorf("origin recovery unavailable after %d attempt(s): %w", origin.attempts, origin.err),
+		)
+	}
+	zero, _ := market.NewAssetQuantity(quoteAsset, new(big.Rat))
+	evidence := "prefunded_recovery_comparison+fresh_quote_build_simulation"
+	if cause != nil {
+		var threshold *executionport.SlippageThresholdError
+		if errors.As(cause, &threshold) {
+			evidence += "+sell_slippage_failure"
+		} else {
+			evidence += "+destination_safe_failure"
+		}
+	}
+	decision := execution.SequentialExitDecision{
+		Operation: operation, DestinationRecovery: zero,
+		ReturnRecovery: zero, SafetyMargin: zero, DecidedAt: d.now(),
+		Evidence: evidence,
+	}
+	if destination.err == nil {
+		decision.DestinationOutput = destination.output
+		decision.DestinationRecovery = destination.recovery
+		decision.DestinationQualified = true
+	} else {
+		decision.Evidence += "+destination_unavailable_after_retries"
+	}
+	if origin.err == nil {
+		decision.ReturnOutput = origin.output
+		decision.ReturnRecovery = origin.recovery
+	} else {
+		decision.Evidence += "+origin_unavailable_after_retries"
+	}
+	decision.CostEvidenceAvailable =
+		(destination.err != nil || destination.costOK) &&
+			(origin.err != nil || origin.costOK)
+	selected := destination
+	switch {
+	case destination.err != nil:
+		decision.Route = execution.ExitSellAtOrigin
+		selected = origin
+		decision.Evidence += "+only_origin_executable"
+	case origin.err != nil:
+		decision.Route = execution.ExitSellAtDestination
+		decision.Evidence += "+only_destination_executable"
+	case origin.recovery.Rat().Cmp(destination.recovery.Rat()) > 0:
+		decision.Route = execution.ExitSellAtOrigin
+		selected = origin
+		decision.Evidence += "+origin_net_advantage"
+	default:
+		decision.Route = execution.ExitSellAtDestination
+		decision.Evidence += "+destination_net_advantage"
+	}
+	d.storeExitSell(operation, selected.bundle)
+	d.logExitDecision(decision, 0)
+	return decision, nil
+}
+
+func (d *SwapDriver) preparePrefundedRecoveryCandidate(
+	ctx context.Context,
+	operation execution.OperationID,
+	plan execution.SequentialPlan,
+	bought market.TokenAmount,
+	quoteAsset market.AssetID,
+	route execution.SequentialExitRoute,
+	stage execution.SequentialStagePlan,
+	logEvent string,
+) prefundedRecoveryCandidate {
+	result := prefundedRecoveryCandidate{route: route}
 	input, err := d.convertAmount(bought, stage.InputToken)
 	if err != nil {
-		return execution.SequentialExitDecision{}, err
+		result.err = err
+		return result
 	}
 	request := execution.SequentialStageRequest{
 		Operation: operation, Plan: plan.ID, Stage: stage, Input: input,
 	}
 	binding, err := d.binding(request)
 	if err != nil {
-		return execution.SequentialExitDecision{}, err
+		result.err = err
+		return result
 	}
-	// Recovery uses its bounded validator policy. It deliberately does not
-	// re-impose the original minimum profit after destination has failed.
-	bundle, err := d.prepareAndSimulate(ctx, request, binding, nil)
-	if err != nil {
-		return execution.SequentialExitDecision{},
-			fmt.Errorf("origin circuit breaker: %w", err)
-	}
-	quoteAsset := d.planQuoteAsset(plan)
-	recovery, err := d.recoveryValue(
-		bundle.artifact.ValidatedQuote.AmountOut,
-		stage.OutputToken,
-		quoteAsset,
+	result.bundle, result.attempts, result.err = d.prepareSwapWithRetry(
+		ctx, operation, request, binding, nil, logEvent,
 	)
-	if err != nil {
-		return execution.SequentialExitDecision{}, err
+	if result.err != nil {
+		return result
 	}
-	zero, _ := market.NewAssetQuantity(quoteAsset, new(big.Rat))
-	evidence := "origin_circuit_breaker+fresh_build+simulation"
-	if cause != nil {
-		var threshold *executionport.SlippageThresholdError
-		if errors.As(cause, &threshold) {
-			evidence += "+dynamic_slippage_drop"
+	result.output = result.bundle.artifact.ValidatedQuote.AmountOut
+	result.recovery, result.err = d.recoveryValue(
+		result.output, stage.OutputToken, quoteAsset,
+	)
+	if result.err != nil {
+		return result
+	}
+	if d.ExitCosts != nil {
+		var (
+			cost market.AssetQuantity
+			ok   bool
+		)
+		if source, prefunded := d.ExitCosts.(PrefundedExitCostSource); prefunded {
+			cost, ok = source.PrefundedExitCost(
+				plan.Opportunity.Direction, route, d.now(),
+			)
 		} else {
-			evidence += "+destination_safe_failure"
+			cost, ok = d.ExitCosts.ExitCost(
+				plan.Opportunity.Direction, route, d.now(),
+			)
+		}
+		if ok {
+			result.recovery, result.err = result.recovery.Sub(cost)
+			result.costOK = result.err == nil
 		}
 	}
-	decision := execution.SequentialExitDecision{
-		Operation: operation, Route: execution.ExitSellAtOrigin,
-		ReturnOutput:   bundle.artifact.ValidatedQuote.AmountOut,
-		ReturnRecovery: recovery, DestinationRecovery: zero,
-		SafetyMargin: zero, CostEvidenceAvailable: true,
-		DecidedAt: d.now(), Evidence: evidence,
-	}
-	d.storeExitSell(operation, bundle)
-	d.logExitDecision(decision, 0)
-	return decision, nil
-}
-
-func (d *SwapDriver) prefundedPendingCost(
-	plan execution.SequentialPlan,
-	incurred []execution.CostComponent,
-) (market.AssetQuantity, error) {
-	candidate, err := selectedCandidate(plan.Opportunity)
-	if err != nil {
-		return market.AssetQuantity{}, err
-	}
-	pending := candidate.Cost.Amount
-	if pending.Asset() == "" || pending.Asset() != d.planQuoteAsset(plan) {
-		return market.AssetQuantity{},
-			fmt.Errorf("frozen admission cost snapshot is unavailable")
-	}
-	for _, component := range incurred {
-		if component.IncludedInOutput {
-			continue
-		}
-		if component.QuoteValue.Asset() != pending.Asset() {
-			return market.AssetQuantity{},
-				fmt.Errorf("realized cost is not valued in the admission asset")
-		}
-		next, subErr := pending.Sub(component.QuoteValue)
-		if subErr != nil {
-			return market.AssetQuantity{}, subErr
-		}
-		pending = next
-	}
-	if pending.Sign() < 0 {
-		pending, _ = market.NewAssetQuantity(pending.Asset(), new(big.Rat))
-	}
-	return pending, nil
+	return result
 }
 
 func (d *SwapDriver) planQuoteAsset(plan execution.SequentialPlan) market.AssetID {
@@ -1194,24 +1263,12 @@ func (d *SwapDriver) selectExit(
 			now,
 		)
 	}
-	var sellSlippage *executionport.SlippageConstraint
-	if !forceComparison && destinationCostsOK {
-		sellSlippage, err = d.dynamicSellSlippage(
-			plan,
-			bridged,
-			incurred,
-			destinationCost,
-		)
-		if err != nil {
-			return execution.SequentialExitDecision{}, err
-		}
-	}
 	destination, destinationAttempts, err := d.prepareExitWithRetry(
 		ctx,
 		operation,
 		destinationRequest,
 		destinationBinding,
-		sellSlippage,
+		nil,
 	)
 	if err != nil {
 		d.write(
@@ -1980,6 +2037,8 @@ func decimalScale(decimals uint8) *big.Int {
 
 func (d *SwapDriver) write(format string, arguments ...any) {
 	if d.Output != nil {
+		d.outputMu.Lock()
+		defer d.outputMu.Unlock()
 		_, _ = fmt.Fprintf(d.Output, format, arguments...)
 	}
 }

@@ -219,13 +219,13 @@ func (e *SequentialExecutor) Execute(
 				if plan.EffectivePolicy() == domainexecution.PolicyPrefundedSequential &&
 					stage.Ordinal == 2 {
 					recoveredStages, decision, recoveryErr :=
-						e.selectOriginCircuitBreaker(
+						e.selectPrefundedRecoveryExit(
 							ctx, operationID, plan, outputs[1],
 							result.Costs, err,
 						)
 					if recoveryErr != nil {
 						stageErr := fmt.Errorf(
-							"destination sale failed and origin circuit breaker could not be prepared: %w",
+							"destination sale failed and no prefunded recovery exit could be prepared: %w",
 							errors.Join(err, recoveryErr),
 						)
 						finishErr := e.finish(
@@ -482,7 +482,7 @@ func (e *SequentialExecutor) persistExitDecision(
 	return journal.RecordSequentialExitDecision(ctx, decision)
 }
 
-func (e *SequentialExecutor) selectOriginCircuitBreaker(
+func (e *SequentialExecutor) selectPrefundedRecoveryExit(
 	ctx context.Context,
 	operationID domainexecution.OperationID,
 	plan domainexecution.SequentialPlan,
@@ -498,26 +498,27 @@ func (e *SequentialExecutor) selectOriginCircuitBreaker(
 		e.drivers.ExitSelector.(executionport.SequentialPrefundedExitSelector)
 	if !ok {
 		return nil, domainexecution.SequentialExitDecision{},
-			fmt.Errorf("origin circuit-breaker selector is unavailable")
+			fmt.Errorf("prefunded recovery selector is unavailable")
 	}
-	decision, err := selector.SelectOriginCircuitBreaker(
+	decision, err := selector.SelectPrefundedRecoveryExit(
 		ctx, operationID, plan, bought,
 		append([]domainexecution.CostComponent(nil), costs...), cause,
 	)
 	if err != nil {
 		return nil, domainexecution.SequentialExitDecision{}, err
 	}
-	if decision.Route != domainexecution.ExitSellAtOrigin {
-		return nil, domainexecution.SequentialExitDecision{},
-			fmt.Errorf("circuit breaker selected invalid route %q", decision.Route)
-	}
 	if err := e.persistExitDecision(ctx, decision); err != nil {
 		return nil, domainexecution.SequentialExitDecision{}, err
 	}
-	return append(
-		[]domainexecution.SequentialStagePlan(nil),
-		plan.CircuitBreaker...,
-	), decision, nil
+	switch decision.Route {
+	case domainexecution.ExitSellAtDestination:
+		return append([]domainexecution.SequentialStagePlan(nil), plan.Stages[1:]...), decision, nil
+	case domainexecution.ExitSellAtOrigin:
+		return append([]domainexecution.SequentialStagePlan(nil), plan.CircuitBreaker...), decision, nil
+	default:
+		return nil, domainexecution.SequentialExitDecision{},
+			fmt.Errorf("prefunded recovery selected invalid route %q", decision.Route)
+	}
 }
 
 func (e *SequentialExecutor) canAutomaticallyRecoverSwap(
