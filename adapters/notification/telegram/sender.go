@@ -618,7 +618,11 @@ func (s *Sender) post(
 	request.Header.Set("Content-Type", "application/json")
 	response, err := s.client.Do(request)
 	if err != nil {
-		return telegramResponse{}, err
+		return telegramResponse{}, fmt.Errorf(
+			"telegram %s request failed: %s",
+			operation,
+			redactBotCredential(err.Error()),
+		)
 	}
 	if response == nil || response.Body == nil {
 		return telegramResponse{}, fmt.Errorf("telegram returned an empty response")
@@ -629,11 +633,15 @@ func (s *Sender) post(
 		return telegramResponse{}, readErr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if operation == "editMessageText" &&
+			strings.Contains(strings.ToLower(string(responseBody)), "message is not modified") {
+			return telegramResponse{OK: true}, nil
+		}
 		return telegramResponse{}, fmt.Errorf(
 			"telegram %s failed with HTTP %d: %s",
 			operation,
 			response.StatusCode,
-			strings.TrimSpace(string(responseBody)),
+			redactBotCredential(strings.TrimSpace(string(responseBody))),
 		)
 	}
 	var result telegramResponse
@@ -644,6 +652,31 @@ func (s *Sender) post(
 		)
 	}
 	return result, nil
+}
+
+func redactBotCredential(value string) string {
+	var redacted strings.Builder
+	for {
+		start := strings.Index(value, "/bot")
+		if start < 0 {
+			redacted.WriteString(value)
+			return redacted.String()
+		}
+		tokenStart := start + len("/bot")
+		remainder := value[tokenStart:]
+		if strings.HasPrefix(remainder, "[REDACTED]") {
+			redacted.WriteString(value[:tokenStart+len("[REDACTED]")])
+			value = remainder[len("[REDACTED]"):]
+			continue
+		}
+		endOffset := strings.IndexByte(remainder, '/')
+		redacted.WriteString(value[:tokenStart])
+		redacted.WriteString("[REDACTED]")
+		if endOffset < 0 {
+			return redacted.String()
+		}
+		value = remainder[endOffset:]
+	}
 }
 
 func triggerLine(trigger string) string {

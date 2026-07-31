@@ -3,6 +3,7 @@ package telegram_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -82,6 +83,54 @@ func TestSenderPostsOneCompleteOpeningMessage(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("requests=%d, want 1", requests)
+	}
+}
+
+func TestSenderRedactsBotCredentialFromTransportErrors(t *testing.T) {
+	const token = "synthetic-secret-token"
+	sender, err := telegram.New(telegram.Config{
+		BotToken: token, ChatID: "synthetic-chat", BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			return nil, errors.New("POST " + request.URL.String() + ": connection reset")
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = sender.SendOpening(context.Background(), notificationport.OpportunityOpening{})
+	if err == nil || strings.Contains(err.Error(), token) ||
+		!strings.Contains(err.Error(), "/bot[REDACTED]/sendMessage") {
+		t.Fatalf("credential was not safely redacted: %v", err)
+	}
+}
+
+func TestSenderTreatsUnchangedTelegramEditAsSuccess(t *testing.T) {
+	requests := 0
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat", BaseURL: "https://telegram.test",
+		Client: clientFunc(func(_ *http.Request) (*http.Response, error) {
+			requests++
+			if requests == 1 {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":41}}`,
+				))}, nil
+			}
+			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(
+				`{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`,
+			))}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := "synthetic-operation"
+	for _, event := range []notificationport.LiveExecutionEvent{
+		{Kind: notificationport.LiveExecutionStarted, Operation: operation},
+		{Kind: notificationport.LiveExecutionStageStarted, Operation: operation, Stage: "sell", Ordinal: 2},
+	} {
+		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
