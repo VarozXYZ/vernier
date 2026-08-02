@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +22,7 @@ import (
 	"github.com/VarozXYZ/vernier/adapters/chain/solana"
 	sqlitepersistence "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
+	"github.com/VarozXYZ/vernier/domain/market"
 	"github.com/VarozXYZ/vernier/internal/buildinfo"
 	persistence "github.com/VarozXYZ/vernier/ports/persistence"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
@@ -46,10 +48,128 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "compare-live" {
 		return runCompareLive(ctx, args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "simulation-canary" {
+		return runSimulationCanary(ctx, args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "windows" {
 		return runWindows(ctx, args[1:], stdout, stderr)
 	}
 	return runSynthetic(ctx, args, stdout, stderr)
+}
+
+func runSimulationCanary(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("research simulation-canary", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	setup := flags.String("setup", "", "setup name; resolves config/<setup>/vernier.yaml and .env.<setup>")
+	configPath := flags.String("config", "", "path to YAML configuration manifest")
+	envPath := flags.String("env-file", "", "path to local environment file")
+	amountText := flags.String("amount", "", "quote-asset input amount; defaults to configured minimum")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "research simulation-canary: positional arguments are not supported")
+		return 2
+	}
+	resolvedConfigPath, resolvedEnvPath, err := resolveCompareLivePaths(*setup, *configPath, *envPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: %v\n", err)
+		return 2
+	}
+	logger, err := observability.NewLogger(stderr, "info")
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: %v\n", err)
+		return 2
+	}
+	if err := loadEnvFile(resolvedEnvPath, os.LookupEnv, os.Setenv); err != nil {
+		fmt.Fprintln(stderr, "research simulation-canary: cannot load local environment")
+		return 2
+	}
+	config, err := configuration.LoadConfig(resolvedConfigPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: %v\n", err)
+		return 2
+	}
+	if !config.SimulationEnabled {
+		fmt.Fprintln(stderr, "research simulation-canary: research.simulation.enabled is false")
+		return 2
+	}
+	amount := config.MinimumSize
+	if strings.TrimSpace(*amountText) != "" {
+		parsed, ok := new(big.Rat).SetString(strings.TrimSpace(*amountText))
+		if !ok || parsed.Sign() <= 0 {
+			fmt.Fprintln(stderr, "research simulation-canary: amount must be a positive decimal")
+			return 2
+		}
+		amount = parsed
+	}
+	input, err := market.NewAssetQuantity(config.Markets[0].Quote.Token.Asset, amount)
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: amount: %v\n", err)
+		return 2
+	}
+	endpoints, err := config.ResolveEndpoints(os.LookupEnv)
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: %v\n", err)
+		return 2
+	}
+	networks := make(livecompare.Networks, len(config.Chains))
+	solanaNetworks := make(livecompare.SolanaNetworks)
+	for id, profile := range config.Chains {
+		if profile.Kind == "solana" {
+			network, dialErr := solana.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, endpoints[id+".http"], endpoints[id+".websocket"])
+			if dialErr != nil {
+				fmt.Fprintf(stderr, "research simulation-canary: %v\n", dialErr)
+				return 1
+			}
+			solanaNetworks[id] = network
+			continue
+		}
+		wsEndpoint := endpoints[id+".websocket"]
+		if wsEndpoint == "" {
+			wsEndpoint = endpoints[id]
+		}
+		network, dialErr := evm.DialReadOnlyNetwork(ctx, profile.ID, profile.Label, profile.ChainID, endpoints[id], wsEndpoint)
+		if dialErr != nil {
+			for _, opened := range networks {
+				if opened != nil {
+					opened.Close()
+				}
+			}
+			fmt.Fprintf(stderr, "research simulation-canary: %v\n", dialErr)
+			return 1
+		}
+		networks[id] = network
+	}
+	defer func() {
+		for _, network := range networks {
+			if network != nil {
+				network.Close()
+			}
+		}
+		for _, network := range solanaNetworks {
+			network.Close()
+		}
+	}()
+	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks})
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: invalid composition: %v\n", err)
+		return 2
+	}
+	results, err := runner.RunSimulationCanary(ctx, input)
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: %v\n", err)
+		return 1
+	}
+	for _, result := range results {
+		fmt.Fprintf(stdout, "direction=%s classification=%s simulation=%s duration=%s\n", result.Direction, result.Class, result.Round.Status, result.Duration)
+		fmt.Fprintf(stdout, "  buy market=%s input_units=%s output_units=%s status=%s\n", result.Candidate.BuyQuote.Market, result.Candidate.BuyQuote.AmountIn.Units(), result.Candidate.BuyQuote.AmountOut.Units(), result.Round.Buy.Status)
+		fmt.Fprintf(stdout, "  sell market=%s input_units=%s output_units=%s status=%s\n", result.Candidate.SellQuote.Market, result.Candidate.SellQuote.AmountIn.Units(), result.Candidate.SellQuote.AmountOut.Units(), result.Round.Sell.Status)
+		if result.Round.Error != "" {
+			fmt.Fprintf(stdout, "  error=%s\n", result.Round.Error)
+		}
+	}
+	return 0
 }
 
 func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer) int {

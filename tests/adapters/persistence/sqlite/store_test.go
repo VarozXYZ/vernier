@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -126,7 +127,7 @@ func TestStoreMigratesV1WindowsToPersistAppliedThreshold(t *testing.T) {
 	if err := db.QueryRow("SELECT threshold_asset, threshold_value FROM opportunity_windows").Scan(&asset, &value); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 || asset != "QUOTE" || value != "0" {
+	if version != 8 || asset != "QUOTE" || value != "0" {
 		t.Fatalf("migration result: version=%d threshold=%s/%s", version, asset, value)
 	}
 }
@@ -177,8 +178,226 @@ func TestStoreFinalizesDanglingWindowsWithoutRecoveryTables(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(tables) != 2 || tables[0] != "opportunity_window_observations" || tables[1] != "opportunity_windows" {
+	expected := []string{"opportunity_tracking_points", "opportunity_tracking_windows", "opportunity_window_observations", "opportunity_windows", "simulation_legs", "simulation_rounds"}
+	if !reflect.DeepEqual(tables, expected) {
 		t.Fatalf("unexpected durable tables: %v", tables)
+	}
+}
+
+func TestStorePersistsSimulationRoundAndLegs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "simulation.sqlite")
+	store, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	buyInput, err := market.ParseTokenAmount("USDT_SOLANA", "1000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	buyLocal, err := market.ParseTokenAmount("ANTFUN_SOLANA", "22000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	buySimulated, err := market.ParseTokenAmount("ANTFUN_SOLANA", "21990000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sellInput, err := market.ParseTokenAmount("ANTFUN_BSC", "21990000000000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sellLocal, err := market.ParseTokenAmount("USDT_BSC", "1002000000000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sellSimulated, err := market.ParseTokenAmount("USDT_BSC", "1001000000000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	round := &arbitrage.SimulationRound{
+		ID: "simulation-window-1-3", WindowID: "window-1", PointSequence: 3,
+		RequestedAt: now, StartedAt: now.Add(2 * time.Millisecond), FinishedAt: now.Add(42 * time.Millisecond),
+		Status: arbitrage.SimulationConfirmed, LocalQualified: true,
+		LocalNetPnL: quantity(t, "USDT", "0.7"), LocalThreshold: quantity(t, "USDT", "0.5"),
+		SimulatedNetPnL: quantity(t, "USDT", "0.6"),
+		Buy: arbitrage.SimulationLeg{
+			Chain: "solana", Market: "antfun_usdt_solana", Input: buyInput,
+			LocalOutput: buyLocal, SimulatedOutput: buySimulated, Status: arbitrage.SimulationConfirmed,
+			SnapshotVersion: 12, Context: "buy", ContextPosition: 5, GasOrComputeUnits: 180000,
+			StartedAt: now.Add(3 * time.Millisecond), FinishedAt: now.Add(18 * time.Millisecond),
+		},
+		Sell: arbitrage.SimulationLeg{
+			Chain: "bsc", Market: "antfun_usdt_bsc", Input: sellInput,
+			LocalOutput: sellLocal, SimulatedOutput: sellSimulated, Status: arbitrage.SimulationConfirmed,
+			SnapshotVersion: 27, Context: "sell", ContextPosition: 9, GasOrComputeUnits: 210000,
+			StartedAt: now.Add(4 * time.Millisecond), FinishedAt: now.Add(35 * time.Millisecond),
+		},
+	}
+	round.Buy.SnapshotHash[0] = 0xab
+	round.Sell.SnapshotHash[0] = 0xcd
+	if err := store.RecordSimulationRound(context.Background(), round); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var rounds, legs int
+	if err := db.QueryRow("SELECT COUNT(*) FROM simulation_rounds").Scan(&rounds); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM simulation_legs").Scan(&legs); err != nil {
+		t.Fatal(err)
+	}
+	if rounds != 1 || legs != 2 {
+		t.Fatalf("unexpected simulation rows: rounds=%d legs=%d", rounds, legs)
+	}
+	var status, localValue, simulatedValue string
+	if err := db.QueryRow("SELECT status, local_net_value, simulated_net_value FROM simulation_rounds WHERE round_id = ?", round.ID).
+		Scan(&status, &localValue, &simulatedValue); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(arbitrage.SimulationConfirmed) || localValue != "7/10" || simulatedValue != "3/5" {
+		t.Fatalf("unexpected simulation round: status=%s local=%s simulated=%s", status, localValue, simulatedValue)
+	}
+	var buyStatus, buyInputUnits, buyHash string
+	if err := db.QueryRow("SELECT status, input_units, snapshot_hash FROM simulation_legs WHERE round_id = ? AND leg = 'buy'", round.ID).
+		Scan(&buyStatus, &buyInputUnits, &buyHash); err != nil {
+		t.Fatal(err)
+	}
+	if buyStatus != string(arbitrage.SimulationConfirmed) || buyInputUnits != "1000000000" ||
+		buyHash != "ab00000000000000000000000000000000000000000000000000000000000000" {
+		t.Fatalf("unexpected persisted buy leg: status=%s input=%s hash=%s", buyStatus, buyInputUnits, buyHash)
+	}
+}
+
+func TestStorePersistsFixedCandidatePointsAndTimers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tracking.sqlite")
+	store, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	trigger := arbitrage.TriggerMetadata{
+		Market: "market-a", Source: "chain/pool-events",
+		Position:  market.SourcePosition{Kind: "block", Value: 10},
+		Reference: market.SourceReference{Kind: "transaction", Value: "0xsynthetic"}, At: now,
+	}
+	window := arbitrage.TrackingWindow{
+		ID: "tracking-window", Run: "run", Strategy: "strategy", ConfigHash: "hash",
+		Direction: arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"},
+		Input:     quantity(t, "QUOTE", "1000"), FixedThreshold: quantity(t, "QUOTE", "0.3"),
+		PercentageThreshold: quantity(t, "QUOTE", "0.5"), EffectiveThreshold: quantity(t, "QUOTE", "0.5"),
+		Cost: quantity(t, "QUOTE", "0.5"), OpeningTrigger: trigger, OpenedAt: now,
+		DiscoveryStartedAt: now, DiscoveryFinishedAt: now.Add(10 * time.Millisecond), OpeningPersistedAt: now.Add(12 * time.Millisecond),
+		Opening:          arbitrage.Candidate{Input: quantity(t, "QUOTE", "1000"), Output: quantity(t, "QUOTE", "1002"), NetPnL: quantity(t, "QUOTE", "1.5")},
+		OpeningBuyOutput: quantity(t, "BASE", "5000"),
+		OpeningSnapshots: []arbitrage.TrackingSnapshot{{Market: "market-a", Version: 1}, {Market: "market-b", Version: 2}},
+		DiscoveryTrace:   []arbitrage.TrackingDiscoveryDirection{{Direction: arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"}, Duration: 10 * time.Millisecond}},
+	}
+	if err := store.OpenTrackingWindow(context.Background(), &window); err != nil {
+		t.Fatal(err)
+	}
+	point := &arbitrage.TrackingPoint{
+		ID: "tracking-window/2", WindowID: window.ID, Sequence: 2, Evaluation: "evaluation-2", Trigger: trigger,
+		Timestamps: arbitrage.TrackingTimestamps{
+			TriggerReceivedAt: now.Add(time.Second), SnapshotCapturedAt: now.Add(time.Second + time.Millisecond),
+			QueuedAt: now.Add(time.Second + time.Millisecond), EvaluationStartedAt: now.Add(time.Second + 2*time.Millisecond),
+			BuyStartedAt: now.Add(time.Second + 2*time.Millisecond), BuyFinishedAt: now.Add(time.Second + 3*time.Millisecond),
+			ConversionStartedAt: now.Add(time.Second + 3*time.Millisecond), ConversionFinishedAt: now.Add(time.Second + 4*time.Millisecond),
+			SellStartedAt: now.Add(time.Second + 4*time.Millisecond), SellFinishedAt: now.Add(time.Second + 5*time.Millisecond),
+			PnLStartedAt: now.Add(time.Second + 5*time.Millisecond), PnLFinishedAt: now.Add(time.Second + 6*time.Millisecond),
+			PersistenceStartedAt: time.Now().UTC(), EvaluationFinishedAt: now.Add(time.Second + 6*time.Millisecond),
+		},
+		Snapshots: []arbitrage.TrackingSnapshot{{Market: "market-a", Version: 2}, {Market: "market-b", Version: 3}},
+		Input:     quantity(t, "QUOTE", "1000"), BuyOutput: quantity(t, "BASE", "5000"), SellOutput: quantity(t, "QUOTE", "1001.5"),
+		GrossPnL: quantity(t, "QUOTE", "1.5"), NetPnL: quantity(t, "QUOTE", "1"),
+		FixedThreshold: quantity(t, "QUOTE", "0.3"), PercentageThreshold: quantity(t, "QUOTE", "0.5"), EffectiveThreshold: quantity(t, "QUOTE", "0.5"),
+		DeltaFromOpening: quantity(t, "QUOTE", "-0.5"), DeltaFromPrevious: quantity(t, "QUOTE", "-0.5"),
+		Classification: arbitrage.ClassificationPolicyQualified, EconomicChange: true,
+	}
+	time.Sleep(time.Millisecond)
+	if err := store.RecordTrackingPoint(context.Background(), point); err != nil {
+		t.Fatal(err)
+	}
+	if point.Timestamps.PersistenceFinishedAt.IsZero() || point.Timestamps.Durations().Persistence <= 0 {
+		t.Fatalf("persistence timer was not returned: %+v", point.Timestamps)
+	}
+	if err := store.MarkTrackingNotificationEnqueued(context.Background(), window.ID, 2, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseTrackingWindow(context.Background(), arbitrage.TrackingWindowClosing{
+		WindowID: window.ID, Status: arbitrage.WindowStatusClosed, Reason: "below_profit_threshold",
+		ClosedAt: now.Add(2 * time.Second), ClosingTriggerAt: now.Add(2 * time.Second), EconomicDuration: 2 * time.Second,
+		ObservedDuration: 2*time.Second + 6*time.Millisecond, CumulativeCalculation: 16 * time.Millisecond,
+		CumulativeQueue: time.Millisecond, MaximumQueue: time.Millisecond, Events: 2, EconomicChanges: 1,
+		InitialPnL: quantity(t, "QUOTE", "1.5"), FinalPnL: quantity(t, "QUOTE", "1"), BestPnL: quantity(t, "QUOTE", "1.5"), WorstPnL: quantity(t, "QUOTE", "1"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count, persistenceNanos int64
+	if err := db.QueryRow(`SELECT COUNT(*), MAX(persistence_nanos) FROM opportunity_tracking_points`).Scan(&count, &persistenceNanos); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || persistenceNanos <= 0 {
+		t.Fatalf("tracking points=%d persistence=%d", count, persistenceNanos)
+	}
+}
+
+func TestStoreFinalizesDanglingTrackingWindowForTelegramRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dangling-tracking.sqlite")
+	store, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	trigger := arbitrage.TriggerMetadata{
+		Market: "market-a", Source: "chain/pool-events", Position: market.SourcePosition{Kind: "block", Value: 10},
+		Reference: market.SourceReference{Kind: "transaction", Value: "synthetic"}, At: now,
+	}
+	window := arbitrage.TrackingWindow{
+		ID: "dangling", Run: "run", Strategy: "strategy", ConfigHash: "hash",
+		Direction: arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"},
+		Input:     quantity(t, "QUOTE", "1000"), FixedThreshold: quantity(t, "QUOTE", "0.3"),
+		PercentageThreshold: quantity(t, "QUOTE", "0.5"), EffectiveThreshold: quantity(t, "QUOTE", "0.5"),
+		Cost: quantity(t, "QUOTE", "0.5"), OpeningTrigger: trigger, OpenedAt: now,
+		DiscoveryStartedAt: now, DiscoveryFinishedAt: now.Add(time.Millisecond), OpeningPersistedAt: now.Add(2 * time.Millisecond),
+		Opening:          arbitrage.Candidate{Input: quantity(t, "QUOTE", "1000"), Output: quantity(t, "QUOTE", "1002"), NetPnL: quantity(t, "QUOTE", "1.5")},
+		OpeningBuyOutput: quantity(t, "BASE", "5000"),
+		OpeningSnapshots: []arbitrage.TrackingSnapshot{{Market: "market-a", Version: 1}, {Market: "market-b", Version: 1}},
+	}
+	if err := store.OpenTrackingWindow(context.Background(), &window); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTrackingMessage(context.Background(), window.ID, 99); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := store.FinalizeDanglingTracking(context.Background(), now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closed) != 1 || closed[0].WindowID != window.ID || closed[0].MessageID != 99 ||
+		closed[0].BuyOutput.String() != "5000" || closed[0].NetPnL.String() != "3/2" ||
+		closed[0].CumulativeCalculation != time.Millisecond {
+		t.Fatalf("unexpected dangling closure: %+v", closed)
+	}
+	again, err := store.FinalizeDanglingTracking(context.Background(), now.Add(2*time.Second))
+	if err != nil || len(again) != 0 {
+		t.Fatalf("dangling closure was not idempotent: %+v %v", again, err)
 	}
 }
 

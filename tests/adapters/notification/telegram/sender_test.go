@@ -140,6 +140,68 @@ func TestSenderRedactsBotCredentialFromTransportErrors(t *testing.T) {
 	}
 }
 
+func TestSenderCreatesAndEditsOneTrackingWindowMessage(t *testing.T) {
+	var paths, texts []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat", BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			paths = append(paths, request.URL.Path)
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			texts = append(texts, payload.Text)
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":72}}`))}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := notificationport.TrackingWindowUpdate{
+		WindowID: "window", State: "open", Direction: "market-a -> market-b", Input: "1000 USDT",
+		BuyOutput: "5000 BASE", SellOutput: "1002 USDT", NetPnL: "1.5 USDT", DeltaOpening: "0 USDT",
+		DeltaPrevious: "0 USDT", Threshold: "0.5 USDT", BestPnL: "1.5 USDT", WorstPnL: "1.5 USDT",
+		Points: 1, DiscoveryDuration: 12 * time.Millisecond, TriggerToOpen: 15 * time.Millisecond,
+		History: []notificationport.TrackingHistoryPoint{{SellOutput: "1002 USDT", NetPnL: "1.5 USDT", Delta: "0 USDT", Calculation: 12 * time.Millisecond, Total: 15 * time.Millisecond}},
+	}
+	messageID, err := sender.SendTrackingWindow(context.Background(), update)
+	if err != nil || messageID != 72 {
+		t.Fatalf("send tracking message: id=%d err=%v", messageID, err)
+	}
+	update.State, update.Reason, update.Points = "closed", "below_profit_threshold", 2
+	update.NetPnL, update.DeltaPrevious = "0.2 USDT", "-1.3 USDT"
+	if err := sender.EditTrackingWindow(context.Background(), messageID, update); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 || !strings.HasSuffix(paths[0], "/sendMessage") || !strings.HasSuffix(paths[1], "/editMessageText") {
+		t.Fatalf("unexpected Telegram operations: %v", paths)
+	}
+	for _, expected := range []string{"CLOSED", "below_profit_threshold", "point 2", "trigger→result"} {
+		if !strings.Contains(texts[1], expected) {
+			t.Fatalf("tracking message missing %q: %s", expected, texts[1])
+		}
+	}
+}
+
+func TestSenderExposesTelegramRetryAfter(t *testing.T) {
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat", BaseURL: "https://telegram.test",
+		Client: clientFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"ok":false,"parameters":{"retry_after":2}}`))}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = sender.SendTrackingWindow(context.Background(), notificationport.TrackingWindowUpdate{State: "open"})
+	var limited notificationport.RetryAfterError
+	if !errors.As(err, &limited) || limited.RetryAfter() != 2*time.Second {
+		t.Fatalf("retry-after was not exposed: %v", err)
+	}
+}
+
 func TestSenderTreatsUnchangedTelegramEditAsSuccess(t *testing.T) {
 	requests := 0
 	sender, err := telegram.New(telegram.Config{

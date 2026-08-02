@@ -251,12 +251,12 @@ func (r *Runner) composeEVMHop(hop configuration.ResolvedHop, candidate market.M
 		}
 		local, err := constantproduct.NewQuoter(market.SourceID(string(hop.Venue.ID)+"/local"), candidate)
 		return adapter, constantproduct.Reducer{}, local, err
-	case "uniswap_v3":
+	case "uniswap_v3", "pancakeswap_v3":
 		maxBase, initialQuote, zeroForOne, err := v3Inputs(configured, hopMaximum(maximum, hop))
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		adapter, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{Pool: hop.Venue.Pool, MaxTickWords: hop.Venue.MaxTickWords, Probes: []uniswapv3.CoverageProbe{{ZeroForOne: zeroForOne, AmountIn: maxBase}, {ZeroForOne: !zeroForOne, AmountIn: initialQuote}}})
+		adapter, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{Pool: hop.Venue.Pool, MaxTickWords: hop.Venue.MaxTickWords, Probes: []uniswapv3.CoverageProbe{{ZeroForOne: zeroForOne, AmountIn: maxBase}, {ZeroForOne: !zeroForOne, AmountIn: initialQuote}}, EventProfile: v3EventProfile(hop.Venue.Kind)})
 		if err != nil {
 			return nil, nil, nil, err
 		}

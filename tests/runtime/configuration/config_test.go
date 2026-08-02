@@ -121,6 +121,27 @@ func TestLoadConfigRejectsUnsupportedSizingAsset(t *testing.T) {
 	}
 }
 
+func TestLoadConfigResolvesFixedAndPercentageProfitThreshold(t *testing.T) {
+	policy := strings.Replace(policyYAML,
+		"min_net_profit: \"0\"",
+		"min_net_profit: \"0\"\n    profit_threshold:\n      kind: max_fixed_and_input_bps\n      fixed: {asset: weth, amount: \"0.3\"}\n      bps: 5\n    tracking_mode: fixed_candidate\n    tracking_queue_capacity: 4096",
+		1,
+	)
+	config, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ProfitThresholdKind != "max_fixed_and_input_bps" || config.ProfitThresholdFixed.RatString() != "3/10" ||
+		config.ProfitThresholdBPS != 5 || config.TrackingMode != "fixed_candidate" || config.TrackingQueueCapacity != 4096 {
+		t.Fatalf("unexpected threshold/tracking configuration: %+v", config)
+	}
+
+	invalid := strings.Replace(policy, "min_net_profit: \"0\"", "min_net_profit: \"0.1\"", 1)
+	if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, invalid)); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("legacy and percentage thresholds were both accepted: %v", err)
+	}
+}
+
 func TestConfigurationHashIgnoresYAMLFormatting(t *testing.T) {
 	first, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, policyYAML))
 	if err != nil {

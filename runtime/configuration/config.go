@@ -190,18 +190,49 @@ type SetupConfig struct {
 }
 
 type ResearchConfig struct {
-	RunID                    string         `yaml:"run_id"`
-	Setup                    string         `yaml:"setup"`
-	InventoryMode            string         `yaml:"inventory_mode"`
-	PriceSource              string         `yaml:"price_source"`
-	FixedCost                AmountConfig   `yaml:"fixed_cost"`
-	MinNetProfit             string         `yaml:"min_net_profit"`
-	Sizing                   SizingConfig   `yaml:"sizing"`
-	EvaluationMode           string         `yaml:"evaluation_mode"`
-	IdleEvaluationIntervalMS int            `yaml:"idle_evaluation_interval_ms"`
-	WindowQualification      string         `yaml:"window_qualification"`
-	Retry                    RetryConfig    `yaml:"retry"`
-	Telegram                 TelegramConfig `yaml:"telegram"`
+	RunID                    string                `yaml:"run_id"`
+	Setup                    string                `yaml:"setup"`
+	InventoryMode            string                `yaml:"inventory_mode"`
+	PriceSource              string                `yaml:"price_source"`
+	FixedCost                AmountConfig          `yaml:"fixed_cost"`
+	MinNetProfit             string                `yaml:"min_net_profit"`
+	ProfitThreshold          ProfitThresholdConfig `yaml:"profit_threshold"`
+	Sizing                   SizingConfig          `yaml:"sizing"`
+	EvaluationMode           string                `yaml:"evaluation_mode"`
+	TrackingMode             string                `yaml:"tracking_mode"`
+	TrackingQueueCapacity    int                   `yaml:"tracking_queue_capacity"`
+	IdleEvaluationIntervalMS int                   `yaml:"idle_evaluation_interval_ms"`
+	WindowQualification      string                `yaml:"window_qualification"`
+	Retry                    RetryConfig           `yaml:"retry"`
+	Telegram                 TelegramConfig        `yaml:"telegram"`
+	Simulation               SimulationConfig      `yaml:"simulation"`
+}
+
+// SimulationConfig enables post-qualification, read-only transaction
+// simulations. It contains only environment-variable names and public
+// policy; balances, keys and addresses remain outside tracked YAML.
+type SimulationConfig struct {
+	Enabled            bool                            `yaml:"enabled"`
+	IntervalMS         int                             `yaml:"interval_ms"`
+	SolanaOwnerEnv     string                          `yaml:"solana_owner_env"`
+	EVMOwnerEnv        string                          `yaml:"evm_owner_env"`
+	EVMRouterEnv       string                          `yaml:"evm_router_env"`
+	EVMBalanceSlot     uint64                          `yaml:"evm_balance_slot"`
+	EVMAllowanceSlot   uint64                          `yaml:"evm_allowance_slot"`
+	EVMGasLimit        uint64                          `yaml:"evm_gas_limit"`
+	SolanaComputeLimit uint32                          `yaml:"solana_compute_limit"`
+	EVMTokenSlots      map[string]SimulationTokenSlots `yaml:"evm_token_slots"`
+}
+
+type SimulationTokenSlots struct {
+	BalanceSlot   uint64 `yaml:"balance_slot"`
+	AllowanceSlot uint64 `yaml:"allowance_slot"`
+}
+
+type ProfitThresholdConfig struct {
+	Kind  string       `yaml:"kind"`
+	Fixed AmountConfig `yaml:"fixed"`
+	BPS   uint16       `yaml:"bps"`
 }
 
 type RetryConfig struct {
@@ -435,31 +466,46 @@ type ResolvedTransferSource struct {
 }
 
 type ParsedConfig struct {
-	Hash                   string
-	ResearchID             string
-	RunID                  string
-	SetupID                string
-	InventoryMode          string
-	Assets                 map[market.AssetID]market.Asset
-	Chains                 map[string]ResolvedChain
-	Markets                [2]ResolvedMarket
-	PriceSource            ResolvedPriceSource
-	QuoteSources           map[string]ResolvedQuoteSource
-	FixedCost              *big.Rat
-	SizingKind             string
-	MinimumSize            *big.Rat
-	MaximumSize            *big.Rat
-	SizeSamples            int
-	SizingAsset            string
-	MinimumNet             *big.Rat
-	EvaluationMode         string
-	IdleEvaluationInterval time.Duration
-	WindowQualification    string
-	RetryAttempts          int
-	RetryDelay             time.Duration
-	TelegramEnabled        bool
-	TelegramBotTokenEnv    string
-	TelegramChatIDEnv      string
+	Hash                         string
+	ResearchID                   string
+	RunID                        string
+	SetupID                      string
+	InventoryMode                string
+	Assets                       map[market.AssetID]market.Asset
+	Chains                       map[string]ResolvedChain
+	Markets                      [2]ResolvedMarket
+	PriceSource                  ResolvedPriceSource
+	QuoteSources                 map[string]ResolvedQuoteSource
+	FixedCost                    *big.Rat
+	SizingKind                   string
+	MinimumSize                  *big.Rat
+	MaximumSize                  *big.Rat
+	SizeSamples                  int
+	SizingAsset                  string
+	MinimumNet                   *big.Rat
+	ProfitThresholdKind          string
+	ProfitThresholdFixed         *big.Rat
+	ProfitThresholdBPS           uint16
+	EvaluationMode               string
+	TrackingMode                 string
+	TrackingQueueCapacity        int
+	IdleEvaluationInterval       time.Duration
+	WindowQualification          string
+	RetryAttempts                int
+	RetryDelay                   time.Duration
+	TelegramEnabled              bool
+	TelegramBotTokenEnv          string
+	TelegramChatIDEnv            string
+	SimulationEnabled            bool
+	SimulationInterval           time.Duration
+	SimulationSolanaOwnerEnv     string
+	SimulationEVMOwnerEnv        string
+	SimulationEVMRouterEnv       string
+	SimulationEVMBalanceSlot     uint64
+	SimulationEVMAllowanceSlot   uint64
+	SimulationEVMGasLimit        uint64
+	SimulationSolanaComputeLimit uint32
+	SimulationEVMTokenSlots      map[market.TokenID]SimulationTokenSlots
 }
 
 type ResolvedLiveAccount struct {
@@ -819,12 +865,47 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 	if err != nil {
 		return ParsedConfig{}, err
 	}
+	thresholdKind := strings.TrimSpace(research.ProfitThreshold.Kind)
+	thresholdFixed := new(big.Rat)
+	thresholdBPS := research.ProfitThreshold.BPS
+	if thresholdKind != "" {
+		if thresholdKind != "max_fixed_and_input_bps" {
+			return ParsedConfig{}, fmt.Errorf("unsupported research profit threshold kind %q", thresholdKind)
+		}
+		if minimumNet.Sign() != 0 {
+			return ParsedConfig{}, fmt.Errorf("research profit_threshold and non-zero min_net_profit are mutually exclusive")
+		}
+		if market.AssetID(strings.TrimSpace(research.ProfitThreshold.Fixed.Asset)) != markets[0].Quote.Token.Asset {
+			return ParsedConfig{}, fmt.Errorf("research fixed profit threshold must use quote asset %q", markets[0].Quote.Token.Asset)
+		}
+		thresholdFixed, err = positive(research.ProfitThreshold.Fixed.Amount, "fixed profit threshold")
+		if err != nil {
+			return ParsedConfig{}, err
+		}
+		if thresholdBPS == 0 || thresholdBPS > 10_000 {
+			return ParsedConfig{}, fmt.Errorf("research input profit threshold BPS must be between 1 and 10000")
+		}
+	}
 	evaluationMode := strings.TrimSpace(research.EvaluationMode)
 	if evaluationMode == "" {
 		evaluationMode = "two_market"
 	}
 	if evaluationMode != "two_market" && evaluationMode != "best_buy_opposite_sell" {
 		return ParsedConfig{}, fmt.Errorf("unsupported research evaluation mode %q", evaluationMode)
+	}
+	trackingMode := strings.TrimSpace(research.TrackingMode)
+	if trackingMode == "" {
+		trackingMode = "window_reselect"
+	}
+	if trackingMode != "window_reselect" && trackingMode != "fixed_candidate" {
+		return ParsedConfig{}, fmt.Errorf("unsupported research tracking mode %q", trackingMode)
+	}
+	trackingQueueCapacity := research.TrackingQueueCapacity
+	if trackingQueueCapacity == 0 {
+		trackingQueueCapacity = 4096
+	}
+	if trackingQueueCapacity < 1 {
+		return ParsedConfig{}, fmt.Errorf("research tracking queue capacity must be positive")
 	}
 	windowQualification := strings.TrimSpace(research.WindowQualification)
 	if windowQualification == "" {
@@ -853,6 +934,40 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 			!environmentName.MatchString(research.Telegram.ChatIDEnv)) {
 		return ParsedConfig{}, fmt.Errorf("telegram alert environment is invalid")
 	}
+	simulationInterval := time.Duration(research.Simulation.IntervalMS) * time.Millisecond
+	if research.Simulation.Enabled {
+		if research.Simulation.IntervalMS == 0 {
+			simulationInterval = time.Second
+		}
+		if simulationInterval < time.Second {
+			return ParsedConfig{}, fmt.Errorf("research simulation interval must be at least one second")
+		}
+		for field, value := range map[string]string{
+			"solana_owner_env": research.Simulation.SolanaOwnerEnv,
+			"evm_owner_env":    research.Simulation.EVMOwnerEnv,
+			"evm_router_env":   research.Simulation.EVMRouterEnv,
+		} {
+			if !environmentName.MatchString(strings.TrimSpace(value)) {
+				return ParsedConfig{}, fmt.Errorf("research simulation %s is invalid", field)
+			}
+		}
+		if research.Simulation.EVMBalanceSlot == research.Simulation.EVMAllowanceSlot {
+			return ParsedConfig{}, fmt.Errorf("research simulation EVM balance and allowance slots must be distinct")
+		}
+		for token, slots := range research.Simulation.EVMTokenSlots {
+			if strings.TrimSpace(token) == "" || slots.BalanceSlot == slots.AllowanceSlot {
+				return ParsedConfig{}, fmt.Errorf("research simulation token slot configuration is invalid for %q", token)
+			}
+		}
+		if research.Simulation.EVMGasLimit == 0 {
+			return ParsedConfig{}, fmt.Errorf("research simulation EVM gas limit must be positive")
+		}
+		if research.Simulation.SolanaComputeLimit == 0 {
+			research.Simulation.SolanaComputeLimit = 1_400_000
+		}
+	} else {
+		simulationInterval = 0
+	}
 	bundle := struct {
 		Manifest Manifest
 		Topology Topology
@@ -869,10 +984,28 @@ func resolve(manifest Manifest, topology Topology, policy Policy) (ParsedConfig,
 		PriceSource: priceSource,
 		FixedCost:   fixedCost, SizingKind: sizingKind, MinimumSize: minimum, MaximumSize: maximum,
 		SizeSamples: sizeSamples, SizingAsset: sizingAsset, MinimumNet: minimumNet,
-		EvaluationMode: evaluationMode, IdleEvaluationInterval: idleInterval,
-		WindowQualification: windowQualification, RetryAttempts: retryAttempts, RetryDelay: retryDelay,
+		ProfitThresholdKind: thresholdKind, ProfitThresholdFixed: thresholdFixed,
+		ProfitThresholdBPS: thresholdBPS,
+		EvaluationMode:     evaluationMode, TrackingMode: trackingMode, TrackingQueueCapacity: trackingQueueCapacity,
+		IdleEvaluationInterval: idleInterval,
+		WindowQualification:    windowQualification, RetryAttempts: retryAttempts, RetryDelay: retryDelay,
 		TelegramEnabled: research.Telegram.Enabled, TelegramBotTokenEnv: research.Telegram.BotTokenEnv,
 		TelegramChatIDEnv: research.Telegram.ChatIDEnv,
+		SimulationEnabled: research.Simulation.Enabled, SimulationInterval: simulationInterval,
+		SimulationSolanaOwnerEnv:     research.Simulation.SolanaOwnerEnv,
+		SimulationEVMOwnerEnv:        research.Simulation.EVMOwnerEnv,
+		SimulationEVMRouterEnv:       research.Simulation.EVMRouterEnv,
+		SimulationEVMBalanceSlot:     research.Simulation.EVMBalanceSlot,
+		SimulationEVMAllowanceSlot:   research.Simulation.EVMAllowanceSlot,
+		SimulationEVMGasLimit:        research.Simulation.EVMGasLimit,
+		SimulationSolanaComputeLimit: research.Simulation.SolanaComputeLimit,
+		SimulationEVMTokenSlots: func() map[market.TokenID]SimulationTokenSlots {
+			result := make(map[market.TokenID]SimulationTokenSlots, len(research.Simulation.EVMTokenSlots))
+			for token, slots := range research.Simulation.EVMTokenSlots {
+				result[market.TokenID(token)] = slots
+			}
+			return result
+		}(),
 	}, nil
 }
 
@@ -1872,7 +2005,7 @@ func resolveToken(id string, config TokenConfig, chain string, assets map[market
 }
 
 func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
-	if config.Kind != "uniswap_v2" && config.Kind != "uniswap_v3" && config.Kind != "aerodrome_slipstream" && config.Kind != "aerodrome_volatile" && config.Kind != "meteora_dlmm" && config.Kind != "orca_whirlpool" {
+	if config.Kind != "uniswap_v2" && config.Kind != "uniswap_v3" && config.Kind != "pancakeswap_v3" && config.Kind != "aerodrome_slipstream" && config.Kind != "aerodrome_volatile" && config.Kind != "meteora_dlmm" && config.Kind != "orca_whirlpool" {
 		return ResolvedVenue{}, fmt.Errorf("venue %q has unsupported kind %q", id, config.Kind)
 	}
 	pool := common.Address{}
@@ -1887,7 +2020,7 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 		return ResolvedVenue{}, fmt.Errorf("venue %q pool: invalid address", id)
 	}
 	factory := common.Address{}
-	if config.Kind != "uniswap_v3" && config.Kind != "meteora_dlmm" && config.Kind != "orca_whirlpool" || config.FactoryAddress != "" {
+	if config.Kind != "uniswap_v3" && config.Kind != "pancakeswap_v3" && config.Kind != "meteora_dlmm" && config.Kind != "orca_whirlpool" || config.FactoryAddress != "" {
 		factory, err = address(config.FactoryAddress)
 		if err != nil {
 			return ResolvedVenue{}, fmt.Errorf("venue %q factory: %w", id, err)
@@ -1909,7 +2042,7 @@ func resolveVenue(id string, config VenueConfig) (ResolvedVenue, error) {
 	if config.Kind == "aerodrome_volatile" && config.Stable {
 		return ResolvedVenue{}, fmt.Errorf("venue %q is volatile and cannot set stable: true", id)
 	}
-	if config.Kind == "uniswap_v3" || config.Kind == "aerodrome_slipstream" || config.Kind == "orca_whirlpool" {
+	if config.Kind == "uniswap_v3" || config.Kind == "pancakeswap_v3" || config.Kind == "aerodrome_slipstream" || config.Kind == "orca_whirlpool" {
 		if config.MaxTickWords == 0 {
 			config.MaxTickWords = 64
 		}

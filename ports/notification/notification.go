@@ -28,6 +28,70 @@ type OpeningSender interface {
 	SendOpening(context.Context, OpportunityOpening) error
 }
 
+type TrackingHistoryPoint struct {
+	SinceOpening time.Duration
+	SellOutput   string
+	NetPnL       string
+	Delta        string
+	Calculation  time.Duration
+	Total        time.Duration
+}
+
+// TrackingWindowUpdate is a provider-neutral projection of one durable
+// fixed-candidate window. The adapter may trim visible history, but the
+// current state and aggregates must always remain present.
+type TrackingWindowUpdate struct {
+	WindowID              string
+	State                 string
+	Direction             string
+	Input                 string
+	BuyOutput             string
+	SellOutput            string
+	NetPnL                string
+	DeltaOpening          string
+	DeltaPrevious         string
+	Threshold             string
+	BestPnL               string
+	WorstPnL              string
+	Reason                string
+	Trigger               string
+	TriggerURL            string
+	OpenedAt              time.Time
+	Points                uint64
+	Changes               uint64
+	DiscoveryDuration     time.Duration
+	TriggerToOpen         time.Duration
+	SinceOpening          time.Duration
+	EconomicDuration      time.Duration
+	ObservedDuration      time.Duration
+	QueueDuration         time.Duration
+	BuyDuration           time.Duration
+	ConversionDuration    time.Duration
+	SellDuration          time.Duration
+	PnLDuration           time.Duration
+	PersistenceDuration   time.Duration
+	CalculationDuration   time.Duration
+	TriggerToResult       time.Duration
+	CumulativeCalculation time.Duration
+	CumulativeQueue       time.Duration
+	History               []TrackingHistoryPoint
+	SimulationStatus      string
+	SimulationFailure     string
+	SimulationError       string
+	SimulationBuyStatus   string
+	SimulationSellStatus  string
+}
+
+type TrackingWindowSender interface {
+	SendTrackingWindow(context.Context, TrackingWindowUpdate) (int64, error)
+	EditTrackingWindow(context.Context, int64, TrackingWindowUpdate) error
+}
+
+type RetryAfterError interface {
+	error
+	RetryAfter() time.Duration
+}
+
 type ConfigurationWarning struct {
 	Code       string
 	Provider   string
