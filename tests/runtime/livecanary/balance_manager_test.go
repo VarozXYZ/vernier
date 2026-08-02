@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/inventory"
 	"github.com/VarozXYZ/vernier/domain/market"
@@ -42,6 +43,46 @@ func TestBalanceManagerRejectsPrefundedOpportunityBeforeExecutionIO(t *testing.T
 	if insufficient.Required.Cmp(big.NewInt(4_000_000_000_000_000)) != 0 {
 		t.Fatalf("required=%s", insufficient.Required)
 	}
+}
+
+func TestBalanceManagerRejectsIncompletePrefundedParallelPlans(t *testing.T) {
+	manager, _, _ := newTestBalanceManager(t, big.NewInt(9_000_000_000_000_000))
+	planner := livecanary.Planner{
+		MarketChains: map[market.MarketID]market.ChainID{
+			"market-a": "chain-a", "market-b": "chain-b",
+		},
+		ExecutionUnits:  big.NewInt(1_000_000),
+		ExecutionPolicy: execution.PolicyPrefundedParallel,
+		BaseAsset:       "base",
+		QuoteAsset:      "quote",
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9, "quote-b": 6, "base-b": 18,
+		},
+	}
+	plan, err := planner.Plan(liveCanaryOpportunity(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("missing sell stage", func(t *testing.T) {
+		partial := plan
+		partial.Stages = partial.Stages[:1]
+		if err := manager.Admit(partial); err == nil {
+			t.Fatal("expected incomplete plan rejection")
+		}
+	})
+
+	t.Run("missing sell input", func(t *testing.T) {
+		incomplete := plan
+		incomplete.Opportunity.Candidates = append(
+			[]arbitrage.Candidate(nil), plan.Opportunity.Candidates...,
+		)
+		selected := incomplete.Opportunity.SelectedIndex
+		incomplete.Opportunity.Candidates[selected].SellQuote.AmountIn = market.TokenAmount{}
+		if err := manager.Admit(incomplete); err == nil {
+			t.Fatal("expected incomplete sell quote rejection")
+		}
+	})
 }
 
 func TestBalanceManagerAppliesConfirmedSettlementLocally(t *testing.T) {
