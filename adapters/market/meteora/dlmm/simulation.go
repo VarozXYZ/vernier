@@ -158,8 +158,14 @@ func BuildSimulationTransaction(
 	}
 	metas = append(metas, solana.NewAccountMeta(solana.PublicKey(eventAuthority), false, false), solana.NewAccountMeta(program, false, false))
 	metas = append(metas, binAccounts...)
+	if !amountIn.IsUint64() || !minimumOut.IsUint64() {
+		return nil, fmt.Errorf("meteora simulation amounts exceed uint64")
+	}
 	data := make([]byte, 8+8+8+4)
-	decoded, _ := hexDecode(swap2Discriminator)
+	decoded, err := hexDecode(swap2Discriminator)
+	if err != nil {
+		return nil, fmt.Errorf("decode Meteora swap discriminator: %w", err)
+	}
 	copy(data[:8], decoded)
 	binary.LittleEndian.PutUint64(data[8:16], amountIn.Uint64())
 	binary.LittleEndian.PutUint64(data[16:24], minimumOut.Uint64())
