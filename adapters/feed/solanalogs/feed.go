@@ -366,7 +366,29 @@ func (f *Feed) runBatchAccountSession(ctx context.Context, sink feedport.Sink, d
 	lastUpdate := make(map[uint64]time.Time)
 	ready := make(map[uint64]market.MarketEvent)
 	pendingTriggers := make(map[uint64][]solana.LogNotification)
-	processedSignatures := make(map[string]struct{})
+	processedSignatures := make(map[string]uint64)
+	const retainedBatchSlots uint64 = 512
+	prune := func(observed uint64) {
+		if observed <= retainedBatchSlots {
+			return
+		}
+		cutoff := observed - retainedBatchSlots
+		for candidate := range ready {
+			if candidate < cutoff {
+				delete(ready, candidate)
+			}
+		}
+		for candidate := range pendingTriggers {
+			if candidate < cutoff {
+				delete(pendingTriggers, candidate)
+			}
+		}
+		for signature, candidate := range processedSignatures {
+			if candidate < cutoff {
+				delete(processedSignatures, signature)
+			}
+		}
+	}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	flush := func() error {
@@ -416,7 +438,7 @@ func (f *Feed) runBatchAccountSession(ctx context.Context, sink feedport.Sink, d
 					if err := separatedSink.PublishTrigger(ctx, triggerEvent); err != nil {
 						return err
 					}
-					processedSignatures[trigger.Signature] = struct{}{}
+					processedSignatures[trigger.Signature] = candidate
 				}
 				delete(pendingTriggers, candidate)
 			}
@@ -433,6 +455,7 @@ func (f *Feed) runBatchAccountSession(ctx context.Context, sink feedport.Sink, d
 			}
 			return true, true, err
 		case update := <-updates:
+			prune(update.slot)
 			pending[update.slot] = append(pending[update.slot], AccountChange{Slot: update.slot, Account: update.account, Value: update.value, Program: update.programDecoder != nil})
 			lastUpdate[update.slot] = time.Now()
 		case err, open := <-logErrors(logSubscription):
@@ -452,6 +475,7 @@ func (f *Feed) runBatchAccountSession(ctx context.Context, sink feedport.Sink, d
 			if notification.Err != nil && string(notification.Err) != "null" || notification.Signature == "" || !matcher.IsEconomicLog(notification) {
 				continue
 			}
+			prune(notification.Slot)
 			if _, duplicate := processedSignatures[notification.Signature]; duplicate {
 				continue
 			}
@@ -471,7 +495,7 @@ func (f *Feed) runBatchAccountSession(ctx context.Context, sink feedport.Sink, d
 				if err := separatedSink.PublishTrigger(ctx, triggerEvent); err != nil {
 					return true, false, err
 				}
-				processedSignatures[notification.Signature] = struct{}{}
+				processedSignatures[notification.Signature] = notification.Slot
 				delete(pendingTriggers, notification.Slot)
 			}
 		case <-ticker.C:
