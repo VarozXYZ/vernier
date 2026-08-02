@@ -18,6 +18,42 @@ type clientFunc func(*http.Request) (*http.Response, error)
 
 func (f clientFunc) Do(request *http.Request) (*http.Response, error) { return f(request) }
 
+func TestSenderPostsReadableInsufficientBalanceRuntimeAlert(t *testing.T) {
+	var message string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat", BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			message = payload.Text
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+				`{"ok":true,"result":{"message_id":1}}`,
+			))}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.SendLiveRuntime(context.Background(), notificationport.LiveRuntimeEvent{
+		Kind:  notificationport.LiveRuntimeBalanceInsufficient,
+		Chain: "chain-b", Token: "BASE", AvailableUnits: "3980", RequiredUnits: "4000",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"INSUFFICIENT BALANCE", "chain-b", "Available <code>3980 BASE</code>",
+		"Required <code>4000 BASE</code>",
+	} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("balance alert does not contain %q: %s", expected, message)
+		}
+	}
+}
+
 func TestSenderPostsOneCompleteOpeningMessage(t *testing.T) {
 	requests := 0
 	sender, err := telegram.New(telegram.Config{
@@ -478,6 +514,91 @@ func TestSenderCreatesOneLiveMessageAndEditsItForEveryUpdate(t *testing.T) {
 		if !strings.Contains(final, expected) {
 			t.Fatalf("final Live message does not contain %q: %s", expected, final)
 		}
+	}
+}
+
+func TestRecoveredExecutionFinishesAsCompleteWithoutPendingStages(t *testing.T) {
+	t.Parallel()
+
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":73}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := "recovered-operation"
+	events := []notificationport.LiveExecutionEvent{
+		{
+			Kind: notificationport.LiveExecutionStarted, Operation: operation,
+			Direction: "Solana -> Polygon", Input: "500 USDC",
+		},
+		{
+			Kind: notificationport.LiveExecutionStageStarted, Operation: operation,
+			Stage: "bridge_base", Ordinal: 3, TotalStages: 4,
+			SourceChain: "Solana", DestinationChain: "Polygon",
+			Input: "2000 BASE",
+		},
+		{
+			Kind: notificationport.LiveExecutionFailed, Operation: operation,
+			Stage: "bridge_base", Ordinal: 3, Detail: "balance visibility timeout",
+		},
+		{
+			Kind: notificationport.LiveExecutionRecoveryStarted, Operation: operation,
+			Detail: "stage 3/4",
+		},
+		{
+			Kind: notificationport.LiveExecutionStageCompleted, Operation: operation,
+			Stage: "bridge_base", Ordinal: 3, TotalStages: 4,
+			SourceChain: "Solana", DestinationChain: "Polygon",
+			Input: "2000 BASE", Output: "2000 BASE",
+		},
+		{
+			Kind: notificationport.LiveExecutionStageCompleted, Operation: operation,
+			Stage: "bridge_quote_return", Ordinal: 4, TotalStages: 4,
+			SourceChain: "Polygon", DestinationChain: "Solana",
+			Input: "502 USDC", Output: "502 USDC",
+		},
+		{
+			Kind: notificationport.LiveExecutionRecoveryCompleted, Operation: operation,
+			Output: "502 USDC",
+		},
+		{
+			Kind: notificationport.LiveExecutionCompleted, Operation: operation,
+			Direction: "Solana -> Polygon", Input: "500 USDC",
+			Output: "502 USDC", ExecutionCost: "0.5 USDC", NetPnL: "+1.5 USDC",
+		},
+	}
+	for _, event := range events {
+		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	final := messages[len(messages)-1]
+	if !strings.Contains(final, "LIVE") ||
+		!strings.Contains(final, "COMPLETE") ||
+		!strings.Contains(final, "Recovered automatically") {
+		t.Fatalf("recovered final message is incomplete:\n%s", final)
+	}
+	if strings.Contains(final, "RECOVERED</b>") ||
+		strings.Contains(final, "\u23f3 <b>3/4") {
+		t.Fatalf("recovered final message retains transient state:\n%s", final)
 	}
 }
 

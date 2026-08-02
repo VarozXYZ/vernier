@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -71,6 +72,10 @@ func (s *SequentialLiveStore) CreateRecoverableSequentialOperation(
 		admissionCostCapturedAt =
 			candidate.Cost.CapturedAt.UTC().Format(time.RFC3339Nano)
 	}
+	decimalsJSON, err := json.Marshal(plan.TokenDecimals)
+	if err != nil {
+		return fmt.Errorf("encode sequential token decimals: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sequential_live_plan_snapshots (
 		operation_id, plan_id, evaluation_id, config_hash,
 		buy_market, sell_market, initial_token, initial_units,
@@ -79,8 +84,9 @@ func (s *SequentialLiveStore) CreateRecoverableSequentialOperation(
 		sell_input_units, sell_output_token, sell_output_units,
 		forced_canary, execution_policy_kind, admission_cost_id,
 		admission_cost_asset, admission_cost_value,
-		admission_cost_captured_at, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		admission_cost_captured_at, base_asset, quote_asset,
+		token_decimals_json, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		operation.ID, plan.ID, plan.Opportunity.Evaluation,
 		plan.Opportunity.ConfigHash, plan.Opportunity.Direction.BuyMarket,
 		plan.Opportunity.Direction.SellMarket, plan.InitialInput.Token(),
@@ -93,7 +99,8 @@ func (s *SequentialLiveStore) CreateRecoverableSequentialOperation(
 		candidate.SellQuote.AmountOut.Token(),
 		candidate.SellQuote.AmountOut.Units().String(), forced,
 		plan.EffectivePolicy(), admissionCostID, admissionCostAsset,
-		admissionCostValue, admissionCostCapturedAt,
+		admissionCostValue, admissionCostCapturedAt, plan.BaseAsset,
+		plan.QuoteAsset, string(decimalsJSON),
 		plan.CreatedAt.UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		return fmt.Errorf("persist sequential plan snapshot: %w", err)
@@ -299,6 +306,7 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		policyKind                                                 domainexecution.ExecutionPolicyKind
 		admissionCostID, admissionCostAsset, admissionCostValue    string
 		admissionCostCapturedAt                                    string
+		baseAsset, quoteAsset, tokenDecimalsJSON                   string
 	)
 	err := s.db.QueryRowContext(ctx, `SELECT plan_id, evaluation_id,
 		config_hash, buy_market, sell_market, initial_token, initial_units,
@@ -307,7 +315,8 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		sell_input_units, sell_output_token, sell_output_units,
 		forced_canary, execution_policy_kind, admission_cost_id,
 		admission_cost_asset, admission_cost_value,
-		admission_cost_captured_at, created_at
+		admission_cost_captured_at, base_asset, quote_asset,
+		token_decimals_json, created_at
 		FROM sequential_live_plan_snapshots WHERE operation_id=?`,
 		operation.ID,
 	).Scan(
@@ -317,7 +326,8 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		&sellInputToken, &sellInputUnits, &sellOutputToken,
 		&sellOutputUnits, &forced, &policyKind, &admissionCostID,
 		&admissionCostAsset, &admissionCostValue,
-		&admissionCostCapturedAt, &created,
+		&admissionCostCapturedAt, &baseAsset, &quoteAsset,
+		&tokenDecimalsJSON, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domainexecution.SequentialPlan{}, fmt.Errorf(
@@ -450,6 +460,11 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 			return domainexecution.SequentialPlan{}, err
 		}
 	}
+	tokenDecimals := make(map[market.TokenID]uint8)
+	if err := json.Unmarshal([]byte(tokenDecimalsJSON), &tokenDecimals); err != nil {
+		return domainexecution.SequentialPlan{},
+			fmt.Errorf("decode durable token decimals: %w", err)
+	}
 	plan := domainexecution.SequentialPlan{
 		ID:     domainexecution.PlanID(planID),
 		Policy: policyKind,
@@ -466,7 +481,9 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 			Reasons:        reasons,
 		},
 		InitialInput: initial, DiscoveryAmount: discovery,
-		Stages: stages, CircuitBreaker: circuit, CreatedAt: createdAt.UTC(),
+		Stages: stages, CircuitBreaker: circuit,
+		BaseAsset: market.AssetID(baseAsset), QuoteAsset: market.AssetID(quoteAsset),
+		TokenDecimals: tokenDecimals, CreatedAt: createdAt.UTC(),
 	}
 	if err := plan.Validate(); err != nil {
 		return domainexecution.SequentialPlan{}, err
@@ -512,6 +529,10 @@ func (s *SequentialLiveStore) loadSequentialTransactions(
 ) ([]executionport.SequentialTransactionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT ordinal, phase, chain_name,
 		account_id, identity, nonce, blockhash, last_valid_block_height,
+		simulation_input_token, simulation_input_units,
+		simulation_output_token, simulation_output_units,
+		simulation_evidence, simulation_context_version,
+		simulation_units_consumed,
 		status, last_error, prepared_at, updated_at, first_uncertain_at,
 		recovery_reason, recovery_attempts, next_recovery_attempt
 		FROM sequential_live_transactions
@@ -526,12 +547,15 @@ func (s *SequentialLiveStore) loadSequentialTransactions(
 	for rows.Next() {
 		var record executionport.SequentialTransactionRecord
 		var chain, account, hash, nonce, blockhash string
+		var simInToken, simInUnits, simOutToken, simOutUnits string
 		var prepared, updated, uncertain, retry string
 		var lastValid uint64
 		record.Operation = operationID
 		if err := rows.Scan(
 			&record.Ordinal, &record.Phase, &chain, &account, &hash,
-			&nonce, &blockhash, &lastValid, &record.Status,
+			&nonce, &blockhash, &lastValid, &simInToken, &simInUnits,
+			&simOutToken, &simOutUnits, &record.SimulationEvidence,
+			&record.SimulationVersion, &record.SimulationUnits, &record.Status,
 			&record.LastError, &prepared, &updated, &uncertain,
 			&record.RecoveryReason, &record.RecoveryAttempts, &retry,
 		); err != nil {
@@ -542,6 +566,19 @@ func (s *SequentialLiveStore) loadSequentialTransactions(
 			Account: domainexecution.AccountID(account),
 			Hash:    hash, Blockhash: blockhash,
 			LastValidBlockHeight: lastValid,
+		}
+		if simInToken != "" || simInUnits != "" || simOutToken != "" || simOutUnits != "" {
+			if simInToken == "" || simInUnits == "" || simOutToken == "" || simOutUnits == "" {
+				return nil, fmt.Errorf("durable simulation evidence is incomplete")
+			}
+			record.SimulatedInput, err = market.ParseTokenAmount(market.TokenID(simInToken), simInUnits)
+			if err != nil {
+				return nil, err
+			}
+			record.SimulatedOutput, err = market.ParseTokenAmount(market.TokenID(simOutToken), simOutUnits)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if nonce != "" {
 			value, parseErr := strconv.ParseUint(nonce, 10, 64)
@@ -626,6 +663,17 @@ func (s *SequentialLiveStore) loadSequentialSettlements(
 		)
 		if err != nil {
 			return nil, nil, err
+		}
+		if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+			ordinal == 1 && input.Token() != stage.InputToken {
+			sell := plan.Stages[1]
+			if input.Token() != sell.OutputToken || output.Token() != sell.InputToken {
+				return nil, nil, fmt.Errorf("durable alternate buy settlement is invalid")
+			}
+			stage.SourceChain = sell.SourceChain
+			stage.InputToken = sell.OutputToken
+			stage.OutputToken = sell.InputToken
+			stage.Market = sell.Market
 		}
 		observedAt, err := time.Parse(time.RFC3339Nano, observed)
 		if err != nil {

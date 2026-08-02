@@ -18,6 +18,10 @@ type Executor interface {
 	) (executionport.SequentialResult, error)
 }
 
+type PlanAdmission interface {
+	Admit(execution.SequentialPlan) error
+}
+
 type Event struct {
 	Operation execution.OperationID
 	Result    executionport.SequentialResult
@@ -45,7 +49,14 @@ type Manager struct {
 	closed        bool
 	accepted      int
 	maxOperations int
+	admission     PlanAdmission
 	wg            sync.WaitGroup
+}
+
+func (m *Manager) SetAdmission(admission PlanAdmission) {
+	m.mu.Lock()
+	m.admission = admission
+	m.mu.Unlock()
 }
 
 func NewManager(
@@ -84,6 +95,14 @@ func (m *Manager) Offer(opportunity arbitrage.Opportunity) (bool, error) {
 	plan, err := m.planner.Plan(opportunity)
 	if err != nil {
 		return false, err
+	}
+	m.mu.Lock()
+	admission := m.admission
+	m.mu.Unlock()
+	if admission != nil {
+		if err := admission.Admit(plan); err != nil {
+			return false, err
+		}
 	}
 	operationID, err := newOperationID()
 	if err != nil {

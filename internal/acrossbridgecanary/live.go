@@ -2,6 +2,8 @@ package acrossbridgecanary
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -323,6 +325,27 @@ func (s *LiveService) RecoverTransfer(
 		return crosschainport.LiveTransferResult{}, err
 	}
 	operationID := acrossLiveOperationID(request)
+	lookup, err := sqlitestore.OpenAcrossCanary(s.config.StorePath)
+	if err != nil {
+		return crosschainport.LiveTransferResult{}, err
+	}
+	persistedBySource, lookupErr := lookup.GetBySourceIdentity(
+		ctx,
+		source.Identity.Hash,
+	)
+	_ = lookup.Close()
+	if lookupErr == nil {
+		// Recovery attempts created before the outer transaction identity was
+		// persisted use a unique child operation ID. Resolve it by the durable
+		// source transaction instead of assuming the deterministic first ID.
+		operationID = persistedBySource.ID
+	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
+		return crosschainport.LiveTransferResult{},
+			executionport.NewRecoveryError(
+				executionport.RecoveryFailureTemporary,
+				fmt.Errorf("resolve Across recovery operation: %w", lookupErr),
+			)
+	}
 	if err := resumeArmedWithWatcher(
 		ctx,
 		s.config.Output,

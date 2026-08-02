@@ -44,6 +44,8 @@ type LiveServiceConfig struct {
 	BalanceVisibilityTimeout time.Duration
 	BalancePollInterval      time.Duration
 	Output                   io.Writer
+	SourceTokenBalance       func(market.ChainID) (*big.Int, error)
+	NativeBalance            func(market.ChainID) (*big.Int, error)
 }
 
 type LiveService struct {
@@ -207,6 +209,8 @@ func (s *LiveService) transfer(
 		SolanaNativeAsset:        s.config.SolanaNativeAsset,
 		EVMNativeAsset:           s.config.EVMNativeAsset,
 		NonceCoordinator:         s.config.NonceCoordinator,
+		SourceTokenBalance:       s.config.SourceTokenBalance,
+		NativeBalance:            s.config.NativeBalance,
 		BalanceVisibilityTimeout: s.config.BalanceVisibilityTimeout,
 		BalancePollInterval:      s.config.BalancePollInterval,
 		Result:                   result,
@@ -261,11 +265,36 @@ func (s *LiveService) transfer(
 			return s.destinationBalance(readCtx, route)
 		},
 	)
+	evidence := "wormhole_ntt_destination_balance"
+	var settlementBefore, settlementAfter *big.Int
 	if err != nil {
-		return crosschainport.LiveTransferResult{},
-			executionport.NewStageError(executionport.DispositionPossible, err)
+		if ctx.Err() != nil {
+			return crosschainport.LiveTransferResult{},
+				executionport.NewStageError(
+					executionport.DispositionPossible,
+					ctx.Err(),
+				)
+		}
+		// A successful destination redeem is the authoritative NTT
+		// settlement. The wallet balance is only corroborating evidence and
+		// may move concurrently because prefunded execution can consume or
+		// replenish the same inventory while the RPC catches up. Recovery
+		// already reconstructs this exact settlement from the two confirmed
+		// transaction identities, so do the same on the initial path instead
+		// of unnecessarily leaving the parent saga active.
+		fmt.Fprintf(
+			s.config.Output,
+			"ntt_settlement warning=destination_balance_unavailable action=accept_confirmed_destination_transaction source_tx=%s destination_tx=%s detail=%q\n",
+			result.SourceIdentity.Hash,
+			result.DestinationIdentity.Hash,
+			err,
+		)
+		evidence = "wormhole_ntt_confirmed_destination_transaction"
+	} else {
+		settlementBefore = new(big.Int).Set(before)
+		settlementAfter = new(big.Int).Set(after)
 	}
-	if attempts > 1 {
+	if err == nil && attempts > 1 {
 		fmt.Fprintf(
 			s.config.Output,
 			"ntt_settlement phase=destination_balance_visible attempts=%d before_units=%s after_units=%s observed_delta_units=%s expected_delta_units=%s\n",
@@ -292,9 +321,9 @@ func (s *LiveService) transfer(
 		Costs:                    append([]domainexecution.CostComponent(nil), result.Costs...),
 		SourceIdentity:           result.SourceIdentity,
 		DestinationIdentity:      result.DestinationIdentity,
-		DestinationBalanceBefore: new(big.Int).Set(before),
-		DestinationBalanceAfter:  new(big.Int).Set(after),
-		ObservedAt:               time.Now().UTC(), Evidence: "wormhole_ntt_destination_balance",
+		DestinationBalanceBefore: settlementBefore,
+		DestinationBalanceAfter:  settlementAfter,
+		ObservedAt:               time.Now().UTC(), Evidence: evidence,
 	}, nil
 }
 

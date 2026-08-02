@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -78,6 +79,13 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			nonce TEXT NOT NULL DEFAULT '',
 			blockhash TEXT NOT NULL DEFAULT '',
 			last_valid_block_height INTEGER NOT NULL DEFAULT 0,
+			simulation_input_token TEXT NOT NULL DEFAULT '',
+			simulation_input_units TEXT NOT NULL DEFAULT '',
+			simulation_output_token TEXT NOT NULL DEFAULT '',
+			simulation_output_units TEXT NOT NULL DEFAULT '',
+			simulation_evidence TEXT NOT NULL DEFAULT '',
+			simulation_context_version INTEGER NOT NULL DEFAULT 0,
+			simulation_units_consumed INTEGER NOT NULL DEFAULT 0,
 			status TEXT NOT NULL,
 			last_error TEXT NOT NULL DEFAULT '',
 			prepared_at TEXT NOT NULL,
@@ -124,6 +132,13 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			external_cost_value TEXT NOT NULL,
 			gross_value TEXT NOT NULL,
 			net_value TEXT NOT NULL,
+			quote_delta_asset TEXT NOT NULL DEFAULT '',
+			quote_delta_value TEXT NOT NULL DEFAULT '',
+			base_delta_asset TEXT NOT NULL DEFAULT '',
+			base_delta_value TEXT NOT NULL DEFAULT '',
+			marked_base_asset TEXT NOT NULL DEFAULT '',
+			marked_base_value TEXT NOT NULL DEFAULT '',
+			mark_price TEXT NOT NULL DEFAULT '',
 			recorded_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS sequential_live_exit_decisions (
@@ -167,6 +182,9 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			admission_cost_asset TEXT NOT NULL DEFAULT '',
 			admission_cost_value TEXT NOT NULL DEFAULT '',
 			admission_cost_captured_at TEXT NOT NULL DEFAULT '',
+			base_asset TEXT NOT NULL DEFAULT '',
+			quote_asset TEXT NOT NULL DEFAULT '',
+			token_decimals_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS sequential_live_plan_stages (
@@ -254,6 +272,20 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sequential_live_transactions
 			ADD COLUMN next_recovery_attempt TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN simulation_input_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN simulation_input_units TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN simulation_output_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN simulation_output_units TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN simulation_evidence TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN simulation_context_version INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sequential_live_transactions
+			ADD COLUMN simulation_units_consumed INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sequential_live_settlements
 			ADD COLUMN destination_balance_before TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sequential_live_settlements
@@ -269,6 +301,26 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			ADD COLUMN admission_cost_value TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sequential_live_plan_snapshots
 			ADD COLUMN admission_cost_captured_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN base_asset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN quote_asset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_plan_snapshots
+			ADD COLUMN token_decimals_json TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE sequential_live_results
+			ADD COLUMN quote_delta_asset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_results
+			ADD COLUMN quote_delta_value TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_results
+			ADD COLUMN base_delta_asset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_results
+			ADD COLUMN base_delta_value TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_results
+			ADD COLUMN marked_base_asset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_results
+			ADD COLUMN marked_base_value TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sequential_live_results
+			ADD COLUMN mark_price TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sequential_live_plan_stages
 			ADD COLUMN branch TEXT NOT NULL DEFAULT 'main'`,
 		`ALTER TABLE sequential_live_plan_stages
@@ -303,13 +355,25 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 
 func sequentialMigrationRequired(db *sql.DB) (bool, error) {
 	for table, columns := range map[string][]string{
+		"sequential_live_transactions": {
+			"simulation_input_token", "simulation_input_units",
+			"simulation_output_token", "simulation_output_units",
+			"simulation_evidence", "simulation_context_version",
+			"simulation_units_consumed",
+		},
 		"sequential_live_plan_snapshots": {
 			"execution_policy_kind", "admission_cost_id",
 			"admission_cost_asset", "admission_cost_value",
-			"admission_cost_captured_at",
+			"admission_cost_captured_at", "base_asset", "quote_asset",
+			"token_decimals_json",
 		},
 		"sequential_live_plan_stages": {
 			"branch", "depends_on", "input_from_ordinal",
+		},
+		"sequential_live_results": {
+			"quote_delta_asset", "quote_delta_value", "base_delta_asset",
+			"base_delta_value", "marked_base_asset", "marked_base_value",
+			"mark_price",
 		},
 	} {
 		rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
@@ -340,6 +404,13 @@ func sequentialMigrationRequired(db *sql.DB) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func ratString(value *big.Rat) string {
+	if value == nil {
+		return ""
+	}
+	return value.RatString()
 }
 
 func (s *SequentialLiveStore) RecordSequentialExitDecision(
@@ -418,17 +489,23 @@ func (s *SequentialLiveStore) RecordSequentialResult(
 	}
 	inserted, err := s.db.ExecContext(ctx, `INSERT INTO sequential_live_results (
 		operation_id, final_token, final_units, cost_asset, cost_value,
-		external_cost_value, gross_value, net_value, recorded_at
-	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		external_cost_value, gross_value, net_value, quote_delta_asset,
+		quote_delta_value, base_delta_asset, base_delta_value,
+		marked_base_asset, marked_base_value, mark_price, recorded_at
+	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
 			WHERE operation_id=? AND state IN ('running', 'recovering')
-				AND current_stage IN (4, 5)
+				AND current_stage IN (2, 4, 5)
 			)`,
 		result.Operation, result.FinalAmount.Token(),
 		result.FinalAmount.Units().String(), result.ExecutionCost.Asset(),
 		result.ExecutionCost.String(), result.ExternalCost.String(),
 		result.RealizedGross.String(), result.RealizedNetPnL.String(),
+		result.QuoteDelta.Asset(), result.QuoteDelta.String(),
+		result.BaseDelta.Asset(), result.BaseDelta.String(),
+		result.MarkedBase.Asset(), result.MarkedBase.String(),
+		ratString(result.MarkPrice),
 		time.Now().UTC().Format(time.RFC3339Nano), result.Operation,
 	)
 	if err != nil {
@@ -479,10 +556,14 @@ func (s *SequentialLiveStore) RecordPreparedTransaction(
 		nonce = strconv.FormatUint(*prepared.Identity.Nonce, 10)
 	}
 	at := prepared.PreparedAt.UTC().Format(time.RFC3339Nano)
+	simInToken, simInUnits, simOutToken, simOutUnits := simulationFields(prepared)
 	result, err := s.db.ExecContext(ctx, `INSERT INTO sequential_live_transactions (
 		operation_id, ordinal, phase, chain_name, account_id, identity, nonce,
-		blockhash, last_valid_block_height, status, prepared_at, updated_at
-	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?
+		blockhash, last_valid_block_height, simulation_input_token,
+		simulation_input_units, simulation_output_token, simulation_output_units,
+		simulation_evidence, simulation_context_version,
+		simulation_units_consumed, status, prepared_at, updated_at
+	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
 			WHERE operation_id=? AND state IN ('running', 'recovering')
@@ -490,7 +571,10 @@ func (s *SequentialLiveStore) RecordPreparedTransaction(
 		prepared.Operation, prepared.Ordinal, prepared.Phase,
 		prepared.Identity.Chain, prepared.Identity.Account,
 		prepared.Identity.Hash, nonce, prepared.Identity.Blockhash,
-		prepared.Identity.LastValidBlockHeight, at, at, prepared.Operation,
+		prepared.Identity.LastValidBlockHeight, simInToken, simInUnits,
+		simOutToken, simOutUnits, prepared.SimulationEvidence,
+		prepared.SimulationContextVersion, prepared.SimulationUnitsConsumed,
+		at, at, prepared.Operation,
 	)
 	if err != nil {
 		return fmt.Errorf("persist prepared sequential transaction: %w", err)
@@ -500,6 +584,68 @@ func (s *SequentialLiveStore) RecordPreparedTransaction(
 		return fmt.Errorf("running sequential operation was not found")
 	}
 	return nil
+}
+
+func (s *SequentialLiveStore) RecordPreparedTransactions(
+	ctx context.Context,
+	prepared []executionport.PreparedTransaction,
+) error {
+	if len(prepared) == 0 {
+		return fmt.Errorf("prepared transaction batch is empty")
+	}
+	for _, item := range prepared {
+		if err := item.Validate(); err != nil {
+			return err
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, item := range prepared {
+		nonce := ""
+		if item.Identity.Nonce != nil {
+			nonce = strconv.FormatUint(*item.Identity.Nonce, 10)
+		}
+		at := item.PreparedAt.UTC().Format(time.RFC3339Nano)
+		simInToken, simInUnits, simOutToken, simOutUnits := simulationFields(item)
+		result, insertErr := tx.ExecContext(ctx, `INSERT INTO sequential_live_transactions (
+			operation_id, ordinal, phase, chain_name, account_id, identity, nonce,
+			blockhash, last_valid_block_height, simulation_input_token,
+			simulation_input_units, simulation_output_token, simulation_output_units,
+			simulation_evidence, simulation_context_version,
+			simulation_units_consumed, status, prepared_at, updated_at
+		) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?
+			WHERE EXISTS (SELECT 1 FROM sequential_live_operations
+			WHERE operation_id=? AND state IN ('running', 'recovering'))`,
+			item.Operation, item.Ordinal, item.Phase, item.Identity.Chain,
+			item.Identity.Account, item.Identity.Hash, nonce,
+			item.Identity.Blockhash, item.Identity.LastValidBlockHeight,
+			simInToken, simInUnits, simOutToken, simOutUnits,
+			item.SimulationEvidence, item.SimulationContextVersion,
+			item.SimulationUnitsConsumed,
+			at, at, item.Operation,
+		)
+		if insertErr != nil {
+			return fmt.Errorf("persist prepared transaction batch: %w", insertErr)
+		}
+		affected, _ := result.RowsAffected()
+		if affected != 1 {
+			return fmt.Errorf("running sequential operation was not found")
+		}
+	}
+	return tx.Commit()
+}
+
+func simulationFields(
+	prepared executionport.PreparedTransaction,
+) (string, string, string, string) {
+	if prepared.SimulatedInput.IsZero() {
+		return "", "", "", ""
+	}
+	return string(prepared.SimulatedInput.Token()), prepared.SimulatedInput.Units().String(),
+		string(prepared.SimulatedOutput.Token()), prepared.SimulatedOutput.Units().String()
 }
 
 func (s *SequentialLiveStore) MarkTransaction(
@@ -685,10 +831,13 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 		}
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE sequential_live_operations
-		SET current_stage=?, current_token=?, current_units=?, updated_at=?
+		SET current_token=CASE WHEN ? >= current_stage THEN ? ELSE current_token END,
+			current_units=CASE WHEN ? >= current_stage THEN ? ELSE current_units END,
+			current_stage=MAX(current_stage, ?), updated_at=?
 		WHERE operation_id=? AND state IN ('running', 'recovering')`,
 		settlement.Request.Stage.Ordinal, settlement.ActualOutput.Token(),
-		settlement.ActualOutput.Units().String(),
+		settlement.Request.Stage.Ordinal, settlement.ActualOutput.Units().String(),
+		settlement.Request.Stage.Ordinal,
 		settlement.ObservedAt.UTC().Format(time.RFC3339Nano),
 		settlement.Request.Operation,
 	)
@@ -728,26 +877,76 @@ func validateSettlementExtension(
 	if err != nil {
 		return err
 	}
-	if policy != domainexecution.PolicyPrefundedSequential {
+	if policy != domainexecution.PolicyPrefundedSequential &&
+		policy != domainexecution.PolicyPrefundedParallel {
 		return fmt.Errorf("unsupported dependent execution policy")
 	}
 
 	var (
-		stage, branch, inputToken, dependencies string
-		inputFrom                               int
+		stage, branch, inputToken, outputToken, sourceChain, marketID, dependencies string
+		inputFrom                                                                   int
 	)
 	err = tx.QueryRowContext(ctx, `SELECT stage, branch, input_token,
-		depends_on, input_from_ordinal
+		output_token, source_chain, market_id, depends_on, input_from_ordinal
 		FROM sequential_live_plan_stages
 		WHERE operation_id=? AND ordinal=?`,
 		settlement.Request.Operation,
 		settlement.Request.Stage.Ordinal,
-	).Scan(&stage, &branch, &inputToken, &dependencies, &inputFrom)
+	).Scan(&stage, &branch, &inputToken, &outputToken, &sourceChain,
+		&marketID, &dependencies, &inputFrom)
 	if err != nil {
 		return err
 	}
-	if stage != string(settlement.Request.Stage.Stage) ||
-		inputToken != string(settlement.Request.Input.Token()) {
+	if stage != string(settlement.Request.Stage.Stage) {
+		return fmt.Errorf("settlement does not match its durable stage")
+	}
+	if policy == domainexecution.PolicyPrefundedParallel {
+		normal := inputToken == string(settlement.Request.Input.Token()) &&
+			outputToken == string(settlement.ActualOutput.Token()) &&
+			sourceChain == string(settlement.Request.Stage.SourceChain) &&
+			marketID == string(settlement.Request.Stage.Market)
+		alternateBuy := false
+		if settlement.Request.Stage.Ordinal == 1 && !normal {
+			var sellSource, sellInput, sellOutput, sellMarket string
+			queryErr := tx.QueryRowContext(ctx, `SELECT source_chain,
+				input_token, output_token, market_id
+				FROM sequential_live_plan_stages
+				WHERE operation_id=? AND ordinal=2`,
+				settlement.Request.Operation,
+			).Scan(&sellSource, &sellInput, &sellOutput, &sellMarket)
+			alternateBuy = queryErr == nil &&
+				string(settlement.Request.Stage.SourceChain) == sellSource &&
+				string(settlement.Request.Input.Token()) == sellOutput &&
+				string(settlement.ActualOutput.Token()) == sellInput &&
+				string(settlement.Request.Stage.Market) == sellMarket
+		}
+		if !normal && !alternateBuy {
+			return fmt.Errorf("parallel settlement does not match a durable execution leg")
+		}
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+			FROM sequential_live_settlements
+			WHERE operation_id=? AND ordinal=?`,
+			settlement.Request.Operation, settlement.Request.Stage.Ordinal,
+		).Scan(&exists); err != nil || exists != 0 {
+			return fmt.Errorf("parallel settlement already exists")
+		}
+		for _, dependency := range strings.Split(dependencies, ",") {
+			dependency = strings.TrimSpace(dependency)
+			if dependency == "" {
+				continue
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+				FROM sequential_live_settlements
+				WHERE operation_id=? AND ordinal=?`,
+				settlement.Request.Operation, dependency,
+			).Scan(&exists); err != nil || exists != 1 {
+				return fmt.Errorf("durable dependency is unsettled")
+			}
+		}
+		return nil
+	}
+	if inputToken != string(settlement.Request.Input.Token()) {
 		return fmt.Errorf("settlement does not match its durable stage")
 	}
 	if settlement.Request.Stage.Ordinal == 1 {

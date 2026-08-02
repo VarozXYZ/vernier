@@ -30,17 +30,19 @@ type RefuelNetwork interface {
 }
 
 type SwapRefuelExecutorConfig struct {
-	Chain          market.ChainID
-	Market         market.MarketID
-	Account        execution.AccountID
-	QuoteToken     market.Token
-	NativeToken    market.Token
-	NativeAsset    market.AssetID
-	Binding        SwapBinding
-	Network        RefuelNetwork
-	Prices         *CostValuator
-	Clock          func() time.Time
-	ConfirmTimeout time.Duration
+	Chain              market.ChainID
+	Market             market.MarketID
+	Account            execution.AccountID
+	QuoteToken         market.Token
+	NativeToken        market.Token
+	NativeAsset        market.AssetID
+	Binding            SwapBinding
+	Network            RefuelNetwork
+	Prices             *CostValuator
+	Clock              func() time.Time
+	ConfirmTimeout     time.Duration
+	LocalNativeBalance func() (*big.Int, error)
+	OnSettled          func(executionport.RefuelRecord) error
 }
 
 type SwapRefuelExecutor struct {
@@ -79,7 +81,7 @@ func (e *SwapRefuelExecutor) Chain() market.ChainID {
 func (e *SwapRefuelExecutor) Balance(
 	ctx context.Context,
 ) (executionport.RefuelBalance, error) {
-	units, err := e.config.Network.NativeBalance(ctx)
+	units, err := e.nativeBalance(ctx)
 	if err != nil {
 		return executionport.RefuelBalance{}, err
 	}
@@ -184,6 +186,7 @@ func (e *SwapRefuelExecutor) Execute(
 		receivedUnits,
 		feeUnits,
 		journal,
+		true,
 	)
 }
 
@@ -223,7 +226,20 @@ func (e *SwapRefuelExecutor) prepare(
 	if err != nil {
 		return executionport.RefuelRecord{}, chainport.PreparedTransaction{}, nil, err
 	}
-	beforeUnits, err := e.config.Network.NativeBalance(ctx)
+	if e.config.Binding.SpendableBalance != nil {
+		available, balanceErr := e.config.Binding.SpendableBalance.SpendableBalance(
+			ctx,
+			input.Token(),
+		)
+		if balanceErr != nil {
+			return executionport.RefuelRecord{}, chainport.PreparedTransaction{}, nil, balanceErr
+		}
+		if available == nil || available.Cmp(input.Units()) < 0 {
+			return executionport.RefuelRecord{}, chainport.PreparedTransaction{}, nil,
+				fmt.Errorf("local quote balance is insufficient for refuel")
+		}
+	}
+	beforeUnits, err := e.nativeBalance(ctx)
 	if err != nil {
 		return executionport.RefuelRecord{}, chainport.PreparedTransaction{}, nil, err
 	}
@@ -333,7 +349,7 @@ func (e *SwapRefuelExecutor) Reconcile(
 		}
 		return record, errors.New(record.LastError)
 	}
-	return e.finishRecord(ctx, record, after, received, fee, journal)
+	return e.finishRecord(ctx, record, after, received, fee, journal, false)
 }
 
 func (e *SwapRefuelExecutor) finishRecord(
@@ -341,6 +357,7 @@ func (e *SwapRefuelExecutor) finishRecord(
 	record executionport.RefuelRecord,
 	afterUnits, receivedUnits, feeUnits *big.Int,
 	journal executionport.RefuelJournal,
+	applyLocal bool,
 ) (executionport.RefuelRecord, error) {
 	var err error
 	record.BalanceAfter, err = quantityFromUnits(
@@ -375,7 +392,19 @@ func (e *SwapRefuelExecutor) finishRecord(
 	); err != nil {
 		return record, err
 	}
+	if applyLocal && e.config.OnSettled != nil {
+		if err := e.config.OnSettled(record); err != nil {
+			return record, fmt.Errorf("apply local refuel balance: %w", err)
+		}
+	}
 	return record, nil
+}
+
+func (e *SwapRefuelExecutor) nativeBalance(ctx context.Context) (*big.Int, error) {
+	if e.config.LocalNativeBalance != nil {
+		return e.config.LocalNativeBalance()
+	}
+	return e.config.Network.NativeBalance(ctx)
 }
 
 func quantityFromUnits(

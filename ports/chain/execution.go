@@ -4,9 +4,11 @@ package chain
 
 import (
 	"context"
+	"math/big"
 	"time"
 
 	"github.com/VarozXYZ/vernier/domain/execution"
+	"github.com/VarozXYZ/vernier/domain/market"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 )
 
@@ -50,6 +52,58 @@ type TxManager interface {
 // enter the emission path.
 type PreparedTransactionSimulator interface {
 	SimulatePrepared(context.Context, PreparedTransaction) error
+}
+
+// EconomicSimulationRequest carries the local, versioned output balance used
+// to derive an exact token delta without adding an account read to the hot
+// path. EVM simulators may ignore OutputBalanceBefore when the router returns
+// the amount directly.
+type EconomicSimulationRequest struct {
+	Prepared            PreparedTransaction
+	OutputBalanceBefore *big.Int
+	BalanceVersion      uint64
+}
+
+// EconomicSimulationResult is evidence from executing the exact signed
+// payload against the node's current state. It is never an execution promise;
+// it is the final pre-commit economic guard.
+type EconomicSimulationResult struct {
+	Input          market.TokenAmount
+	Output         market.TokenAmount
+	UnitsConsumed  uint64
+	ContextVersion uint64
+	Evidence       string
+}
+
+// EconomicOutputError is returned only after the exact payload simulated
+// successfully but its economic output could not be decoded or attributed.
+// Transport failures and on-chain reverts must use ordinary errors instead.
+type EconomicOutputError struct {
+	Err error
+}
+
+func (e *EconomicOutputError) Error() string {
+	if e == nil || e.Err == nil {
+		return "successful simulation has no attributable economic output"
+	}
+	return e.Err.Error()
+}
+
+func (e *EconomicOutputError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// EconomicPreparedTransactionSimulator is mandatory for prefunded_parallel.
+// A nil/zero output after a technically successful simulation is an invariant
+// failure and must block Live rather than fall back to provider estimates.
+type EconomicPreparedTransactionSimulator interface {
+	SimulatePreparedEconomic(
+		context.Context,
+		EconomicSimulationRequest,
+	) (EconomicSimulationResult, error)
 }
 
 // EVMNonceCoordinator is the single in-process authority for the next nonce of

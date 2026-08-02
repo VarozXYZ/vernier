@@ -127,6 +127,20 @@ func (m *settledTxManager) SimulatePrepared(
 	}
 	return m.simulationErr
 }
+
+func (m *settledTxManager) SimulatePreparedEconomic(
+	_ context.Context,
+	request chainport.EconomicSimulationRequest,
+) (chainport.EconomicSimulationResult, error) {
+	m.simulations++
+	if m.simulationErr != nil {
+		return chainport.EconomicSimulationResult{}, m.simulationErr
+	}
+	return chainport.EconomicSimulationResult{
+		Input: request.Prepared.Leg.Input, Output: m.actualOutput,
+		ContextVersion: request.BalanceVersion, Evidence: "test-economic-simulation",
+	}, nil
+}
 func (m *settledTxManager) Broadcast(
 	_ context.Context,
 	prepared chainport.PreparedTransaction,
@@ -1099,7 +1113,7 @@ func TestSwapDriverRejectsWhenSecondTransactionSimulationFails(t *testing.T) {
 	}
 }
 
-func TestPrefundedPreflightRetriesFreshDestinationAfterSimulationFailure(t *testing.T) {
+func TestPrefundedPreflightDoesNotRetryBeforeFirstSettlement(t *testing.T) {
 	now := time.Now().UTC()
 	plan := prefundedPreflightPlan(t, now)
 	journal := &durableJournal{}
@@ -1149,14 +1163,17 @@ func TestPrefundedPreflightRetriesFreshDestinationAfterSimulationFailure(t *test
 		ExitValidationAttempts:   2,
 		ExitValidationRetryDelay: time.Nanosecond,
 	}
-	if err := driver.Preflight(
+	err := driver.Preflight(
 		context.Background(),
 		"operation",
 		plan,
-	); err != nil {
-		t.Fatal(err)
+	)
+	if err == nil ||
+		executionport.ErrorDisposition(err) !=
+			executionport.DispositionRejected {
+		t.Fatalf("preflight error = %v", err)
 	}
-	if sellManager.simulations != 2 ||
+	if sellManager.simulations != 1 ||
 		buyManager.simulations != 1 ||
 		buyManager.broadcasts != 0 ||
 		sellManager.broadcasts != 0 {
@@ -1851,6 +1868,119 @@ func forcedPreflightPlan(
 		t.Fatal(err)
 	}
 	return plan
+}
+
+func TestPrefundedParallelPreflightUsesFixedIndependentInputsAndJointPnL(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	buyManager := &settledTxManager{actualOutput: mustLiveAmount(t, "base-a", "2010000000")}
+	sellManager := &settledTxManager{actualOutput: mustLiveAmount(t, "quote-b", "501500000")}
+	buyValidator := &fixedOutputValidator{now: now, output: big.NewInt(2_010_000_000)}
+	sellValidator := &fixedOutputValidator{now: now, output: big.NewInt(501_500_000)}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": parallelBinding(buyValidator, buyManager),
+			"market-b": parallelBinding(sellValidator, sellManager),
+		},
+		TokenDecimals: plan.TokenDecimals,
+		BaseAsset:     "base", QuoteAsset: "usdc", MinimumNet: big.NewRat(1, 1),
+		Clock: func() time.Time { return now },
+	}
+	if err := driver.Preflight(context.Background(), "operation-parallel", plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(sellValidator.inputs) != 1 {
+		t.Fatalf("sell builds = %d", len(sellValidator.inputs))
+	}
+	if got, want := sellValidator.inputs[0].Units().String(), "2000000000000000000"; got != want {
+		t.Fatalf("fixed sell input = %s, want %s", got, want)
+	}
+	driver.DiscardPreflight("operation-parallel")
+}
+
+func TestPrefundedParallelPreflightRejectsCombinedSimulationDeterioration(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	buyManager := &settledTxManager{actualOutput: mustLiveAmount(t, "base-a", "1990000000")}
+	sellManager := &settledTxManager{actualOutput: mustLiveAmount(t, "quote-b", "499500000")}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": parallelBinding(
+				&fixedOutputValidator{now: now, output: big.NewInt(1_990_000_000)}, buyManager,
+			),
+			"market-b": parallelBinding(
+				&fixedOutputValidator{now: now, output: big.NewInt(499_500_000)}, sellManager,
+			),
+		},
+		TokenDecimals: plan.TokenDecimals,
+		BaseAsset:     "base", QuoteAsset: "usdc", MinimumNet: big.NewRat(1, 1),
+		Clock: func() time.Time { return now },
+	}
+	err := driver.Preflight(context.Background(), "operation-negative", plan)
+	if err == nil || !strings.Contains(err.Error(), "joint simulated PnL is below threshold") {
+		t.Fatalf("preflight error = %v", err)
+	}
+}
+
+func parallelBinding(
+	validator executionport.Validator,
+	manager chainport.TxManager,
+) livecanary.SwapBinding {
+	return livecanary.SwapBinding{
+		Account: "account", Validator: validator, TxManager: manager,
+		BalanceSnapshot: func(market.TokenID) (*big.Int, uint64, error) {
+			return new(big.Int), 1, nil
+		},
+	}
+}
+
+func parallelPreflightPlan(t *testing.T, now time.Time) execution.SequentialPlan {
+	t.Helper()
+	original := preflightPlan(t, now)
+	candidate := original.Opportunity.Candidates[0]
+	candidate.Input, _ = market.NewAssetQuantity("usdc", big.NewRat(750, 1))
+	candidate.Cost = arbitrage.CostSnapshot{
+		ID: "complete-flow", Amount: mustLiveAsset(t, "usdc", "1"), CapturedAt: now,
+	}
+	original.Opportunity.Candidates[0] = candidate
+	initial := mustLiveAmount(t, "quote-a", "500000000")
+	plan, err := execution.NewPrefundedParallelPlan(
+		"parallel-plan", original.Opportunity, initial,
+		"chain-a", "chain-b", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.BaseAsset, plan.QuoteAsset = "base", "usdc"
+	plan.TokenDecimals = map[market.TokenID]uint8{
+		"quote-a": 6, "quote-b": 6, "base-a": 9, "base-b": 18,
+	}
+	if err := plan.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func mustLiveAmount(t *testing.T, token market.TokenID, units string) market.TokenAmount {
+	t.Helper()
+	value, ok := new(big.Int).SetString(units, 10)
+	if !ok {
+		t.Fatal("invalid token units")
+	}
+	amount, err := market.NewTokenAmount(token, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return amount
+}
+
+func mustLiveAsset(t *testing.T, asset market.AssetID, value string) market.AssetQuantity {
+	t.Helper()
+	amount, err := market.ParseAssetQuantity(asset, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return amount
 }
 
 func preflightPlan(

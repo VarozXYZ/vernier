@@ -33,6 +33,7 @@ import (
 	"github.com/VarozXYZ/vernier/core/saga"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/execution"
+	"github.com/VarozXYZ/vernier/domain/inventory"
 	"github.com/VarozXYZ/vernier/domain/market"
 	"github.com/VarozXYZ/vernier/internal/acrossbridgecanary"
 	"github.com/VarozXYZ/vernier/internal/nttmanualcanary"
@@ -73,7 +74,9 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		(config.Live.ExecutionPolicyKind !=
 			string(execution.PolicyTransportedSequential) &&
 			config.Live.ExecutionPolicyKind !=
-				string(execution.PolicyPrefundedSequential)) {
+				string(execution.PolicyPrefundedSequential) &&
+			config.Live.ExecutionPolicyKind !=
+				string(execution.PolicyPrefundedParallel)) {
 		return nil, fmt.Errorf("sequential Live composition configuration is incomplete")
 	}
 	if config.ForcedCanary != "" &&
@@ -196,7 +199,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
-	var progressObserver executionport.SequentialObserver
+	var progressObserver *ProgressObserver
 	if liveNotifier != nil {
 		progressObserver, err = NewProgressObserver(
 			liveNotifier,
@@ -256,6 +259,67 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		return nil, err
 	}
 	cleanup = append(cleanup, evmClosers...)
+	runtimeGate := NewRuntimeGate()
+	accounts := map[market.ChainID]execution.AccountID{
+		market.ChainID(solanaChain): execution.AccountID(solanaAccount.ID),
+		market.ChainID(evmChain):    execution.AccountID(evmAccount.ID),
+	}
+	nativeTokens := map[market.ChainID]market.Token{
+		market.ChainID(solanaChain): solanaBinding.NativeToken,
+		market.ChainID(evmChain):    evmBinding.NativeToken,
+	}
+	baseTokens := map[market.ChainID]market.TokenID{
+		market.ChainID(solanaChain): solanaMarket.Base.Token.ID,
+		market.ChainID(evmChain):    evmMarket.Base.Token.ID,
+	}
+	balanceReaders := make(map[inventory.Key]PhysicalBalanceReader)
+	for _, configuredBalance := range config.Live.Inventory {
+		chain := market.ChainID(configuredBalance.Chain)
+		account := execution.AccountID(configuredBalance.Account)
+		token := configuredBalance.Token.ID
+		reader := solanaBinding.SpendableBalance
+		if chain == market.ChainID(evmChain) {
+			reader = evmBinding.SpendableBalance
+		}
+		if reader == nil {
+			return nil, fmt.Errorf("physical token balance reader is unavailable for %s", chain)
+		}
+		balanceReaders[inventory.Key{Chain: chain, Account: account, Token: token}] = func(readCtx context.Context) (*big.Int, error) {
+			return reader.SpendableBalance(readCtx, token)
+		}
+	}
+	for chain, native := range nativeTokens {
+		chain := chain
+		native := native
+		var network RefuelNetwork = solanaBinding.RefuelNetwork
+		if chain == market.ChainID(evmChain) {
+			network = evmBinding.RefuelNetwork
+		}
+		balanceReaders[inventory.Key{Chain: chain, Account: accounts[chain], Token: native.ID}] = func(readCtx context.Context) (*big.Int, error) {
+			return network.NativeBalance(readCtx)
+		}
+	}
+	balanceManager, err := NewBalanceManager(BalanceManagerConfig{
+		Balances: config.Live.Inventory, Readers: balanceReaders,
+		NativeTokens: nativeTokens, Accounts: accounts, Gate: runtimeGate,
+		Notifier: liveNotifier, Logger: config.Logger, Output: config.Output,
+		PollInterval:  config.Live.BalancePollInterval,
+		AlertInterval: config.Live.BalanceAlertInterval,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := balanceManager.Warm(ctx); err != nil {
+		return nil, err
+	}
+	solanaBinding.SpendableBalance = balanceManager.SpendableReader(market.ChainID(solanaChain))
+	evmBinding.SpendableBalance = balanceManager.SpendableReader(market.ChainID(evmChain))
+	solanaBinding.BalanceSnapshot = func(token market.TokenID) (*big.Int, uint64, error) {
+		return balanceManager.Snapshot(market.ChainID(solanaChain), token)
+	}
+	evmBinding.BalanceSnapshot = func(token market.TokenID) (*big.Int, uint64, error) {
+		return balanceManager.Snapshot(market.ChainID(evmChain), token)
+	}
 	var solanaSellPreflight, evmSellPreflight SellPreflight
 	if config.Live.ExecutionPolicyKind ==
 		string(execution.PolicyTransportedSequential) {
@@ -307,10 +371,6 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
-	accounts := map[market.ChainID]execution.AccountID{
-		market.ChainID(solanaChain): execution.AccountID(solanaAccount.ID),
-		market.ChainID(evmChain):    execution.AccountID(evmAccount.ID),
-	}
 	storeStem := strings.TrimSuffix(config.Live.OperationalStorePath, filepath.Ext(config.Live.OperationalStorePath))
 	quoteBridge, err := acrossbridgecanary.NewLiveService(
 		acrossbridgecanary.LiveServiceConfig{
@@ -346,6 +406,12 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			TokenDecimals: map[market.ChainID]uint8{
 				market.ChainID(solanaChain): solanaMarket.Base.Token.Decimals,
 				market.ChainID(evmChain):    evmMarket.Base.Token.Decimals,
+			},
+			SourceTokenBalance: func(chain market.ChainID) (*big.Int, error) {
+				return balanceManager.Available(chain, baseTokens[chain])
+			},
+			NativeBalance: func(chain market.ChainID) (*big.Int, error) {
+				return balanceManager.Available(chain, nativeTokens[chain].ID)
 			},
 			Output: config.Output,
 		},
@@ -415,7 +481,6 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		{BuyMarket: solanaMarket.ID, SellMarket: evmMarket.ID},
 		{BuyMarket: evmMarket.ID, SellMarket: solanaMarket.ID},
 	}
-	runtimeGate := NewRuntimeGate()
 	reevaluate := make(chan time.Time, 1)
 	flowCosts, err := NewFlowCostOracle(FlowCostOracleConfig{
 		Directions: directions,
@@ -459,6 +524,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		},
 		BridgePrecision: 8,
 		QuoteAsset:      solanaMarket.Quote.Token.Asset,
+		BaseAsset:       solanaMarket.Base.Token.Asset,
 		MinimumNet:      config.Live.MinimumNet,
 		ReturnMargin:    config.Live.ReturnBridgeSafetyMargin,
 		ExitCosts:       flowCosts,
@@ -491,20 +557,31 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		},
 		ExitSelector: swapDriver,
 	}
+	observer := executionport.SequentialObserver(balanceProgressObserver{
+		progress: progressObserver,
+		balances: balanceManager,
+	})
 	executor, err := saga.NewSequentialExecutorWithObserver(
 		journal,
 		drivers,
 		time.Now,
-		progressObserver,
+		observer,
 	)
 	if err != nil {
 		return nil, err
 	}
+	recoveryObserver := NewRecoveryObserver(liveNotifier, progressObserver, time.Now)
+	recoveryObserver.SetBalanceManager(balanceManager)
+	recoveryDrivers := drivers
+	recoveryDrivers.Buy = balanceRecoveryDriver{driver: drivers.Buy, balances: balanceManager}
+	recoveryDrivers.BridgeBase = balanceRecoveryDriver{driver: drivers.BridgeBase, balances: balanceManager}
+	recoveryDrivers.Sell = balanceRecoveryDriver{driver: drivers.Sell, balances: balanceManager}
+	recoveryDrivers.BridgeQuoteReturn = balanceRecoveryDriver{driver: drivers.BridgeQuoteReturn, balances: balanceManager}
 	recovery, err := saga.NewSequentialRecoveryCoordinator(
 		saga.SequentialRecoveryConfig{
 			Journal: journal, RecoveryJournal: journal,
-			Drivers: drivers, Clock: time.Now,
-			Observer:         NewRecoveryObserver(liveNotifier, time.Now),
+			Drivers: recoveryDrivers, Clock: time.Now,
+			Observer:         recoveryObserver,
 			UncertainTimeout: 10 * time.Minute,
 			CostValuator:     costValuator,
 		},
@@ -526,6 +603,10 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 				Network:     solanaBinding.RefuelNetwork,
 				Prices:      costValuator, Clock: time.Now,
 				ConfirmTimeout: config.Live.ConfirmationTimeout,
+				LocalNativeBalance: func() (*big.Int, error) {
+					return balanceManager.Available(market.ChainID(solanaChain), solanaBinding.NativeToken.ID)
+				},
+				OnSettled: balanceManager.ObserveRefuel,
 			},
 		)
 		if refuelErr != nil {
@@ -543,6 +624,10 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 				Network:     evmBinding.RefuelNetwork,
 				Prices:      costValuator, Clock: time.Now,
 				ConfirmTimeout: config.Live.ConfirmationTimeout,
+				LocalNativeBalance: func() (*big.Int, error) {
+					return balanceManager.Available(market.ChainID(evmChain), evmBinding.NativeToken.ID)
+				},
+				OnSettled: balanceManager.ObserveRefuel,
 			},
 		)
 		if refuelErr != nil {
@@ -587,6 +672,14 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			ExecutionPolicy: execution.ExecutionPolicyKind(
 				config.Live.ExecutionPolicyKind,
 			),
+			BaseAsset:  solanaMarket.Base.Token.Asset,
+			QuoteAsset: solanaMarket.Quote.Token.Asset,
+			TokenDecimals: map[market.TokenID]uint8{
+				solanaMarket.Base.Token.ID:  solanaMarket.Base.Token.Decimals,
+				solanaMarket.Quote.Token.ID: solanaMarket.Quote.Token.Decimals,
+				evmMarket.Base.Token.ID:     evmMarket.Base.Token.Decimals,
+				evmMarket.Quote.Token.ID:    evmMarket.Quote.Token.Decimals,
+			},
 		},
 		executor,
 		operationLimit,
@@ -594,6 +687,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	if err != nil {
 		return nil, err
 	}
+	manager.SetAdmission(balanceManager)
 	opportunityStore, err := sqlitestore.Open(storeStem + "-opportunities.sqlite")
 	if err != nil {
 		return nil, err
@@ -609,6 +703,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	runtime.SetPostFlowRefresh(flowCosts.Warm)
 	runtime.SetRecovery(recovery)
 	runtime.SetRefuel(refuelService)
+	runtime.SetBalanceManager(balanceManager)
 	keep = true
 	return runtime, nil
 }
@@ -768,6 +863,20 @@ func composeSolanaSwap(
 	if err != nil || maxPriorityFee == 0 {
 		return SwapBinding{}, fmt.Errorf("live Solana priority-fee cap is invalid")
 	}
+	tokenAccounts := make(map[market.TokenID]string, len(mints))
+	for token, mintText := range mints {
+		mint, mintErr := solanago.PublicKeyFromBase58(mintText)
+		if mintErr != nil {
+			return SwapBinding{}, mintErr
+		}
+		ata, _, ataErr := solanago.FindAssociatedTokenAddress(
+			privateKey.PublicKey(), mint,
+		)
+		if ataErr != nil {
+			return SwapBinding{}, ataErr
+		}
+		tokenAccounts[token] = ata.String()
+	}
 	manager, err := solanaadapter.NewTxManager(solanaadapter.TxManagerConfig{
 		Chain:   market.ChainID(configured.Chain),
 		Account: execution.AccountID(account.ID), PrivateKey: privateKey,
@@ -776,6 +885,7 @@ func composeSolanaSwap(
 		MaxPriorityFeeLamports: maxPriorityFee,
 		Reconciliation:         network, Simulator: network, FeeEstimator: network, Clock: time.Now,
 		SettlementDecoder: decoder,
+		TokenAccounts:     tokenAccounts,
 	})
 	if err != nil {
 		return SwapBinding{}, err

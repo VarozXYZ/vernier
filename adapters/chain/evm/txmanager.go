@@ -400,6 +400,54 @@ func (m *TxManager) SimulatePrepared(
 	return nil
 }
 
+func (m *TxManager) SimulatePreparedEconomic(
+	ctx context.Context,
+	request chainport.EconomicSimulationRequest,
+) (chainport.EconomicSimulationResult, error) {
+	prepared := request.Prepared
+	if m.simulator == nil || prepared.Leg.Account != m.account ||
+		len(prepared.SignedPayload) == 0 {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("EVM economic simulation input is invalid")
+	}
+	var transaction types.Transaction
+	if err := transaction.UnmarshalBinary(prepared.SignedPayload); err != nil {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("decode EVM transaction for economic simulation: %w", err)
+	}
+	if transaction.To() == nil {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("simulate EVM contract creation is unsupported")
+	}
+	raw, err := m.simulator.CallContract(ctx, geth.CallMsg{
+		From: m.address, To: transaction.To(), Gas: transaction.Gas(),
+		GasFeeCap: transaction.GasFeeCap(), GasTipCap: transaction.GasTipCap(),
+		Value: transaction.Value(), Data: transaction.Data(),
+		AccessList: transaction.AccessList(),
+	}, nil)
+	if err != nil {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("simulate EVM prepared transaction: %w", err)
+	}
+	if len(raw) < 32 {
+		return chainport.EconomicSimulationResult{},
+			&chainport.EconomicOutputError{Err: fmt.Errorf("EVM simulation returned no decodable swap output")}
+	}
+	output, err := market.NewTokenAmount(
+		prepared.Leg.ExpectedOutput.Token(),
+		new(big.Int).SetBytes(raw[:32]),
+	)
+	if err != nil || output.IsZero() {
+		return chainport.EconomicSimulationResult{},
+			&chainport.EconomicOutputError{Err: fmt.Errorf("EVM simulation returned an invalid swap output")}
+	}
+	return chainport.EconomicSimulationResult{
+		Input: prepared.Leg.Input, Output: output,
+		ContextVersion: request.BalanceVersion,
+		Evidence:       "evm_eth_call_router_return",
+	}, nil
+}
+
 func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTransaction) (chainport.BroadcastResult, error) {
 	if prepared.Leg.Account != m.account || len(prepared.SignedPayload) == 0 {
 		return chainport.BroadcastResult{}, fmt.Errorf("EVM prepared transaction is invalid")

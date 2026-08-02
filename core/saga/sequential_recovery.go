@@ -186,8 +186,16 @@ func (c *SequentialRecoveryCoordinator) resume(
 		outputs[ordinal] = settlement.ActualOutput
 		settled[ordinal] = true
 	}
-	if snapshot.Plan.EffectivePolicy() ==
-		domainexecution.PolicyPrefundedSequential &&
+	if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+		parallelBuyRestoredOnSellChain(snapshot.Plan, snapshot.Settlements) {
+		// The confirmed sale and the compensating ExactIn purchase occurred on
+		// the same chain. Quote and base inventory are already restored there;
+		// emitting either rebalance bridge would create a new imbalance.
+		settled[3], settled[4] = true, true
+	}
+	if (snapshot.Plan.EffectivePolicy() ==
+		domainexecution.PolicyPrefundedSequential ||
+		snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel) &&
 		settled[1] && snapshot.ExitDecision == nil {
 		selected, selectErr := c.selectPrefundedRecoveryExit(
 			ctx, snapshot.Plan, operation.ID, outputs[1], result.Costs, nil,
@@ -282,6 +290,43 @@ func (c *SequentialRecoveryCoordinator) resume(
 			); sleepErr != nil {
 				return result, sleepErr
 			}
+		}
+		if stage.Ordinal == 1 && snapshot.Plan.EffectivePolicy() ==
+			domainexecution.PolicyPrefundedParallel && settled[2] &&
+			allTransactionsDefinitiveOrAbsent(transactions) {
+			recovery, ok := c.config.Drivers.Buy.(executionport.SequentialParallelBuyRecovery)
+			if !ok {
+				blockErr := fmt.Errorf("parallel buy recovery selector is unavailable")
+				_ = c.block(context.WithoutCancel(ctx), operation, blockErr)
+				return result, blockErr
+			}
+			settlement, recoveryErr := recovery.RecoverParallelBuy(
+				ctx, operation.ID, snapshot.Plan, transactions, c.config.Journal,
+			)
+			if recoveryErr != nil {
+				attempts++
+				delay := recoveryBackoff(attempts)
+				attempt := executionport.SequentialRecoveryAttempt{Operation: operation.ID, Ordinal: 1, Action: "buy_same_quote_input_best_chain", Reason: string(executionport.RecoveryFailureTemporary), Detail: recoveryErr.Error(), Attempt: attempts, CreatedAt: c.config.Clock().UTC(), RetryAt: c.config.Clock().UTC().Add(delay)}
+				_ = c.config.RecoveryJournal.RecordSequentialRecoveryAttempt(context.WithoutCancel(ctx), attempt)
+				if c.config.Observer != nil {
+					c.config.Observer.RecoveryAttempt(attempt)
+				}
+				if sleepErr := c.config.Sleep(ctx, delay); sleepErr != nil {
+					return result, sleepErr
+				}
+				continue
+			}
+			if err := c.config.Journal.RecordStageSettlement(context.WithoutCancel(ctx), settlement); err != nil {
+				return result, err
+			}
+			outputs[1], settled[1] = settlement.ActualOutput, true
+			result.Settlements = append(result.Settlements, settlement)
+			result.Costs = append(result.Costs, settlement.Costs...)
+			if settlement.Request.Stage.SourceChain == snapshot.Plan.Stages[1].SourceChain {
+				settled[3], settled[4] = true, true
+			}
+			attempts = 0
+			continue
 		}
 		if stage.Ordinal == 1 &&
 			allTransactionsDefinitiveOrAbsent(transactions) {
@@ -380,8 +425,9 @@ func (c *SequentialRecoveryCoordinator) resume(
 				)
 				return result, blockErr
 			}
-			if snapshot.Plan.EffectivePolicy() ==
-				domainexecution.PolicyPrefundedSequential &&
+			if (snapshot.Plan.EffectivePolicy() ==
+				domainexecution.PolicyPrefundedSequential ||
+				snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel) &&
 				stage.Ordinal == 2 &&
 				executionport.IsDefinitiveFailure(stageErr) {
 				selected, selectErr := c.selectPrefundedRecoveryExit(
@@ -498,9 +544,15 @@ func (c *SequentialRecoveryCoordinator) resume(
 		}
 	}
 	result.FinalAmount = current
-	if err := calculateSequentialEconomics(snapshot.Plan, &result); err != nil {
-		_ = c.block(context.WithoutCancel(ctx), operation, err)
-		return result, err
+	var economicsErr error
+	if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel {
+		economicsErr = calculateParallelEconomics(snapshot.Plan, &result)
+	} else {
+		economicsErr = calculateSequentialEconomics(snapshot.Plan, &result)
+	}
+	if economicsErr != nil {
+		_ = c.block(context.WithoutCancel(ctx), operation, economicsErr)
+		return result, economicsErr
 	}
 	if journal, ok := c.config.Journal.(executionport.SequentialResultJournal); ok {
 		if err := journal.RecordSequentialResult(
@@ -519,6 +571,25 @@ func (c *SequentialRecoveryCoordinator) resume(
 		return result, err
 	}
 	return result, nil
+}
+
+func parallelBuyRestoredOnSellChain(
+	plan domainexecution.SequentialPlan,
+	settlements []domainexecution.SequentialStageSettlement,
+) bool {
+	if len(plan.Stages) < 2 {
+		return false
+	}
+	buySettled, sellSettled := false, false
+	for _, settlement := range settlements {
+		switch settlement.Request.Stage.Ordinal {
+		case 1:
+			buySettled = settlement.Request.Stage.SourceChain == plan.Stages[1].SourceChain
+		case 2:
+			sellSettled = true
+		}
+	}
+	return buySettled && sellSettled
 }
 
 type recoveryExit struct {

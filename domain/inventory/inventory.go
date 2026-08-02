@@ -205,6 +205,19 @@ func (i *Inventory) Available(key Key) (*big.Int, bool) {
 	return i.effectiveAvailableLocked(key, balance), true
 }
 
+// WalletBalance returns the locally projected physical balance before policy
+// caps, buffers, reservations, or in-flight deductions. Economic simulation
+// deltas must compare against this value, not against spendable inventory.
+func (i *Inventory) WalletBalance(key Key) (*big.Int, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	balance, ok := i.balances[key]
+	if !ok {
+		return nil, false
+	}
+	return new(big.Int).Set(balance), true
+}
+
 func (i *Inventory) effectiveAvailableLocked(key Key, wallet *big.Int) *big.Int {
 	effective := new(big.Int).Set(wallet)
 	if cap := i.allocationCaps[key]; cap != nil && effective.Cmp(cap) > 0 {
@@ -230,6 +243,45 @@ func (i *Inventory) ObserveWalletBalance(key Key, amount market.TokenAmount) err
 		return fmt.Errorf("wallet inventory observation references an unknown balance")
 	}
 	i.balances[key] = amount.Units()
+	return nil
+}
+
+// ApplyEffects advances the locally projected wallet balances from confirmed
+// economic evidence. Unlike Settle it is not tied to a reservation, which
+// makes it suitable for sequential runtimes that admit only one operation at
+// a time. Callers must provide idempotency before invoking this method.
+func (i *Inventory) ApplyEffects(effects []Effect) error {
+	if i == nil || len(effects) == 0 {
+		return fmt.Errorf("inventory effects are required")
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	deltas := make(map[Key]*big.Int)
+	for _, effect := range effects {
+		if effect.Key.Chain == "" || effect.Key.Account == "" ||
+			effect.Key.Token == "" || effect.Delta == nil {
+			return fmt.Errorf("inventory effect is invalid")
+		}
+		if _, ok := i.balances[effect.Key]; !ok {
+			return fmt.Errorf("inventory effect references an unknown balance")
+		}
+		if deltas[effect.Key] == nil {
+			deltas[effect.Key] = new(big.Int)
+		}
+		deltas[effect.Key].Add(deltas[effect.Key], effect.Delta)
+	}
+	for key, delta := range deltas {
+		if new(big.Int).Add(i.balances[key], delta).Sign() < 0 {
+			return fmt.Errorf(
+				"inventory effect would make chain %q token %q negative",
+				key.Chain,
+				key.Token,
+			)
+		}
+	}
+	for key, delta := range deltas {
+		i.balances[key].Add(i.balances[key], delta)
+	}
 	return nil
 }
 

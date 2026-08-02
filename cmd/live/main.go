@@ -121,6 +121,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		"",
 		"close one manually reconciled operation barrier by exact operation ID",
 	)
+	acknowledgeValidation := flags.String(
+		"acknowledge-blocked-validation", "",
+		"release one exact validation-blocked operation after manual verification",
+	)
 	recoverOnly := flags.Bool(
 		"recover-only",
 		false,
@@ -165,6 +169,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			"live: -acknowledge-reconciled-operation cannot be combined with execution flags",
 		)
 		return 2
+	}
+	if strings.TrimSpace(*acknowledgeValidation) != "" {
+		if strings.TrimSpace(*acknowledgeReconciled) != "" || *arm || *dryRun || *costObserve || *recoverOnly || *once {
+			fmt.Fprintln(stderr, "live: -acknowledge-blocked-validation cannot be combined with execution flags")
+			return 2
+		}
+		*acknowledgeReconciled = *acknowledgeValidation
 	}
 	if *recoverOnly && !*arm {
 		fmt.Fprintln(stderr, "live: -recover-only requires -arm")
@@ -340,7 +351,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	if *arm && !*recoverOnly && refuelChain == "" &&
 		config.RunTier == "live" &&
-		config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) {
+		(config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) ||
+			config.ExecutionPolicyID != "") {
 		expected := ""
 		if config.ExecutionInput != nil {
 			expected = config.ExecutionInput.RatString()
@@ -389,6 +401,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			config.ExecutionPolicyKind,
 		)
 		return 2
+	}
+	if config.ExecutionPolicyKind == string(execution.PolicyPrefundedParallel) &&
+		config.ExecutionPolicyID != "" {
+		factory = composeSequentialRuntime
 	}
 	if config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) {
 		if mode == modeDryRun {

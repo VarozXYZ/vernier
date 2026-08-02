@@ -259,6 +259,7 @@ type LiveConfig struct {
 	OperationalStore              OperationalStoreConfig       `yaml:"operational_store"`
 	Accounts                      map[string]LiveAccountConfig `yaml:"accounts"`
 	Inventory                     []InventoryBalanceConfig     `yaml:"inventory"`
+	BalanceTracking               BalanceTrackingConfig        `yaml:"balance_tracking"`
 	GasRefuel                     GasRefuelConfig              `yaml:"gas_refuel"`
 }
 
@@ -284,6 +285,11 @@ type GasRefuelConfig struct {
 	SlippageBPS     uint16        `yaml:"slippage_bps"`
 	MaxUSDC         string        `yaml:"max_usdc"`
 	EVMGas          *EVMGasConfig `yaml:"evm_gas"`
+}
+
+type BalanceTrackingConfig struct {
+	PollSeconds          int `yaml:"poll_seconds"`
+	AlertIntervalSeconds int `yaml:"alert_interval_seconds"`
 }
 
 type OperationalStoreConfig struct {
@@ -533,6 +539,8 @@ type ParsedLiveConfig struct {
 	SQLiteSynchronous             string
 	Accounts                      map[string]ResolvedLiveAccount
 	Inventory                     []ResolvedInventoryBalance
+	BalancePollInterval           time.Duration
+	BalanceAlertInterval          time.Duration
 	GasRefuel                     ResolvedGasRefuel
 }
 
@@ -946,7 +954,8 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		return ParsedLiveConfig{}, fmt.Errorf("live run_tier must be canary or live")
 	}
 	sequential := executionMode == "transported_sequential" ||
-		executionMode == "prefunded_sequential"
+		executionMode == "prefunded_sequential" ||
+		(executionMode == "prefunded_parallel" && executionPolicyID != "")
 	sequentialCanary := sequential && runTier == "canary"
 	sequentialLive := sequential && runTier == "live"
 	if executionMode != "prefunded_parallel" && !sequential {
@@ -1211,6 +1220,17 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 	}
 	if config.CostRefreshIntervalMS == 0 {
 		config.CostRefreshIntervalMS = 15_000
+	}
+	if config.BalanceTracking.PollSeconds == 0 {
+		config.BalanceTracking.PollSeconds = 60
+	}
+	if config.BalanceTracking.AlertIntervalSeconds == 0 {
+		config.BalanceTracking.AlertIntervalSeconds = 300
+	}
+	if config.BalanceTracking.PollSeconds < 1 ||
+		config.BalanceTracking.PollSeconds > 3600 ||
+		config.BalanceTracking.AlertIntervalSeconds < 1 {
+		return ParsedLiveConfig{}, fmt.Errorf("live balance tracking policy is invalid")
 	}
 	if config.CostCacheTTLMS == 0 {
 		config.CostCacheTTLMS = 60_000
@@ -1506,7 +1526,9 @@ func resolveLive(manifest Manifest, topology Topology, policy Policy) (ParsedLiv
 		ExitValidationRetryDelay: exitValidationRetryDelay,
 		OperationalStorePath:     config.OperationalStore.Path, SQLiteSynchronous: synchronous,
 		Accounts: accounts, Inventory: inventoryBalances,
-		GasRefuel: refuel,
+		BalancePollInterval:  time.Duration(config.BalanceTracking.PollSeconds) * time.Second,
+		BalanceAlertInterval: time.Duration(config.BalanceTracking.AlertIntervalSeconds) * time.Second,
+		GasRefuel:            refuel,
 	}, nil
 }
 

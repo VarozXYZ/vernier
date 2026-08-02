@@ -69,6 +69,8 @@ type nttLiveHooks struct {
 	BalanceVisibilityTimeout time.Duration
 	BalancePollInterval      time.Duration
 	Result                   *nttLiveResult
+	SourceTokenBalance       func(market.ChainID) (*big.Int, error)
+	NativeBalance            func(market.ChainID) (*big.Int, error)
 }
 
 func (h *nttLiveHooks) prepared(
@@ -380,20 +382,27 @@ func (r *armedRuntime) validateNetworks(ctx context.Context) error {
 	if chainID.Cmp(r.evmAdapter.ChainID()) != 0 {
 		return fmt.Errorf("configured EVM chain ID does not match RPC")
 	}
-	solanaBalance, err := r.solanaRPC.GetBalance(
-		ctx,
-		r.solanaKey.PublicKey(),
-		solanarpc.CommitmentConfirmed,
-	)
-	if err != nil {
-		return fmt.Errorf("read Solana payer balance: %w", err)
+	var solanaNative *big.Int
+	if r.liveHooks != nil && r.liveHooks.NativeBalance != nil {
+		solanaNative, err = r.liveHooks.NativeBalance(r.liveHooks.SolanaChain)
+		if err != nil {
+			return fmt.Errorf("read local Solana payer balance: %w", err)
+		}
+	} else {
+		solanaBalance, balanceErr := r.solanaRPC.GetBalance(
+			ctx, r.solanaKey.PublicKey(), solanarpc.CommitmentConfirmed,
+		)
+		if balanceErr != nil {
+			return fmt.Errorf("read Solana payer balance: %w", balanceErr)
+		}
+		solanaNative = new(big.Int).SetUint64(solanaBalance.Value)
 	}
-	if solanaBalance.Value < r.config.Solana.MinimumBalanceLamports {
+	if solanaNative.Cmp(new(big.Int).SetUint64(r.config.Solana.MinimumBalanceLamports)) < 0 {
 		return executionport.NewRecoveryError(
 			executionport.RecoveryFailureInsufficientNative,
 			fmt.Errorf(
-				"solana payer has %d lamports; at least %d are required",
-				solanaBalance.Value,
+				"solana payer has %s lamports; at least %d are required",
+				solanaNative,
 				r.config.Solana.MinimumBalanceLamports,
 			),
 		)
@@ -406,9 +415,17 @@ func (r *armedRuntime) validateNetworks(ctx context.Context) error {
 		return fmt.Errorf("invalid minimum EVM native balance")
 	}
 	evmAddress := gethcrypto.PubkeyToAddress(r.evmKey.PublicKey)
-	evmBalance, err := r.evmRPC.BalanceAt(ctx, evmAddress, nil)
-	if err != nil {
-		return fmt.Errorf("read EVM sender balance: %w", err)
+	var evmBalance *big.Int
+	if r.liveHooks != nil && r.liveHooks.NativeBalance != nil {
+		evmBalance, err = r.liveHooks.NativeBalance(r.liveHooks.EVMChain)
+		if err != nil {
+			return fmt.Errorf("read local EVM sender balance: %w", err)
+		}
+	} else {
+		evmBalance, err = r.evmRPC.BalanceAt(ctx, evmAddress, nil)
+		if err != nil {
+			return fmt.Errorf("read EVM sender balance: %w", err)
+		}
 	}
 	if evmBalance.Cmp(minimumEVM) < 0 {
 		return executionport.NewRecoveryError(
@@ -950,7 +967,15 @@ func (r *armedRuntime) checkEVMSource(ctx context.Context, amount *big.Int) erro
 		return err
 	}
 	var balance *big.Int
-	if r.liveHooks == nil {
+	if r.liveHooks != nil && r.liveHooks.SourceTokenBalance != nil {
+		balance, err = r.liveHooks.SourceTokenBalance(r.liveHooks.EVMChain)
+		if err != nil {
+			return fmt.Errorf("read local EVM token balance: %w", err)
+		}
+		if balance.Cmp(amount) < 0 {
+			return fmt.Errorf("EVM token balance %s is below amount %s", balance, amount)
+		}
+	} else if r.liveHooks == nil {
 		rawBalance, callErr := r.evmRPC.CallContract(
 			ctx,
 			geth.CallMsg{To: &balanceCall.To, Data: balanceCall.Data},
@@ -1049,6 +1074,17 @@ func (r *armedRuntime) checkEVMSource(ctx context.Context, amount *big.Int) erro
 }
 
 func (r *armedRuntime) checkSolanaTokenBalance(ctx context.Context, amount uint64) error {
+	if r.liveHooks != nil && r.liveHooks.SourceTokenBalance != nil {
+		balance, err := r.liveHooks.SourceTokenBalance(r.liveHooks.SolanaChain)
+		if err != nil {
+			return fmt.Errorf("read local Solana token balance: %w", err)
+		}
+		if !balance.IsUint64() || balance.Uint64() < amount {
+			return fmt.Errorf("solana token balance %s is below amount %d", balance, amount)
+		}
+		fmt.Fprintf(r.output, "source_readiness=ok chain=solana token_balance=%s source=local_balance_manager\n", balance)
+		return nil
+	}
 	ata, _, err := solanago.FindAssociatedTokenAddress(
 		r.solanaKey.PublicKey(),
 		r.solanaAdapter.TokenMint(),

@@ -19,6 +19,9 @@ type Planner struct {
 	MarketChains    map[market.MarketID]market.ChainID
 	ExecutionUnits  *big.Int
 	ExecutionPolicy execution.ExecutionPolicyKind
+	BaseAsset       market.AssetID
+	QuoteAsset      market.AssetID
+	TokenDecimals   map[market.TokenID]uint8
 	Clock           func() time.Time
 }
 
@@ -61,6 +64,23 @@ func (p Planner) Plan(
 			execution.PlanID(id), opportunity, initial,
 			buyChain, sellChain, clock().UTC(),
 		)
+	case execution.PolicyPrefundedParallel:
+		plan, planErr := execution.NewPrefundedParallelPlan(
+			execution.PlanID(id), opportunity, initial,
+			buyChain, sellChain, clock().UTC(),
+		)
+		if planErr != nil {
+			return execution.SequentialPlan{}, planErr
+		}
+		plan.BaseAsset, plan.QuoteAsset = p.BaseAsset, p.QuoteAsset
+		plan.TokenDecimals = make(map[market.TokenID]uint8, len(p.TokenDecimals))
+		for token, decimals := range p.TokenDecimals {
+			plan.TokenDecimals[token] = decimals
+		}
+		if plan.BaseAsset == "" || plan.QuoteAsset == "" {
+			return execution.SequentialPlan{}, fmt.Errorf("parallel plan valuation assets are unavailable")
+		}
+		return plan, plan.Validate()
 	default:
 		return execution.SequentialPlan{}, fmt.Errorf(
 			"unsupported dependent execution policy %q", p.ExecutionPolicy,

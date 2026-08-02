@@ -1150,7 +1150,13 @@ func AwaitDestinationConfirmation(
 				}
 			default:
 				if evidence.Balance != nil && evidence.Balance.Cmp(target) >= 0 {
-					return evidence, nil
+					copy := evidence
+					balanceEvidence = &copy
+				}
+				if balanceEvidence != nil && fillIdentity != "" {
+					balanceEvidence.Identity = fillIdentity
+					balanceEvidence.Source += "+across_status"
+					return *balanceEvidence, nil
 				}
 			}
 		case err := <-watcherErrors:
