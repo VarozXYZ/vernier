@@ -59,7 +59,6 @@ func (n *trackingNotifier) stop() {
 	if n == nil {
 		return
 	}
-	close(n.queue)
 	<-n.done
 }
 
@@ -74,10 +73,10 @@ func (n *trackingNotifier) run(ctx context.Context) {
 			job = pending[0]
 			pending = pending[1:]
 		} else {
-			var ok bool
-			job, ok = <-n.queue
-			if !ok {
+			select {
+			case <-ctx.Done():
 				return
+			case job = <-n.queue:
 			}
 		}
 		deferred, closed := n.deliver(ctx, job, messages)

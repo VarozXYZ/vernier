@@ -240,9 +240,8 @@ func (r *Runner) runFixedCandidateRouteStream(ctx context.Context, options Strea
 		}
 	}
 	defer feeds.Wait()
-	defer cancel()
-
 	defer notifier.stop()
+	defer cancel()
 	r.logger.Info("fixed-candidate route stream started", "run", r.config.RunID, "markets", len(routes), "queue_capacity", capacity)
 
 	var active *fixedWindowState
