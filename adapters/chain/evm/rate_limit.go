@@ -29,6 +29,16 @@ func NewRateLimitedNetwork(delegate Network, minimumInterval time.Duration) (*Ra
 
 func (n *RateLimitedNetwork) ID() string { return n.delegate.ID() }
 
+// StateOverrideRPC is forwarded without bypassing the rate-limited network's
+// normal feed/read surface. The simulation layer uses it only for an explicit
+// eth_call with ephemeral state overrides; it still does not expose signing.
+func (n *RateLimitedNetwork) StateOverrideRPC() StateOverrideRPC {
+	if provider, ok := n.delegate.(interface{ StateOverrideRPC() StateOverrideRPC }); ok {
+		return provider.StateOverrideRPC()
+	}
+	return nil
+}
+
 func (n *RateLimitedNetwork) CurrentBlock(ctx context.Context) (BlockReference, error) {
 	if err := n.wait(ctx); err != nil {
 		return BlockReference{}, err

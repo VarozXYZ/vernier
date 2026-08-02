@@ -69,6 +69,18 @@ func NewReadOnlyNetwork(id, label string, chainID *big.Int, httpClient, wsClient
 
 func (n *ReadOnlyNetwork) ID() string { return n.id }
 
+// StateOverrideRPC exposes only the raw-call capability needed by read-only
+// simulation. It does not expose signing or broadcast methods. Networks
+// created with the production ethclient support this capability; lightweight
+// test doubles may intentionally return nil.
+func (n *ReadOnlyNetwork) StateOverrideRPC() StateOverrideRPC {
+	if typed, ok := n.http.(*ethclient.Client); ok {
+		return typed.Client()
+	}
+	rpc, _ := n.http.(StateOverrideRPC)
+	return rpc
+}
+
 func (n *ReadOnlyNetwork) Validate(ctx context.Context) error {
 	for name, client := range map[string]Client{"HTTP": n.http, "WebSocket": n.websocket} {
 		chainID, err := client.ChainID(ctx)

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"time"
 
-	"github.com/VarozXYZ/vernier/adapters/market/liquiditycurve"
 	"github.com/VarozXYZ/vernier/domain/market"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
 )
@@ -33,15 +33,21 @@ func (q *Quoter) Quote(ctx context.Context, input quoteport.Input) (market.Quote
 	if err != nil {
 		return market.Quote{}, err
 	}
-	segments, err := q.segments(state, input.TokenIn, input.TokenOut)
+	swapForY, err := q.direction(input.TokenIn, input.TokenOut)
 	if err != nil {
 		return market.Quote{}, err
 	}
-	amountOut, fee, err := liquiditycurve.ExactInputRate(segments, input.AmountIn.Units(), state.feeRate)
+	quotedAt := quoteTime(input.QuotedAt, input.Snapshot.Metadata().AppliedAt, stateUpdateTime(state))
+	protocolResult, err := quoteExactIn(state, input.AmountIn.Units(), swapForY, quotedAt.Unix())
 	if err != nil {
 		return market.Quote{}, err
 	}
-	return q.result(input, market.QuoteModeExactInput, input.AmountIn, input.TokenOut, amountOut, fee)
+	feeToken := input.TokenIn
+	if !state.feeOnInput(swapForY) {
+		feeToken = input.TokenOut
+	}
+	input.QuotedAt = quotedAt
+	return q.result(input, market.QuoteModeExactInput, input.AmountIn, input.TokenOut, protocolResult.amountOut, feeToken, protocolResult.fee)
 }
 
 func (q *Quoter) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutputInput) (market.Quote, error) {
@@ -52,19 +58,24 @@ func (q *Quoter) QuoteExactOutput(ctx context.Context, input quoteport.ExactOutp
 	if err != nil {
 		return market.Quote{}, err
 	}
-	segments, err := q.segments(state, input.TokenIn, input.TokenOut)
+	swapForY, err := q.direction(input.TokenIn, input.TokenOut)
 	if err != nil {
 		return market.Quote{}, err
 	}
-	amountIn, fee, err := liquiditycurve.ExactOutputRate(segments, input.AmountOut.Units(), state.feeRate)
+	quotedAt := quoteTime(input.QuotedAt, input.Snapshot.Metadata().AppliedAt, stateUpdateTime(state))
+	protocolResult, err := quoteExactOut(state, input.AmountOut.Units(), swapForY, quotedAt.Unix())
 	if err != nil {
 		return market.Quote{}, err
 	}
-	amount, err := market.NewTokenAmount(input.TokenIn, amountIn)
+	amount, err := market.NewTokenAmount(input.TokenIn, protocolResult.amountIn)
 	if err != nil {
 		return market.Quote{}, err
 	}
-	return q.result(quoteport.Input{Snapshot: input.Snapshot, TokenIn: input.TokenIn, TokenOut: input.TokenOut, AmountIn: amount, Purpose: input.Purpose, QuotedAt: input.QuotedAt}, market.QuoteModeExactOutput, amount, input.TokenOut, input.AmountOut.Units(), fee)
+	feeToken := input.TokenIn
+	if !state.feeOnInput(swapForY) {
+		feeToken = input.TokenOut
+	}
+	return q.result(quoteport.Input{Snapshot: input.Snapshot, TokenIn: input.TokenIn, TokenOut: input.TokenOut, AmountIn: amount, Purpose: input.Purpose, QuotedAt: quotedAt}, market.QuoteModeExactOutput, amount, input.TokenOut, input.AmountOut.Units(), feeToken, protocolResult.fee)
 }
 
 func (q *Quoter) state(snapshot market.MarketSnapshot) (Snapshot, error) {
@@ -78,59 +89,43 @@ func (q *Quoter) state(snapshot market.MarketSnapshot) (Snapshot, error) {
 	return state, nil
 }
 
-func (q *Quoter) segments(state Snapshot, tokenIn, tokenOut market.TokenID) ([]liquiditycurve.Segment, error) {
+func (q *Quoter) direction(tokenIn, tokenOut market.TokenID) (bool, error) {
 	if tokenIn != q.tokenX && tokenIn != q.tokenY || tokenOut != q.tokenX && tokenOut != q.tokenY || tokenIn == tokenOut {
-		return nil, fmt.Errorf("unsupported Meteora token direction")
+		return false, fmt.Errorf("unsupported Meteora token direction")
 	}
-	result := make([]liquiditycurve.Segment, 0, len(state.bins))
-	scale := new(big.Int).Lsh(big.NewInt(1), priceScaleBits)
-	if tokenIn == q.tokenX {
-		// Meteora's swap_for_y direction consumes the active bin and then
-		// decrements active_id. The official SDK therefore walks toward lower
-		// bin IDs when X is sold for Y.
-		for i := len(state.bins) - 1; i >= 0; i-- {
-			bin := state.bins[i]
-			if bin.id > state.activeID {
-				continue
-			}
-			if bin.reserveY.Sign() > 0 {
-				// The protocol consumes Y liquidity at the bin price. The
-				// corresponding X input capacity is rounded up.
-				input := ceilMulDiv(bin.reserveY, scale, bin.priceX64)
-				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveY, FeeRate: state.FeeRateForBin(bin.id)})
-			}
-		}
-	} else {
-		// The opposite direction increments active_id and consumes higher
-		// bins after the active bin.
-		for _, bin := range state.bins {
-			if bin.id < state.activeID {
-				continue
-			}
-			if bin.reserveX.Sign() > 0 {
-				input := ceilMulDiv(bin.reserveX, bin.priceX64, scale)
-				result = append(result, liquiditycurve.Segment{In: input, Out: bin.reserveX, FeeRate: state.FeeRateForBin(bin.id)})
-			}
-		}
-	}
-	if len(result) == 0 {
-		return nil, fmt.Errorf("meteora DLMM has no active liquidity")
-	}
-	return result, nil
+	return tokenIn == q.tokenX, nil
 }
 
-func ceilMulDiv(value, multiplier, divisor *big.Int) *big.Int {
-	product := new(big.Int).Mul(value, multiplier)
-	product.Add(product, new(big.Int).Sub(new(big.Int).Set(divisor), big.NewInt(1)))
-	return product.Quo(product, divisor)
+func quoteTime(quotedAt time.Time, stateTimes ...time.Time) time.Time {
+	latest := quotedAt.UTC()
+	for _, candidate := range stateTimes {
+		candidate = candidate.UTC()
+		if !candidate.IsZero() && (latest.IsZero() || candidate.After(latest)) {
+			latest = candidate
+		}
+	}
+	if latest.IsZero() {
+		return time.Now().UTC()
+	}
+	// Snapshot application and Meteora's embedded protocol timestamp come
+	// from different clocks. Dynamic fees must never be evaluated before
+	// either state boundary.
+	return latest
 }
 
-func (q *Quoter) result(input quoteport.Input, mode market.QuoteMode, amountIn market.TokenAmount, outputToken market.TokenID, outputUnits, feeUnits *big.Int) (market.Quote, error) {
+func stateUpdateTime(state Snapshot) time.Time {
+	if state.lastUpdateTime <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(state.lastUpdateTime, 0).UTC()
+}
+
+func (q *Quoter) result(input quoteport.Input, mode market.QuoteMode, amountIn market.TokenAmount, outputToken market.TokenID, outputUnits *big.Int, feeToken market.TokenID, feeUnits *big.Int) (market.Quote, error) {
 	amountOut, err := market.NewTokenAmount(outputToken, outputUnits)
 	if err != nil {
 		return market.Quote{}, err
 	}
-	fee, err := market.NewTokenAmount(input.TokenIn, feeUnits)
+	fee, err := market.NewTokenAmount(feeToken, feeUnits)
 	if err != nil {
 		return market.Quote{}, err
 	}

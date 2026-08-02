@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -332,5 +333,148 @@ func TestFeedUsesProgramWebSocketForDiscoveredAccounts(t *testing.T) {
 	}
 	if decoder.decoded != 1 || len(s.resets) != 1 || len(s.events) != 1 {
 		t.Fatalf("decoded=%d resets=%d events=%d", decoder.decoded, len(s.resets), len(s.events))
+	}
+}
+
+type batchDecoder struct {
+	network *batchNetwork
+	batches atomic.Int32
+	changes atomic.Int32
+}
+
+func (d *batchDecoder) Bootstrap(context.Context, solanalogs.Network, uint64) (market.EventData, error) {
+	if !d.network.accountSubscribed.Load() || !d.network.programSubscribed.Load() {
+		return nil, errors.New("batch subscriptions were not active before bootstrap")
+	}
+	d.network.account.notifications <- solana.AccountNotification{Slot: 11, Account: "pool", Value: solana.Account{Data: []byte{1}}}
+	d.network.program.notifications <- solana.ProgramNotification{Slot: 11, Account: "bin", Value: solana.Account{Data: []byte{2}}}
+	return eventData{value: 0}, nil
+}
+
+func (*batchDecoder) Decode(context.Context, solanalogs.Network, solana.LogNotification) ([]market.EventData, error) {
+	return nil, errors.New("logs must not be decoded")
+}
+func (*batchDecoder) AccountSubscriptions() []string { return []string{"pool"} }
+func (*batchDecoder) ProgramSubscriptions() []solana.ProgramSubscriptionRequest {
+	return []solana.ProgramSubscriptionRequest{{Program: "program"}}
+}
+func (d *batchDecoder) DecodeAccountBatch(_ context.Context, changes []solanalogs.AccountChange) ([]market.EventData, error) {
+	d.batches.Add(1)
+	d.changes.Store(int32(len(changes)))
+	return []market.EventData{eventData{value: len(changes)}}, nil
+}
+
+type batchNetwork struct {
+	accountSubscribed atomic.Bool
+	programSubscribed atomic.Bool
+	account           *accountSubscription
+	program           *programSubscription
+}
+
+func newBatchNetwork() *batchNetwork {
+	return &batchNetwork{
+		account: &accountSubscription{notifications: make(chan solana.AccountNotification, 4), errors: make(chan error, 1)},
+		program: &programSubscription{notifications: make(chan solana.ProgramNotification, 4), errors: make(chan error, 1)},
+	}
+}
+
+func (*batchNetwork) CurrentSlot(context.Context) (uint64, error) { return 10, nil }
+func (*batchNetwork) SubscribeLogs(context.Context, string) (solana.LogsSubscription, error) {
+	return nil, errors.New("batch path must not subscribe logs")
+}
+func (n *batchNetwork) SubscribeAccount(context.Context, string) (solana.AccountSubscription, error) {
+	n.accountSubscribed.Store(true)
+	return n.account, nil
+}
+func (n *batchNetwork) SubscribeProgram(context.Context, solana.ProgramSubscriptionRequest) (solana.ProgramSubscription, error) {
+	n.programSubscribed.Store(true)
+	return n.program, nil
+}
+
+func TestFeedBatchSubscribesBeforeBootstrapAndGroupsSameSlot(t *testing.T) {
+	network := newBatchNetwork()
+	decoder := &batchDecoder{network: network}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &sink{cancel: cancel, cancelEvents: 1}
+	feed, err := solanalogs.New(solanalogs.Config{
+		Market: "pool", Source: "solana", Pool: "pool", Network: network, Decoder: decoder,
+		Retry: solanalogs.RetryPolicy{Initial: time.Millisecond, Maximum: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := feed.Run(ctx, s); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v", err)
+	}
+	if decoder.batches.Load() != 1 || decoder.changes.Load() != 2 || len(s.events) != 1 {
+		t.Fatalf("batches=%d changes=%d events=%d", decoder.batches.Load(), decoder.changes.Load(), len(s.events))
+	}
+	if s.events[0].Reference.Value != "account-batch:11" {
+		t.Fatalf("unexpected batch reference: %s", s.events[0].Reference.Value)
+	}
+}
+
+type economicBatchDecoder struct{ *batchDecoder }
+
+func (*economicBatchDecoder) IsEconomicLog(notification solana.LogNotification) bool {
+	for _, line := range notification.Logs {
+		if line == "Program log: Instruction: Swap" {
+			return true
+		}
+	}
+	return false
+}
+
+type economicBatchNetwork struct {
+	*batchNetwork
+	logs *fakeSubscription
+}
+
+func (n *economicBatchNetwork) SubscribeLogs(context.Context, string) (solana.LogsSubscription, error) {
+	return n.logs, nil
+}
+
+type separatedBatchSink struct {
+	*sink
+	states []market.MarketEvent
+}
+
+func (s *separatedBatchSink) ApplyState(_ context.Context, event market.MarketEvent) error {
+	s.states = append(s.states, event)
+	return nil
+}
+
+func (s *separatedBatchSink) PublishTrigger(ctx context.Context, event market.MarketEvent) error {
+	return s.Publish(ctx, event)
+}
+
+func TestFeedBatchUsesAccountStateButTriggersOncePerEconomicSignature(t *testing.T) {
+	base := newBatchNetwork()
+	network := &economicBatchNetwork{batchNetwork: base, logs: newFakeSubscription()}
+	decoder := &economicBatchDecoder{batchDecoder: &batchDecoder{network: base}}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &separatedBatchSink{sink: &sink{cancel: cancel, cancelEvents: 1}}
+	feed, err := solanalogs.New(solanalogs.Config{
+		Market: "pool", Source: "solana", Pool: "pool", Network: network, Decoder: decoder,
+		Retry: solanalogs.RetryPolicy{Initial: time.Millisecond, Maximum: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		network.logs.notifications <- solana.LogNotification{Slot: 11, Signature: "failed", Err: json.RawMessage(`{"InstructionError":[0,"Custom"]}`), Logs: []string{"Program log: Instruction: Swap"}}
+		network.logs.notifications <- solana.LogNotification{Slot: 11, Signature: "admin", Logs: []string{"Program log: Instruction: ClaimFee"}}
+		network.logs.notifications <- solana.LogNotification{Slot: 11, Signature: "economic-signature", Logs: []string{"Program log: Instruction: Swap"}}
+		network.logs.notifications <- solana.LogNotification{Slot: 11, Signature: "economic-signature", Logs: []string{"Program log: Instruction: Swap"}}
+	}()
+	if err := feed.Run(ctx, s); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v", err)
+	}
+	if decoder.batches.Load() != 1 || decoder.changes.Load() != 2 || len(s.states) != 1 || len(s.events) != 1 {
+		t.Fatalf("batches=%d changes=%d states=%d triggers=%d", decoder.batches.Load(), decoder.changes.Load(), len(s.states), len(s.events))
+	}
+	if s.states[0].Reference.Value != "account-batch:11" || s.events[0].Reference.Value != "economic-signature" {
+		t.Fatalf("unexpected references: state=%s trigger=%s", s.states[0].Reference.Value, s.events[0].Reference.Value)
 	}
 }

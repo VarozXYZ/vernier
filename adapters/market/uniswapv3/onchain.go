@@ -20,6 +20,13 @@ import (
 
 const ID = "uniswap-v3"
 
+type EventProfile string
+
+const (
+	EventProfileUniswapV3     EventProfile = "uniswap_v3"
+	EventProfilePancakeSwapV3 EventProfile = "pancakeswap_v3"
+)
+
 const poolABIJSON = "[" +
 	"{\"type\":\"function\",\"name\":\"token0\",\"stateMutability\":\"view\",\"inputs\":[],\"outputs\":[{\"type\":\"address\"}]}," +
 	"{\"type\":\"function\",\"name\":\"token1\",\"stateMutability\":\"view\",\"inputs\":[],\"outputs\":[{\"type\":\"address\"}]}," +
@@ -37,6 +44,15 @@ const poolABIJSON = "[" +
 
 var poolABI = mustParseABI(poolABIJSON)
 
+const pancakeSwapV3EventABIJSON = "[" +
+	"{\"type\":\"event\",\"name\":\"Initialize\",\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"name\":\"sqrtPriceX96\",\"type\":\"uint160\"},{\"indexed\":false,\"name\":\"tick\",\"type\":\"int24\"}]}," +
+	"{\"type\":\"event\",\"name\":\"Swap\",\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"name\":\"sender\",\"type\":\"address\"},{\"indexed\":true,\"name\":\"recipient\",\"type\":\"address\"},{\"indexed\":false,\"name\":\"amount0\",\"type\":\"int256\"},{\"indexed\":false,\"name\":\"amount1\",\"type\":\"int256\"},{\"indexed\":false,\"name\":\"sqrtPriceX96\",\"type\":\"uint160\"},{\"indexed\":false,\"name\":\"liquidity\",\"type\":\"uint128\"},{\"indexed\":false,\"name\":\"tick\",\"type\":\"int24\"},{\"indexed\":false,\"name\":\"protocolFeesToken0\",\"type\":\"uint128\"},{\"indexed\":false,\"name\":\"protocolFeesToken1\",\"type\":\"uint128\"}]}," +
+	"{\"type\":\"event\",\"name\":\"Mint\",\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"name\":\"sender\",\"type\":\"address\"},{\"indexed\":true,\"name\":\"owner\",\"type\":\"address\"},{\"indexed\":true,\"name\":\"tickLower\",\"type\":\"int24\"},{\"indexed\":true,\"name\":\"tickUpper\",\"type\":\"int24\"},{\"indexed\":false,\"name\":\"amount\",\"type\":\"uint128\"},{\"indexed\":false,\"name\":\"amount0\",\"type\":\"uint256\"},{\"indexed\":false,\"name\":\"amount1\",\"type\":\"uint256\"}]}," +
+	"{\"type\":\"event\",\"name\":\"Burn\",\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"name\":\"owner\",\"type\":\"address\"},{\"indexed\":true,\"name\":\"tickLower\",\"type\":\"int24\"},{\"indexed\":true,\"name\":\"tickUpper\",\"type\":\"int24\"},{\"indexed\":false,\"name\":\"amount\",\"type\":\"uint128\"},{\"indexed\":false,\"name\":\"amount0\",\"type\":\"uint256\"},{\"indexed\":false,\"name\":\"amount1\",\"type\":\"uint256\"}]}" +
+	"]"
+
+var pancakeSwapV3EventABI = mustParseABI(pancakeSwapV3EventABIJSON)
+
 type CoverageProbe struct {
 	ZeroForOne bool
 	AmountIn   *big.Int
@@ -46,6 +62,7 @@ type OnChainConfig struct {
 	Pool         common.Address
 	MaxTickWords int
 	Probes       []CoverageProbe
+	EventProfile EventProfile
 }
 
 type PoolInfo struct {
@@ -61,6 +78,7 @@ type Adapter struct {
 	mu       sync.RWMutex
 	info     PoolInfo
 	hasInfo  bool
+	events   abi.ABI
 }
 
 func NewAdapter(config OnChainConfig) (*Adapter, error) {
@@ -80,7 +98,15 @@ func NewAdapter(config OnChainConfig) (*Adapter, error) {
 		}
 		probes[index] = CoverageProbe{ZeroForOne: probe.ZeroForOne, AmountIn: cloneInt(probe.AmountIn)}
 	}
-	return &Adapter{pool: config.Pool, maxWords: config.MaxTickWords, probes: probes}, nil
+	events := poolABI
+	switch config.EventProfile {
+	case "", EventProfileUniswapV3:
+	case EventProfilePancakeSwapV3:
+		events = pancakeSwapV3EventABI
+	default:
+		return nil, fmt.Errorf("unsupported V3 event profile %q", config.EventProfile)
+	}
+	return &Adapter{pool: config.Pool, maxWords: config.MaxTickWords, probes: probes, events: events}, nil
 }
 
 func (*Adapter) ID() string { return ID }
@@ -89,10 +115,10 @@ func (a *Adapter) Filter() evm.LogFilter {
 	return evm.LogFilter{
 		Address: a.pool,
 		Topics: []common.Hash{
-			poolABI.Events["Initialize"].ID,
-			poolABI.Events["Swap"].ID,
-			poolABI.Events["Mint"].ID,
-			poolABI.Events["Burn"].ID,
+			a.events.Events["Initialize"].ID,
+			a.events.Events["Swap"].ID,
+			a.events.Events["Mint"].ID,
+			a.events.Events["Burn"].ID,
 		},
 	}
 }
@@ -234,7 +260,7 @@ func (a *Adapter) DecodeLog(_ context.Context, _ evm.Network, block evm.BlockRef
 	if event.Address != a.pool || event.BlockHash != block.Hash || event.BlockNumber != block.Number || event.Removed {
 		return nil, fmt.Errorf("uniswap V3 log does not belong to pool and block")
 	}
-	update, err := decodeLog(event)
+	update, err := decodeLog(a.events, event)
 	if err != nil {
 		return nil, fmt.Errorf("decode Uniswap V3 log %s at block %d index %d: %w", event.TxHash.Hex(), block.Number, event.Index, err)
 	}
@@ -410,16 +436,16 @@ func (a *Adapter) call(ctx context.Context, network evm.Network, block evm.Block
 	return values, nil
 }
 
-func decodeLog(event types.Log) (market.EventData, error) {
+func decodeLog(events abi.ABI, event types.Log) (market.EventData, error) {
 	if len(event.Topics) == 0 {
 		return nil, fmt.Errorf("uniswap V3 log has no signature topic")
 	}
 	switch event.Topics[0] {
-	case poolABI.Events["Initialize"].ID:
+	case events.Events["Initialize"].ID:
 		if len(event.Topics) != 1 {
 			return nil, fmt.Errorf("invalid Uniswap V3 Initialize topics")
 		}
-		values, err := poolABI.Events["Initialize"].Inputs.NonIndexed().Unpack(event.Data)
+		values, err := events.Events["Initialize"].Inputs.NonIndexed().Unpack(event.Data)
 		if err != nil {
 			return nil, fmt.Errorf("decode Uniswap V3 Initialize: %w", err)
 		}
@@ -432,11 +458,11 @@ func decodeLog(event types.Log) (market.EventData, error) {
 			return nil, err
 		}
 		return NewInitializeUpdate(price, tick)
-	case poolABI.Events["Swap"].ID:
+	case events.Events["Swap"].ID:
 		if len(event.Topics) != 3 {
 			return nil, fmt.Errorf("invalid Uniswap V3 Swap topics")
 		}
-		values, err := poolABI.Events["Swap"].Inputs.NonIndexed().Unpack(event.Data)
+		values, err := events.Events["Swap"].Inputs.NonIndexed().Unpack(event.Data)
 		if err != nil {
 			return nil, fmt.Errorf("decode Uniswap V3 Swap: %w", err)
 		}
@@ -453,11 +479,11 @@ func decodeLog(event types.Log) (market.EventData, error) {
 			return nil, err
 		}
 		return NewSwapUpdate(price, tick, liquidity)
-	case poolABI.Events["Mint"].ID:
+	case events.Events["Mint"].ID:
 		if len(event.Topics) != 4 {
 			return nil, fmt.Errorf("invalid Uniswap V3 Mint topics")
 		}
-		values, err := poolABI.Events["Mint"].Inputs.NonIndexed().Unpack(event.Data)
+		values, err := events.Events["Mint"].Inputs.NonIndexed().Unpack(event.Data)
 		if err != nil {
 			return nil, fmt.Errorf("decode Uniswap V3 Mint: %w", err)
 		}
@@ -466,11 +492,11 @@ func decodeLog(event types.Log) (market.EventData, error) {
 			return nil, err
 		}
 		return liquidityLogUpdate(event, amount)
-	case poolABI.Events["Burn"].ID:
+	case events.Events["Burn"].ID:
 		if len(event.Topics) != 4 {
 			return nil, fmt.Errorf("invalid Uniswap V3 Burn topics")
 		}
-		values, err := poolABI.Events["Burn"].Inputs.NonIndexed().Unpack(event.Data)
+		values, err := events.Events["Burn"].Inputs.NonIndexed().Unpack(event.Data)
 		if err != nil {
 			return nil, fmt.Errorf("decode Uniswap V3 Burn: %w", err)
 		}

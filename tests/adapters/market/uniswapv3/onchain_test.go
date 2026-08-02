@@ -161,6 +161,56 @@ func TestDecoderOrdersMintBeforeSwapAndAppliesIncrementally(t *testing.T) {
 	}
 }
 
+func TestPancakeSwapV3ProfileFiltersAndDecodesExtendedSwap(t *testing.T) {
+	pool := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	adapter, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{
+		Pool: pool, MaxTickWords: 1, EventProfile: uniswapv3.EventProfilePancakeSwapV3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pancakeSwapTopic := crypto.Keccak256Hash([]byte("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)"))
+	standardSwapTopic := crypto.Keccak256Hash([]byte("Swap(address,address,int256,int256,uint160,uint128,int24)"))
+	filter := adapter.Filter()
+	if filter.Address != pool || !containsTopic(filter.Topics, pancakeSwapTopic) {
+		t.Fatalf("PancakeSwap topic is absent from filter: %+v", filter)
+	}
+	if containsTopic(filter.Topics, standardSwapTopic) {
+		t.Fatal("PancakeSwap profile unexpectedly subscribed to the standard Uniswap swap topic")
+	}
+
+	block := evm.BlockReference{Number: 21, Hash: common.HexToHash("0x21")}
+	price, err := uniswapv3.SqrtRatioAtTick(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := types.Log{
+		Address: pool, BlockNumber: block.Number, BlockHash: block.Hash,
+		Topics: []common.Hash{pancakeSwapTopic, common.Hash{}, common.Hash{}},
+		Data: packValues(t, []string{"int256", "int256", "uint160", "uint128", "int24", "uint128", "uint128"},
+			big.NewInt(10), big.NewInt(-9), price, big.NewInt(1500), big.NewInt(7), big.NewInt(2), big.NewInt(3)),
+	}
+	data, err := adapter.DecodeLog(context.Background(), nil, block, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirror := newV3Mirror(t)
+	applyV3(t, mirror, v3Event(t, 1, stateUpdateForTest(t, big.NewInt(1000), nil)))
+	snapshot := applyV3(t, mirror, v3Event(t, block.Number, data)).Data().(uniswapv3.Snapshot)
+	if snapshot.SqrtPriceX96().Cmp(price) != 0 || snapshot.Tick() != 7 || snapshot.Liquidity().Cmp(big.NewInt(1500)) != 0 {
+		t.Fatalf("extended PancakeSwap event was not applied: price=%s tick=%d liquidity=%s", snapshot.SqrtPriceX96(), snapshot.Tick(), snapshot.Liquidity())
+	}
+}
+
+func containsTopic(topics []common.Hash, target common.Hash) bool {
+	for _, topic := range topics {
+		if topic == target {
+			return true
+		}
+	}
+	return false
+}
+
 func selector(signature string) string {
 	return common.Bytes2Hex(crypto.Keccak256([]byte(signature))[:4])
 }

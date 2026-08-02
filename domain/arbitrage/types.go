@@ -203,14 +203,17 @@ const (
 )
 
 type Candidate struct {
-	Size      market.AssetQuantity
-	Input     market.AssetQuantity
-	Output    market.AssetQuantity
-	GrossPnL  market.AssetQuantity
-	Cost      CostSnapshot
-	NetPnL    market.AssetQuantity
-	BuyQuote  market.Quote
-	SellQuote market.Quote
+	Size                market.AssetQuantity
+	Input               market.AssetQuantity
+	Output              market.AssetQuantity
+	GrossPnL            market.AssetQuantity
+	Cost                CostSnapshot
+	NetPnL              market.AssetQuantity
+	FixedThreshold      market.AssetQuantity
+	PercentageThreshold market.AssetQuantity
+	EffectiveThreshold  market.AssetQuantity
+	BuyQuote            market.Quote
+	SellQuote           market.Quote
 }
 
 type Opportunity struct {
