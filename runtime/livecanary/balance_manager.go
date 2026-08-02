@@ -259,6 +259,9 @@ func (m *BalanceManager) planRequirements(plan execution.SequentialPlan) ([]inve
 		plan.EffectivePolicy() != execution.PolicyPrefundedParallel {
 		return result, nil
 	}
+	if len(plan.Stages) < 2 {
+		return nil, fmt.Errorf("balance admission prefunded plan requires buy and sell stages")
+	}
 	if plan.Opportunity.SelectedIndex < 0 || plan.Opportunity.SelectedIndex >= len(plan.Opportunity.Candidates) {
 		return nil, fmt.Errorf("balance admission opportunity has no candidate")
 	}
@@ -274,6 +277,9 @@ func (m *BalanceManager) planRequirements(plan execution.SequentialPlan) ([]inve
 		// Parallel execution fixes the sale independently from the purchase.
 		// Admission must reserve that exact scaled discovery input rather than
 		// assuming the purchase's expected output will fund it.
+		if candidate.SellQuote.AmountIn.IsZero() {
+			return nil, fmt.Errorf("balance admission sell quote is incomplete")
+		}
 		discoveryBase = candidate.SellQuote.AmountIn
 	}
 	expected := new(big.Int).Quo(
