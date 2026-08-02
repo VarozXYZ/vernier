@@ -268,6 +268,9 @@ func (m *BalanceManager) planRequirements(plan execution.SequentialPlan) ([]inve
 	}
 	discoveryBase := candidate.BuyQuote.AmountOut
 	if plan.EffectivePolicy() == execution.PolicyPrefundedParallel {
+		if candidate.SellQuote.AmountIn.IsZero() {
+			return nil, fmt.Errorf("balance admission sell quote is incomplete")
+		}
 		// Parallel execution fixes the sale independently from the purchase.
 		// Admission must reserve that exact scaled discovery input rather than
 		// assuming the purchase's expected output will fund it.
