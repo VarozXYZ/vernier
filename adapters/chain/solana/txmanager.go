@@ -37,6 +37,14 @@ type SignedTransactionSimulator interface {
 	SimulateSignedTransaction(context.Context, []byte) error
 }
 
+type SignedTransactionEconomicSimulator interface {
+	SimulateSignedTransactionEconomic(
+		context.Context,
+		[]byte,
+		string,
+	) (*big.Int, uint64, uint64, error)
+}
+
 type MessageFeeEstimator interface {
 	FeeForMessage(context.Context, string) (uint64, error)
 }
@@ -71,6 +79,7 @@ type TxManagerConfig struct {
 	Clock                  func() time.Time
 	WarmInterval           time.Duration
 	SettlementDecoder      TransactionSettlementDecoder
+	TokenAccounts          map[market.TokenID]string
 }
 
 type TxManager struct {
@@ -90,6 +99,7 @@ type TxManager struct {
 	clock                  func() time.Time
 	warmInterval           time.Duration
 	settlementDecoder      TransactionSettlementDecoder
+	tokenAccounts          map[market.TokenID]string
 	requestID              atomic.Uint64
 	warmOnce               sync.Once
 }
@@ -134,6 +144,12 @@ func NewTxManager(config TxManagerConfig) (*TxManager, error) {
 	if config.WarmInterval < time.Second {
 		return nil, fmt.Errorf("helius Sender warm interval must be at least one second")
 	}
+	tokenAccounts := make(map[market.TokenID]string, len(config.TokenAccounts))
+	for token, account := range config.TokenAccounts {
+		if token != "" && strings.TrimSpace(account) != "" {
+			tokenAccounts[token] = strings.TrimSpace(account)
+		}
+	}
 	return &TxManager{
 		chain: config.Chain, account: config.Account, privateKey: append(solanago.PrivateKey(nil), config.PrivateKey...),
 		senderEndpoint: endpoint.String(), pingEndpoint: ping.String(), computeLimit: config.ComputeUnitLimit,
@@ -142,6 +158,7 @@ func NewTxManager(config TxManagerConfig) (*TxManager, error) {
 		client:                 config.Client, reconciliation: config.Reconciliation, clock: config.Clock,
 		simulator: config.Simulator, feeEstimator: config.FeeEstimator, warmInterval: config.WarmInterval,
 		settlementDecoder: config.SettlementDecoder,
+		tokenAccounts:     tokenAccounts,
 	}, nil
 }
 
@@ -236,6 +253,48 @@ func (m *TxManager) SimulatePrepared(
 		return fmt.Errorf("solana prepared transaction is invalid")
 	}
 	return m.simulator.SimulateSignedTransaction(ctx, prepared.SignedPayload)
+}
+
+func (m *TxManager) SimulatePreparedEconomic(
+	ctx context.Context,
+	request chainport.EconomicSimulationRequest,
+) (chainport.EconomicSimulationResult, error) {
+	prepared := request.Prepared
+	if prepared.Leg.Account != m.account || prepared.Leg.Chain != m.chain ||
+		len(prepared.SignedPayload) == 0 || request.OutputBalanceBefore == nil {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("solana economic simulation input is invalid")
+	}
+	simulator, ok := m.simulator.(SignedTransactionEconomicSimulator)
+	if !ok {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("solana economic transaction simulator is unavailable")
+	}
+	outputToken := prepared.Leg.ExpectedOutput.Token()
+	account := m.tokenAccounts[outputToken]
+	if account == "" {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("solana simulation output token account is unavailable")
+	}
+	post, units, slot, err := simulator.SimulateSignedTransactionEconomic(
+		ctx, prepared.SignedPayload, account,
+	)
+	if err != nil {
+		return chainport.EconomicSimulationResult{}, err
+	}
+	delta := new(big.Int).Sub(post, request.OutputBalanceBefore)
+	if delta.Sign() <= 0 {
+		return chainport.EconomicSimulationResult{},
+			fmt.Errorf("solana simulation returned no positive output delta")
+	}
+	output, err := market.NewTokenAmount(outputToken, delta)
+	if err != nil {
+		return chainport.EconomicSimulationResult{}, err
+	}
+	return chainport.EconomicSimulationResult{
+		Input: prepared.Leg.Input, Output: output, UnitsConsumed: units,
+		ContextVersion: slot, Evidence: "solana_simulate_post_spl_balance",
+	}, nil
 }
 
 // EstimateArtifactNetworkCost builds the exact Helius Sender transaction and

@@ -106,6 +106,30 @@ func (s *Sender) SendLiveRuntime(
 	ctx context.Context,
 	event notificationport.LiveRuntimeEvent,
 ) error {
+	if event.Kind == notificationport.LiveRuntimeValidationBlocked {
+		_, err := s.send(ctx, strings.Join([]string{
+			"\U0001f6d1 <b>LIVE · VALIDATION BLOCKED</b>",
+			"⚠️ " + escape(event.Reason),
+			"🔒 Broadcast disabled until manual acknowledgement",
+		}, "\n"))
+		return err
+	}
+	if event.Kind == notificationport.LiveRuntimeBalanceInsufficient ||
+		event.Kind == notificationport.LiveRuntimeBalanceRecovered {
+		title := "⚠️ <b>LIVE · INSUFFICIENT BALANCE</b>"
+		if event.Kind == notificationport.LiveRuntimeBalanceRecovered {
+			title = "✅ <b>LIVE · BALANCE RECOVERED</b>"
+		}
+		lines := []string{
+			title,
+			"\U0001f4cd " + escape(event.Chain),
+			"\U0001fa99 <code>" + escape(event.Token) + "</code>",
+			"\U0001f4b0 Available <code>" + escape(event.AvailableUnits) + " " + escape(event.Token) + "</code>",
+			"\U0001f3af Required <code>" + escape(event.RequiredUnits) + " " + escape(event.Token) + "</code>",
+		}
+		_, err := s.send(ctx, strings.Join(lines, "\n"))
+		return err
+	}
 	mode := strings.TrimSpace(event.Mode)
 	if mode == "" {
 		mode = "live"
@@ -328,7 +352,7 @@ func liveSummaryLines(state *liveMessageState) []string {
 					escape(compactDetail(state.recovery.Detail)),
 			)
 		case notificationport.LiveExecutionRecoveryCompleted:
-			lines = append(lines, "\u2705 Recovery completed")
+			lines = append(lines, "\U0001f504 Recovered automatically")
 		case notificationport.LiveExecutionRecoveryBlocked:
 			lines = append(
 				lines,
@@ -442,6 +466,16 @@ func terminalLines(event notificationport.LiveExecutionEvent) []string {
 			result,
 			"   \U0001f4b0 Return   <b>"+escape(output)+"</b>",
 		)
+	}
+	if quoteDelta := compactLiveMoney(event.QuoteDelta); quoteDelta != "" {
+		result = append(result, "   \U0001f4b5 Quote \u0394  "+escape(quoteDelta))
+	}
+	if baseDelta := compactLiveAmount(event.BaseDelta); baseDelta != "" {
+		line := "   \U0001fa99 Base \u0394   " + escape(baseDelta)
+		if baseValue := compactLiveMoney(event.BaseValue); baseValue != "" {
+			line += " (" + escape(baseValue) + ")"
+		}
+		result = append(result, line)
 	}
 	if cost := compactLiveMoney(event.ExecutionCost); cost != "" {
 		result = append(result, "   \U0001f4b8 Costs    "+escape(cost))

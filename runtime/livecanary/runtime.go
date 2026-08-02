@@ -33,6 +33,7 @@ type Runtime struct {
 	postFlowRefresh    func(context.Context) error
 	recovery           sequentialRecovery
 	refuel             *RefuelService
+	balances           *BalanceManager
 	execute            bool
 	forcedDirection    *arbitrage.Direction
 	exitAfterOperation bool
@@ -217,6 +218,11 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 						RuntimeGateExecuting,
 						RuntimeGateIdle,
 					)
+					var insufficient *InsufficientLocalBalanceError
+					if errors.As(err, &insufficient) {
+						fmt.Fprintf(r.output, "live_operation status=rejected reason=insufficient_local_balance chain=%s token=%s available_units=%s required_units=%s\n", insufficient.Key.Chain, insufficient.Key.Token, insufficient.Available, insufficient.Required)
+						return nil
+					}
 					return err
 				}
 				if !accepted {
@@ -304,6 +310,9 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 			refuelResult <- r.refuel.Run(streamCtx)
 		}()
 	}
+	if r.balances != nil {
+		go r.balances.Run(streamCtx)
+	}
 
 	for {
 		select {
@@ -320,6 +329,20 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				return fmt.Errorf("gas refuel runtime: %w", err)
 			}
 		case event := <-r.manager.Events():
+			var simulationInvariant *executionport.SimulationInvariantError
+			if event.Err != nil && errors.As(event.Err, &simulationInvariant) {
+				_ = r.gate.Transition(RuntimeGateExecuting, RuntimeGateRecoveryBlocked)
+				if r.notifier != nil {
+					r.notifier.NotifyRuntime(notificationport.LiveRuntimeEvent{
+						Kind: notificationport.LiveRuntimeValidationBlocked,
+						Mode: r.runtimeMode(), Reason: simulationInvariant.Error(),
+						OccurredAt: time.Now().UTC(),
+					})
+				}
+				cancelStream()
+				<-streamResult
+				return fmt.Errorf("operation %s validation blocked: %w", event.Operation, event.Err)
+			}
 			if event.Err != nil && event.RetryEvaluation {
 				action := "reevaluate_latest"
 				if event.FromRetryEvaluation {
@@ -559,6 +582,10 @@ func (r *Runtime) SetRecovery(recovery sequentialRecovery) {
 
 func (r *Runtime) SetRefuel(refuel *RefuelService) {
 	r.refuel = refuel
+}
+
+func (r *Runtime) SetBalanceManager(balances *BalanceManager) {
+	r.balances = balances
 }
 
 // RefuelOnce uses the normal signer-backed builders and simulators without

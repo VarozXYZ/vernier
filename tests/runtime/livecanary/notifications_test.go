@@ -2,6 +2,7 @@ package livecanary_test
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"strings"
 	"sync"
@@ -194,4 +195,221 @@ func TestProgressObserverEmitsNonBlockingLifecycleEvents(t *testing.T) {
 		sender.events[4].NetPnL != "-0.05 QUOTE" {
 		t.Fatalf("unexpected realized economics event: %+v", sender.events[4])
 	}
+}
+
+func TestPrefundedProgressDirectionUsesBuyAndSellChains(t *testing.T) {
+	t.Parallel()
+
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	observer := newSyntheticProgressObserver(t, notifier, now)
+	opportunity := liveCanaryOpportunity(t)
+	initial := opportunity.Candidates[0].BuyQuote.AmountIn
+	plan, err := execution.NewPrefundedSequentialPlan(
+		"prefunded-plan",
+		opportunity,
+		initial,
+		"chain-a",
+		"chain-b",
+		now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer.OperationStarted(execution.SequentialOperation{
+		ID: "prefunded-operation", Plan: plan.ID,
+		State: execution.SequentialRunning, CurrentAmount: initial,
+		StartedAt: now, UpdatedAt: now,
+	}, plan)
+	request := execution.SequentialStageRequest{
+		Operation: "prefunded-operation", Plan: plan.ID,
+		Stage: plan.Stages[0], Input: initial,
+	}
+	observer.StageStarted(request)
+	observer.StageSettled(execution.SequentialStageSettlement{
+		Request: request, ActualInput: initial,
+		ActualOutput: opportunity.Candidates[0].BuyQuote.AmountOut,
+		SourceIdentity: execution.TransactionIdentity{
+			Chain: "chain-a", Account: "synthetic-account", Hash: "synthetic-tx",
+		},
+		ObservedAt: now, Evidence: "durable_receipt",
+	})
+	notifier.Close()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.events) != 3 || sender.events[0].Direction != "Chain A -> Chain B" {
+		t.Fatalf("unexpected prefunded direction events: %+v", sender.events)
+	}
+}
+
+func TestProgressObserverSuppressesDefinitiveFailureBeforeBuySettlement(t *testing.T) {
+	t.Parallel()
+
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	observer := newSyntheticProgressObserver(t, notifier, now)
+	opportunity := liveCanaryOpportunity(t)
+	initial := opportunity.Candidates[0].BuyQuote.AmountIn
+	plan, err := execution.NewPrefundedSequentialPlan(
+		"silent-plan", opportunity, initial, "chain-a", "chain-b", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := execution.SequentialOperation{
+		ID: "silent-operation", Plan: plan.ID,
+		State: execution.SequentialRunning, CurrentAmount: initial,
+		StartedAt: now, UpdatedAt: now,
+	}
+	observer.OperationStarted(operation, plan)
+	observer.StageStarted(execution.SequentialStageRequest{
+		Operation: operation.ID, Plan: plan.ID,
+		Stage: plan.Stages[0], Input: initial,
+	})
+	observer.OperationFinished(
+		operation,
+		execution.SequentialAborted,
+		executionport.SequentialResult{Operation: operation.ID},
+		executionport.NewStageError(
+			executionport.DispositionRejected,
+			errors.New("artifact expired before broadcast"),
+		),
+	)
+	notifier.Close()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.events) != 0 {
+		t.Fatalf("definitive pre-buy failure emitted events: %+v", sender.events)
+	}
+}
+
+func TestLiveNotifierSuppressesRetryablePreflightFailure(t *testing.T) {
+	t.Parallel()
+
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier.Notify(notificationport.LiveExecutionEvent{
+		Kind:      notificationport.LiveExecutionFailed,
+		Operation: "preflight-operation", State: "aborted_retrying",
+		Detail: "buy threshold is below required output",
+	})
+	notifier.Close()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.events) != 0 {
+		t.Fatalf("preflight failure emitted events: %+v", sender.events)
+	}
+}
+
+func TestRecoveryReplaysDurableStagesAndEmitsFinalCompletion(t *testing.T) {
+	t.Parallel()
+
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	progress := newSyntheticProgressObserver(t, notifier, now)
+	recovery := livecanary.NewRecoveryObserver(notifier, progress, func() time.Time {
+		return now
+	})
+	opportunity := liveCanaryOpportunity(t)
+	initial := opportunity.Candidates[0].BuyQuote.AmountIn
+	plan, err := execution.NewPrefundedSequentialPlan(
+		"recovery-plan", opportunity, initial,
+		"chain-a", "chain-b", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := execution.SequentialOperation{
+		ID: "recovery-operation", Plan: plan.ID,
+		State:         execution.SequentialRecovering,
+		CurrentAmount: initial, StartedAt: now.Add(-time.Minute), UpdatedAt: now,
+	}
+	request := execution.SequentialStageRequest{
+		Operation: operation.ID, Plan: plan.ID,
+		Stage: plan.Stages[0], Input: initial,
+	}
+	settlement := execution.SequentialStageSettlement{
+		Request: request, ActualInput: initial,
+		ActualOutput: opportunity.Candidates[0].BuyQuote.AmountOut,
+		SourceIdentity: execution.TransactionIdentity{
+			Chain: "chain-a", Account: "synthetic-account", Hash: "synthetic-tx",
+		},
+		ObservedAt: now, Evidence: "durable_receipt",
+	}
+	// Model the terminal failure already sent before recovery took ownership.
+	notifier.Notify(notificationport.LiveExecutionEvent{
+		Kind:      notificationport.LiveExecutionFailed,
+		Operation: string(operation.ID), Detail: "temporary failure",
+	})
+	recovery.RecoveryStarted(executionport.SequentialRecoverySnapshot{
+		Operation: operation, Plan: plan,
+		Settlements: []execution.SequentialStageSettlement{settlement},
+	})
+	result := executionport.SequentialResult{
+		Operation: operation.ID, FinalAmount: initial,
+		Settlements: []execution.SequentialStageSettlement{settlement},
+	}
+	result.ExternalCost, _ = market.NewAssetQuantity("quote", new(big.Rat))
+	result.RealizedNetPnL, _ = market.NewAssetQuantity("quote", new(big.Rat))
+	recovery.RecoveryCompleted(result)
+	notifier.Close()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	var completed bool
+	for _, event := range sender.events {
+		if event.Kind == notificationport.LiveExecutionCompleted {
+			completed = true
+			if event.Direction != "Chain A -> Chain B" {
+				t.Fatalf("completed direction=%q", event.Direction)
+			}
+		}
+	}
+	if !completed {
+		t.Fatalf("recovery never emitted final completion: %+v", sender.events)
+	}
+}
+
+func newSyntheticProgressObserver(
+	t *testing.T,
+	notifier *livecanary.LiveNotifier,
+	now time.Time,
+) *livecanary.ProgressObserver {
+	t.Helper()
+	observer, err := livecanary.NewProgressObserver(
+		notifier,
+		map[market.TokenID]market.Token{
+			"quote-a": {ID: "quote-a", Asset: "quote", Symbol: "QUOTE", Decimals: 6},
+			"base-a":  {ID: "base-a", Asset: "base", Symbol: "BASE", Decimals: 9},
+			"quote-b": {ID: "quote-b", Asset: "quote", Symbol: "QUOTE", Decimals: 6},
+			"base-b":  {ID: "base-b", Asset: "base", Symbol: "BASE", Decimals: 18},
+		},
+		map[market.ChainID]configuration.ResolvedChain{
+			"chain-a": {ID: "chain-a", Label: "Chain A", Kind: "solana"},
+			"chain-b": {ID: "chain-b", Label: "Chain B", Kind: "evm"},
+		},
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return observer
 }

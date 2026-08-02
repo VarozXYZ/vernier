@@ -114,6 +114,9 @@ type SequentialPlan struct {
 	Stages          []SequentialStagePlan
 	CircuitBreaker  []SequentialStagePlan
 	DiscoveryAmount market.TokenAmount
+	BaseAsset       market.AssetID
+	QuoteAsset      market.AssetID
+	TokenDecimals   map[market.TokenID]uint8
 	CreatedAt       time.Time
 }
 
@@ -134,9 +137,13 @@ func (p SequentialPlan) Validate() error {
 		if len(p.Stages) != 4 {
 			return fmt.Errorf("transported sequential plan requires four main stages")
 		}
-	case PolicyPrefundedSequential:
+	case PolicyPrefundedSequential, PolicyPrefundedParallel:
 		if len(p.Stages) != 4 || len(p.CircuitBreaker) != 1 {
-			return fmt.Errorf("prefunded sequential plan requires four main stages and one circuit-breaker stage")
+			return fmt.Errorf("prefunded plan requires four main stages and one circuit-breaker stage")
+		}
+		if p.EffectivePolicy() == PolicyPrefundedParallel &&
+			(p.BaseAsset == "" || p.QuoteAsset == "" || len(p.TokenDecimals) == 0) {
+			return fmt.Errorf("prefunded parallel plan requires durable valuation metadata")
 		}
 	default:
 		return fmt.Errorf("unsupported dependent execution policy %q", p.Policy)
@@ -387,6 +394,25 @@ func NewPrefundedSequentialPlan(
 		return SequentialPlan{}, err
 	}
 	return transported, nil
+}
+
+func NewPrefundedParallelPlan(
+	id PlanID,
+	opportunity arbitrage.Opportunity,
+	initialInput market.TokenAmount,
+	buyChain, sellChain market.ChainID,
+	createdAt time.Time,
+) (SequentialPlan, error) {
+	plan, err := NewPrefundedSequentialPlan(
+		id, opportunity, initialInput, buyChain, sellChain, createdAt,
+	)
+	if err != nil {
+		return SequentialPlan{}, err
+	}
+	plan.Policy = PolicyPrefundedParallel
+	// Valuation assets and token decimals are supplied by the setup-neutral
+	// runtime planner before the final validation.
+	return plan, nil
 }
 
 type SequentialOperationState string

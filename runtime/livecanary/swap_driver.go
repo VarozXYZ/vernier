@@ -26,6 +26,7 @@ type SwapBinding struct {
 	Confirmation     chainport.ConfirmationSource
 	NonceCoordinator chainport.EVMNonceCoordinator
 	SpendableBalance SpendableBalanceReader
+	BalanceSnapshot  func(market.TokenID) (*big.Int, uint64, error)
 	Allowance        AllowanceReader
 	RefuelNetwork    RefuelNetwork
 	NativeToken      market.Token
@@ -155,6 +156,7 @@ type SwapDriver struct {
 	TokenDecimals            map[market.TokenID]uint8
 	BridgePrecision          uint8
 	QuoteAsset               market.AssetID
+	BaseAsset                market.AssetID
 	MinimumNet               *big.Rat
 	ReturnMargin             *big.Rat
 	ExitCosts                ExitCostSource
@@ -179,6 +181,7 @@ type preparedSwap struct {
 	prepared        chainport.PreparedTransaction
 	validationTime  time.Duration
 	compactRebuilds int
+	simulation      chainport.EconomicSimulationResult
 }
 
 type exitReturnQuote struct {
@@ -404,6 +407,7 @@ func (d *SwapDriver) RecoverStage(
 	if candidate == nil ||
 		candidate.Status == "rejected" ||
 		candidate.Status == "confirmed_revert" {
+		d.primeSwapAttempts(request.Operation, request.Stage.Ordinal, len(transactions))
 		return d.executeRecoverySwap(ctx, request, binding, journal)
 	}
 	expected, expectedErr := market.NewTokenAmount(
@@ -684,6 +688,9 @@ func (d *SwapDriver) Preflight(
 	operation execution.OperationID,
 	plan execution.SequentialPlan,
 ) error {
+	if plan.EffectivePolicy() == execution.PolicyPrefundedParallel {
+		return d.preflightParallel(ctx, operation, plan)
+	}
 	sellIndex := 2
 	if plan.EffectivePolicy() == execution.PolicyPrefundedSequential {
 		sellIndex = 1
@@ -807,23 +814,13 @@ func (d *SwapDriver) Preflight(
 			}
 			return
 		}
-		var bundle preparedSwap
-		var prepareErr error
-		if plan.EffectivePolicy() ==
-			execution.PolicyPrefundedSequential {
-			bundle, _, prepareErr = d.prepareSwapWithRetry(
-				ctx,
-				operation,
-				sellRequest,
-				sellBinding,
-				nil,
-				"live_preflight_sell",
-			)
-		} else {
-			bundle, prepareErr = d.prepareAndSimulate(
-				ctx, sellRequest, sellBinding, nil,
-			)
-		}
+		// Initial preflight runs before the operation and its first settlement
+		// exist. A failed destination simulation must therefore abort and let
+		// the scheduler perform one fresh evaluation; the multi-attempt exit
+		// policy is reserved for recovery of inventory already at risk.
+		bundle, prepareErr := d.prepareAndSimulate(
+			ctx, sellRequest, sellBinding, nil,
+		)
 		sellPrepared <- sellResult{
 			artifact: bundle.artifact,
 			identity: string(sellBinding.Account),
@@ -917,6 +914,23 @@ func (d *SwapDriver) nextSwapTransactionPhase(
 	return fmt.Sprintf("swap_recovery_%d", attempt)
 }
 
+func (d *SwapDriver) primeSwapAttempts(
+	operation execution.OperationID,
+	ordinal, attempts int,
+) {
+	d.preflightMu.Lock()
+	defer d.preflightMu.Unlock()
+	if d.swapAttempts == nil {
+		d.swapAttempts = make(map[execution.OperationID]map[int]int)
+	}
+	if d.swapAttempts[operation] == nil {
+		d.swapAttempts[operation] = make(map[int]int)
+	}
+	if d.swapAttempts[operation][ordinal] < attempts {
+		d.swapAttempts[operation][ordinal] = attempts
+	}
+}
+
 func (d *SwapDriver) SelectExit(
 	ctx context.Context,
 	operation execution.OperationID,
@@ -948,7 +962,8 @@ func (d *SwapDriver) SelectPrefundedExit(
 	bought market.TokenAmount,
 	incurred []execution.CostComponent,
 ) (execution.SequentialExitDecision, error) {
-	if plan.EffectivePolicy() != execution.PolicyPrefundedSequential ||
+	if (plan.EffectivePolicy() != execution.PolicyPrefundedSequential &&
+		plan.EffectivePolicy() != execution.PolicyPrefundedParallel) ||
 		len(plan.Stages) != 4 || len(plan.CircuitBreaker) != 1 ||
 		bought.IsZero() {
 		return execution.SequentialExitDecision{},
@@ -1012,7 +1027,8 @@ func (d *SwapDriver) SelectPrefundedRecoveryExit(
 	incurred []execution.CostComponent,
 	cause error,
 ) (execution.SequentialExitDecision, error) {
-	if plan.EffectivePolicy() != execution.PolicyPrefundedSequential ||
+	if (plan.EffectivePolicy() != execution.PolicyPrefundedSequential &&
+		plan.EffectivePolicy() != execution.PolicyPrefundedParallel) ||
 		len(plan.Stages) != 4 || len(plan.CircuitBreaker) != 1 || bought.IsZero() {
 		return execution.SequentialExitDecision{},
 			fmt.Errorf("prefunded recovery input is incomplete")

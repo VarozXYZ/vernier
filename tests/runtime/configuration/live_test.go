@@ -30,6 +30,14 @@ func TestLoadLiveConfigResolvesExecutionPolicy(t *testing.T) {
 	if len(config.Accounts) != 2 || len(config.Inventory) != 4 {
 		t.Fatalf("accounts=%d inventory=%d", len(config.Accounts), len(config.Inventory))
 	}
+	if config.BalancePollInterval != time.Minute ||
+		config.BalanceAlertInterval != 5*time.Minute {
+		t.Fatalf(
+			"unexpected balance tracking defaults: poll=%s alert=%s",
+			config.BalancePollInterval,
+			config.BalanceAlertInterval,
+		)
+	}
 }
 
 func TestLoadLiveConfigRejectsZeroExecutionCost(t *testing.T) {

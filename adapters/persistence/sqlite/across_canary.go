@@ -181,13 +181,32 @@ func (s *AcrossCanaryStore) Destination(
 }
 
 func (s *AcrossCanaryStore) Get(ctx context.Context, operationID string) (AcrossCanaryOperation, error) {
+	return s.get(ctx, "operation_id=?", operationID)
+}
+
+func (s *AcrossCanaryStore) GetBySourceIdentity(
+	ctx context.Context,
+	sourceIdentity string,
+) (AcrossCanaryOperation, error) {
+	if strings.TrimSpace(sourceIdentity) == "" {
+		return AcrossCanaryOperation{},
+			fmt.Errorf("across source identity is required")
+	}
+	return s.get(ctx, "source_identity=?", sourceIdentity)
+}
+
+func (s *AcrossCanaryStore) get(
+	ctx context.Context,
+	clause string,
+	argument string,
+) (AcrossCanaryOperation, error) {
 	var operation AcrossCanaryOperation
 	var createdAt string
 	err := s.db.QueryRowContext(ctx, `SELECT
 		operation_id, direction, amount_units, expected_output_units, status,
 		source_chain, source_identity, destination_chain, destination_identity,
 		balance_before, balance_after, last_error, created_at
-		FROM across_canary_operations WHERE operation_id=?`, operationID,
+		FROM across_canary_operations WHERE `+clause, argument,
 	).Scan(
 		&operation.ID, &operation.Direction, &operation.AmountUnits, &operation.ExpectedOutput,
 		&operation.Status, &operation.SourceChain, &operation.SourceIdentity,

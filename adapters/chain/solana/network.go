@@ -6,6 +6,7 @@ package solana
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	chainport "github.com/VarozXYZ/vernier/ports/chain"
 	"github.com/gorilla/websocket"
 )
 
@@ -220,6 +222,74 @@ func (n *ReadOnlyNetwork) SimulateSignedTransaction(
 	raw []byte,
 ) error {
 	return n.simulateTransaction(ctx, raw, true)
+}
+
+// SimulateSignedTransactionEconomic returns the post-simulation SPL account
+// amount as part of the same RPC request. The caller supplies its versioned
+// local pre-balance, avoiding a separate hot-path account read.
+func (n *ReadOnlyNetwork) SimulateSignedTransactionEconomic(
+	ctx context.Context,
+	raw []byte,
+	outputAccount string,
+) (*big.Int, uint64, uint64, error) {
+	if len(raw) == 0 || strings.TrimSpace(outputAccount) == "" {
+		return nil, 0, 0, fmt.Errorf("simulate %s economic transaction: input is incomplete", n.label)
+	}
+	var result struct {
+		Context struct {
+			Slot uint64 `json:"slot"`
+		} `json:"context"`
+		Value *struct {
+			Err           json.RawMessage `json:"err"`
+			Logs          []string        `json:"logs"`
+			UnitsConsumed *uint64         `json:"unitsConsumed"`
+			Accounts      []*struct {
+				Data []json.RawMessage `json:"data"`
+			} `json:"accounts"`
+		} `json:"value"`
+	}
+	if err := n.callHTTP(ctx, "simulateTransaction", []any{
+		base64.StdEncoding.EncodeToString(raw),
+		map[string]any{
+			"encoding": "base64", "sigVerify": true,
+			"commitment": "confirmed",
+			"accounts": map[string]any{
+				"encoding": "base64", "addresses": []string{outputAccount},
+			},
+		},
+	}, &result); err != nil {
+		return nil, 0, 0, fmt.Errorf("simulate %s economic transaction: %w", n.label, err)
+	}
+	if result.Value == nil {
+		return nil, 0, result.Context.Slot, fmt.Errorf("simulate %s economic transaction: response has no value", n.label)
+	}
+	if len(result.Value.Err) > 0 && string(result.Value.Err) != "null" {
+		logs := result.Value.Logs
+		if len(logs) > 8 {
+			logs = logs[len(logs)-8:]
+		}
+		return nil, 0, result.Context.Slot, fmt.Errorf(
+			"simulate %s economic transaction failed: %s logs=%v",
+			n.label, string(result.Value.Err), logs,
+		)
+	}
+	if len(result.Value.Accounts) != 1 || result.Value.Accounts[0] == nil ||
+		len(result.Value.Accounts[0].Data) == 0 {
+		return nil, 0, result.Context.Slot, &chainport.EconomicOutputError{Err: fmt.Errorf("simulate %s economic transaction returned no output account", n.label)}
+	}
+	var encoded string
+	if err := json.Unmarshal(result.Value.Accounts[0].Data[0], &encoded); err != nil {
+		return nil, 0, result.Context.Slot, &chainport.EconomicOutputError{Err: fmt.Errorf("decode %s simulated output account: %w", n.label, err)}
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(data) < 72 {
+		return nil, 0, result.Context.Slot, &chainport.EconomicOutputError{Err: fmt.Errorf("decode %s simulated SPL balance", n.label)}
+	}
+	consumed := uint64(0)
+	if result.Value.UnitsConsumed != nil {
+		consumed = *result.Value.UnitsConsumed
+	}
+	return new(big.Int).SetUint64(binary.LittleEndian.Uint64(data[64:72])), consumed, result.Context.Slot, nil
 }
 
 // SimulateTransactionWithoutSignatureVerification is restricted to

@@ -39,6 +39,34 @@ type SlippageThresholdError struct {
 	Required market.TokenAmount
 }
 
+// SimulationInvariantError means the chain accepted the exact payload for
+// simulation but the adapter could not prove its economic output. Continuing
+// would silently disable Live's joint profitability guard.
+type SimulationInvariantError struct {
+	Chain    market.ChainID
+	Market   market.MarketID
+	Provider string
+	Identity string
+	Err      error
+}
+
+func (e *SimulationInvariantError) Error() string {
+	if e == nil || e.Err == nil {
+		return "successful simulation has no attributable economic output"
+	}
+	return fmt.Sprintf(
+		"successful simulation has no attributable economic output on %s/%s: %v",
+		e.Chain, e.Market, e.Err,
+	)
+}
+
+func (e *SimulationInvariantError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 func (e *SlippageThresholdError) Error() string {
 	if e == nil {
 		return "swap threshold is below the required output"

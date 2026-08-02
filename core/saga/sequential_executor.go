@@ -98,6 +98,30 @@ func (e *SequentialExecutor) Execute(
 	}
 	if preflight, ok := e.drivers.Buy.(executionport.SequentialPreflight); ok {
 		if err := preflight.Preflight(ctx, operationID, plan); err != nil {
+			var invariant *executionport.SimulationInvariantError
+			if errors.As(err, &invariant) {
+				blockedAt := e.clock().UTC()
+				operation := domainexecution.SequentialOperation{
+					ID: operationID, Plan: plan.ID,
+					OpportunityID: string(plan.Opportunity.Evaluation),
+					ConfigHash:    plan.Opportunity.ConfigHash,
+					State:         domainexecution.SequentialRunning,
+					CurrentStage:  0, CurrentAmount: plan.InitialInput,
+					StartedAt: blockedAt, UpdatedAt: blockedAt,
+				}
+				if recoveryJournal, ok := e.journal.(executionport.SequentialRecoveryJournal); ok {
+					if persistErr := recoveryJournal.CreateRecoverableSequentialOperation(ctx, operation, plan); persistErr != nil {
+						return result, errors.Join(err, persistErr)
+					}
+					if persistErr := recoveryJournal.SetSequentialRecoveryState(
+						context.WithoutCancel(ctx), operationID,
+						domainexecution.SequentialRecoveryBlocked,
+						fmt.Errorf("validation_blocked: %w", invariant),
+					); persistErr != nil {
+						return result, errors.Join(err, persistErr)
+					}
+				}
+			}
 			return result, fmt.Errorf("swap preflight: %w", err)
 		}
 		defer preflight.DiscardPreflight(operationID)
@@ -128,6 +152,9 @@ func (e *SequentialExecutor) Execute(
 	e.observe(func(observer executionport.SequentialObserver) {
 		observer.OperationStarted(operation, plan)
 	})
+	if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel {
+		return e.executePrefundedParallel(ctx, operation, plan, result)
+	}
 
 	current := plan.InitialInput
 	stages := append([]domainexecution.SequentialStagePlan(nil), plan.Stages...)

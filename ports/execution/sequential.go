@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
@@ -88,16 +89,27 @@ func ErrorCosts(err error) []domainexecution.CostComponent {
 }
 
 type PreparedTransaction struct {
-	Operation  domainexecution.OperationID
-	Ordinal    int
-	Phase      string
-	Identity   domainexecution.TransactionIdentity
-	PreparedAt time.Time
+	Operation                domainexecution.OperationID
+	Ordinal                  int
+	Phase                    string
+	Identity                 domainexecution.TransactionIdentity
+	PreparedAt               time.Time
+	SimulatedInput           market.TokenAmount
+	SimulatedOutput          market.TokenAmount
+	SimulationEvidence       string
+	SimulationContextVersion uint64
+	SimulationUnitsConsumed  uint64
 }
 
 func (t PreparedTransaction) Validate() error {
 	if t.Operation == "" || t.Ordinal < 1 || t.Phase == "" || t.PreparedAt.IsZero() {
 		return fmt.Errorf("prepared sequential transaction is incomplete")
+	}
+	if t.SimulatedInput.IsZero() != t.SimulatedOutput.IsZero() {
+		return fmt.Errorf("prepared transaction simulation evidence is incomplete")
+	}
+	if !t.SimulatedInput.IsZero() && t.SimulationEvidence == "" {
+		return fmt.Errorf("prepared transaction simulation evidence is incomplete")
 	}
 	return t.Identity.Validate()
 }
@@ -114,6 +126,29 @@ type SequentialJournal interface {
 	ActiveSequentialOperation(context.Context) (domainexecution.SequentialOperation, bool, error)
 }
 
+type SequentialPreparedBatchJournal interface {
+	RecordPreparedTransactions(context.Context, []PreparedTransaction) error
+}
+
+type SequentialParallelSwapDriver interface {
+	ExecuteParallelSwaps(
+		context.Context,
+		domainexecution.OperationID,
+		domainexecution.SequentialPlan,
+		SequentialJournal,
+	) ([]domainexecution.SequentialStageSettlement, error)
+}
+
+type SequentialParallelBuyRecovery interface {
+	RecoverParallelBuy(
+		context.Context,
+		domainexecution.OperationID,
+		domainexecution.SequentialPlan,
+		[]SequentialTransactionRecord,
+		SequentialJournal,
+	) (domainexecution.SequentialStageSettlement, error)
+}
+
 type SequentialTransactionRecord struct {
 	Operation           domainexecution.OperationID
 	Ordinal             int
@@ -127,6 +162,11 @@ type SequentialTransactionRecord struct {
 	RecoveryReason      string
 	RecoveryAttempts    int
 	NextRecoveryAttempt time.Time
+	SimulatedInput      market.TokenAmount
+	SimulatedOutput     market.TokenAmount
+	SimulationEvidence  string
+	SimulationVersion   uint64
+	SimulationUnits     uint64
 }
 
 type SequentialRecoverySnapshot struct {
@@ -380,6 +420,10 @@ type SequentialResult struct {
 	ExternalCost   market.AssetQuantity
 	RealizedGross  market.AssetQuantity
 	RealizedNetPnL market.AssetQuantity
+	QuoteDelta     market.AssetQuantity
+	BaseDelta      market.AssetQuantity
+	MarkedBase     market.AssetQuantity
+	MarkPrice      *big.Rat
 }
 
 // SequentialObserver receives lifecycle evidence after durable state changes.

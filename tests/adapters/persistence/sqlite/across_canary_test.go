@@ -50,4 +50,11 @@ func TestAcrossCanaryPersistsIdentityBeforeBroadcast(t *testing.T) {
 		stored.DestinationIdentity != "synthetic-fill" || stored.BalanceAfter != "1999900" {
 		t.Fatalf("unexpected stored operation: %+v", stored)
 	}
+	bySource, err := store.GetBySourceIdentity(ctx, "0xsynthetic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bySource.ID != operation.ID {
+		t.Fatalf("source lookup operation=%q, want %q", bySource.ID, operation.ID)
+	}
 }

@@ -63,6 +63,19 @@ func (n *LiveNotifier) Notify(event notificationport.LiveExecutionEvent) {
 	if n.closed {
 		return
 	}
+	// Preflight failures happen before any transaction can affect inventory.
+	// They remain visible in operational logs and trigger a fresh evaluation,
+	// but creating a Telegram execution message for them is only noise.
+	if event.Kind == notificationport.LiveExecutionFailed &&
+		event.State == "aborted_retrying" {
+		return
+	}
+	if event.Kind == notificationport.LiveExecutionRecoveryStarted {
+		// A previous failure notification is no longer terminal once durable
+		// recovery owns the operation. Allow the eventual completed event to
+		// replace it with the reconstructed final result.
+		delete(n.terminal, event.Operation+"/execution")
+	}
 	if event.Kind == notificationport.LiveExecutionCompleted ||
 		event.Kind == notificationport.LiveExecutionFailed ||
 		event.Kind == notificationport.LiveExecutionRecoveryBlocked ||
@@ -163,6 +176,8 @@ type progressOperation struct {
 	started   time.Time
 	stage     execution.SequentialStageRequest
 	stageAt   time.Time
+	pending   []notificationport.LiveExecutionEvent
+	visible   bool
 }
 
 type ProgressObserver struct {
@@ -197,18 +212,11 @@ func (o *ProgressObserver) OperationStarted(
 	operation execution.SequentialOperation,
 	plan execution.SequentialPlan,
 ) {
-	direction := ""
-	if len(plan.Stages) == 4 {
-		direction = o.chainLabel(plan.Stages[0].SourceChain) + " -> " +
-			o.chainLabel(plan.Stages[2].SourceChain)
-	}
+	direction := o.planDirection(plan)
 	value := progressOperation{
 		direction: direction, initial: plan.InitialInput,
 		started: operation.StartedAt,
 	}
-	o.mu.Lock()
-	o.operations[operation.ID] = value
-	o.mu.Unlock()
 	event := notificationport.LiveExecutionEvent{
 		Kind:      notificationport.LiveExecutionStarted,
 		Operation: string(operation.ID), Direction: direction,
@@ -231,26 +239,61 @@ func (o *ProgressObserver) OperationStarted(
 		}
 	}
 	event.Trigger, event.TriggerURL = o.opportunityTrigger(opportunity, plan)
-	o.notifier.Notify(event)
+	// Keep the operation silent until the initial buy has a durable economic
+	// settlement. A rejected preflight or buy is not actionable and should not
+	// create a Telegram message that is immediately changed to ABORTED.
+	value.pending = append(value.pending, event)
+	o.mu.Lock()
+	o.operations[operation.ID] = value
+	o.mu.Unlock()
+}
+
+func (o *ProgressObserver) planDirection(
+	plan execution.SequentialPlan,
+) string {
+	var buyChain, sellChain market.ChainID
+	for _, stage := range plan.Stages {
+		switch stage.Stage {
+		case execution.StageBuy:
+			if buyChain == "" {
+				buyChain = stage.SourceChain
+			}
+		case execution.StageSell:
+			if sellChain == "" {
+				sellChain = stage.SourceChain
+			}
+		}
+	}
+	if buyChain == "" || sellChain == "" {
+		return ""
+	}
+	return o.chainLabel(buyChain) + " -> " + o.chainLabel(sellChain)
 }
 
 func (o *ProgressObserver) StageStarted(
 	request execution.SequentialStageRequest,
 ) {
 	now := o.clock().UTC()
-	o.mu.Lock()
-	value := o.operations[request.Operation]
-	value.stage, value.stageAt = request, now
-	o.operations[request.Operation] = value
-	o.mu.Unlock()
-	o.notifier.Notify(notificationport.LiveExecutionEvent{
+	event := notificationport.LiveExecutionEvent{
 		Kind:      notificationport.LiveExecutionStageStarted,
 		Operation: string(request.Operation),
 		Stage:     string(request.Stage.Stage), Ordinal: request.Stage.Ordinal,
 		TotalStages: 4, SourceChain: o.chainLabel(request.Stage.SourceChain),
 		DestinationChain: o.chainLabel(request.Stage.DestinationChain),
 		Input:            o.amount(request.Input), OccurredAt: now,
-	})
+	}
+	o.mu.Lock()
+	value := o.operations[request.Operation]
+	value.stage, value.stageAt = request, now
+	visible := value.visible
+	if !visible {
+		value.pending = append(value.pending, event)
+	}
+	o.operations[request.Operation] = value
+	o.mu.Unlock()
+	if visible {
+		o.notifier.Notify(event)
+	}
 }
 
 func (o *ProgressObserver) StageSettled(
@@ -287,7 +330,32 @@ func (o *ProgressObserver) StageSettled(
 			settlement.DestinationIdentity.Hash,
 		)
 	}
-	o.notifier.Notify(event)
+	o.mu.Lock()
+	value = o.operations[settlement.Request.Operation]
+	if !value.visible && settlement.Request.Stage.Stage == execution.StageBuy {
+		value.visible = true
+		pending := append(
+			[]notificationport.LiveExecutionEvent(nil),
+			value.pending...,
+		)
+		value.pending = nil
+		o.operations[settlement.Request.Operation] = value
+		o.mu.Unlock()
+		for _, buffered := range pending {
+			o.notifier.Notify(buffered)
+		}
+		o.notifier.Notify(event)
+		return
+	}
+	visible := value.visible
+	if !visible {
+		value.pending = append(value.pending, event)
+		o.operations[settlement.Request.Operation] = value
+	}
+	o.mu.Unlock()
+	if visible {
+		o.notifier.Notify(event)
+	}
 }
 
 func (o *ProgressObserver) ExitSelected(
@@ -377,21 +445,34 @@ func (o *ProgressObserver) OperationFinished(
 				value.initial, result.FinalAmount, result.Costs,
 			)
 		}
-		o.notifier.Notify(notificationport.LiveExecutionEvent{
+		event := notificationport.LiveExecutionEvent{
 			Kind:      notificationport.LiveExecutionCompleted,
 			Operation: string(operation.ID), State: string(state),
 			Direction: value.direction, Input: o.amount(value.initial),
 			Output:        o.amount(result.FinalAmount),
 			ExecutionCost: executionCost, NetPnL: netPnL, Duration: duration,
 			OccurredAt: now,
-		})
+		}
+		if result.QuoteDelta.Asset() != "" {
+			event.QuoteDelta = o.signedAssetAmount(result.QuoteDelta)
+		}
+		if result.BaseDelta.Asset() != "" {
+			event.BaseDelta = o.signedAssetAmount(result.BaseDelta)
+		}
+		if result.MarkedBase.Asset() != "" {
+			event.BaseValue = o.signedAssetAmount(result.MarkedBase)
+		}
+		for _, pending := range value.pending {
+			o.notifier.Notify(pending)
+		}
+		o.notifier.Notify(event)
 		return
 	}
 	detail := ""
 	if cause != nil {
 		detail = cause.Error()
 	}
-	o.notifier.Notify(notificationport.LiveExecutionEvent{
+	event := notificationport.LiveExecutionEvent{
 		Kind:      notificationport.LiveExecutionFailed,
 		Operation: string(operation.ID), State: string(state),
 		Stage:   string(value.stage.Stage.Stage),
@@ -399,7 +480,16 @@ func (o *ProgressObserver) OperationFinished(
 		SourceChain:      o.chainLabel(value.stage.Stage.SourceChain),
 		DestinationChain: o.chainLabel(value.stage.Stage.DestinationChain),
 		Detail:           detail, Duration: duration, OccurredAt: now,
-	})
+	}
+	if !value.visible &&
+		(state == execution.SequentialAborted ||
+			executionport.IsDefinitiveFailure(cause)) {
+		return
+	}
+	for _, pending := range value.pending {
+		o.notifier.Notify(pending)
+	}
+	o.notifier.Notify(event)
 }
 
 func (o *ProgressObserver) assetAmount(quantity market.AssetQuantity) string {

@@ -15,6 +15,7 @@ import (
 type confirmationTestWatcher struct {
 	balance  *big.Int
 	awaitErr error
+	evidence *acrossbridgecanary.DestinationEvidence
 }
 
 func (w *confirmationTestWatcher) Await(
@@ -24,8 +25,38 @@ func (w *confirmationTestWatcher) Await(
 	if w.awaitErr != nil {
 		return acrossbridgecanary.DestinationEvidence{}, w.awaitErr
 	}
+	if w.evidence != nil {
+		return *w.evidence, nil
+	}
 	<-ctx.Done()
 	return acrossbridgecanary.DestinationEvidence{}, ctx.Err()
+}
+
+func TestDestinationBalanceEventCannotConfirmWithoutAcrossFill(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	target := big.NewInt(1_000_000)
+	_, err := acrossbridgecanary.AwaitDestinationConfirmation(
+		ctx,
+		&bytes.Buffer{},
+		&confirmationTestWatcher{
+			balance: target,
+			evidence: &acrossbridgecanary.DestinationEvidence{
+				Balance: target,
+				Source:  "solana_account_websocket",
+			},
+		},
+		confirmationTestStatus{status: across.Status{
+			State: across.DepositPending,
+		}},
+		"source",
+		target,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v, want context deadline", err)
+	}
 }
 
 func (w *confirmationTestWatcher) Balance(context.Context) (*big.Int, error) {

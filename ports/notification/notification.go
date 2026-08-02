@@ -87,6 +87,9 @@ type LiveExecutionEvent struct {
 	ReturnValue       string
 	SafetyMargin      string
 	ExecutionCost     string
+	QuoteDelta        string
+	BaseDelta         string
+	BaseValue         string
 	NetPnL            string
 	SourceTransaction string
 	SourceURL         string
@@ -105,19 +108,26 @@ type LiveExecutionSender interface {
 type LiveRuntimeEventKind string
 
 const (
-	LiveRuntimeStarted LiveRuntimeEventKind = "started"
-	LiveRuntimeStopped LiveRuntimeEventKind = "stopped"
+	LiveRuntimeStarted             LiveRuntimeEventKind = "started"
+	LiveRuntimeStopped             LiveRuntimeEventKind = "stopped"
+	LiveRuntimeBalanceInsufficient LiveRuntimeEventKind = "balance_insufficient"
+	LiveRuntimeBalanceRecovered    LiveRuntimeEventKind = "balance_recovered"
+	LiveRuntimeValidationBlocked   LiveRuntimeEventKind = "validation_blocked"
 )
 
 // LiveRuntimeEvent reports only process lifecycle state. It deliberately
 // excludes setup identifiers, account addresses, endpoints, and credentials.
 type LiveRuntimeEvent struct {
-	Kind       LiveRuntimeEventKind
-	Mode       string
-	Reason     string
-	StartedAt  time.Time
-	OccurredAt time.Time
-	Uptime     time.Duration
+	Kind           LiveRuntimeEventKind
+	Mode           string
+	Reason         string
+	StartedAt      time.Time
+	OccurredAt     time.Time
+	Uptime         time.Duration
+	Chain          string
+	Token          string
+	AvailableUnits string
+	RequiredUnits  string
 }
 
 type LiveRuntimeSender interface {
