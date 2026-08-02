@@ -48,6 +48,38 @@ func TestMeteoraDLMMGoldenSegmentQuoteAndExactOutput(t *testing.T) {
 	}
 }
 
+func TestMeteoraDLMMQuoteTimeNeverPredatesSnapshot(t *testing.T) {
+	bin, err := dlmm.NewBin(0, big.NewInt(10_000), big.NewInt(10_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := dlmm.NewStateUpdate(0, 1, 0, []dlmm.Bin{bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, hash, err := (dlmm.Reducer{}).Reduce(context.Background(), nil, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testSnapshot(t, "pool", data, hash)
+	quoter, err := dlmm.NewQuoter("meteora", market.Market{ID: "pool", BaseToken: "x", QuoteToken: "y"}, "x", "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	amount, _ := market.NewTokenAmount("x", big.NewInt(1))
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{
+		Snapshot: snapshot, TokenIn: "x", TokenOut: "y", AmountIn: amount,
+		Purpose:  market.QuotePurposeResearchDiscovery,
+		QuotedAt: snapshot.Metadata().AppliedAt.Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quote.QuotedAt.Equal(snapshot.Metadata().AppliedAt) {
+		t.Fatalf("quote time = %s, want snapshot time %s", quote.QuotedAt, snapshot.Metadata().AppliedAt)
+	}
+}
+
 func TestMeteoraDLMMUsesBinPriceAndOneSidedLiquidity(t *testing.T) {
 	price := new(big.Int).Lsh(big.NewInt(2), 64)
 	bin, err := dlmm.NewBinWithPrice(0, big.NewInt(0), big.NewInt(2_000), price)
@@ -157,6 +189,110 @@ func TestMeteoraDLMMDynamicFeeRisesAcrossBins(t *testing.T) {
 	state := data.(dlmm.Snapshot)
 	if state.FeeRateForBin(0) <= state.FeeRateForBin(1) {
 		t.Fatalf("dynamic fee did not rise across bins: near=%d next=%d", state.FeeRateForBin(1), state.FeeRateForBin(0))
+	}
+}
+
+func TestMeteoraDLMMOfficialFeeAndQ64Parity(t *testing.T) {
+	// Synthetic fixture evaluated with Meteora's official dlmm-sdk quote
+	// algorithm: token Y is sold for X, price is exactly 0.05 in Q64.64,
+	// and the pool's canonical 0.03% base fee is collected on input.
+	price := new(big.Int).Quo(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(20))
+	bin, err := dlmm.NewBinWithPrice(0, big.NewInt(10_000_000_000), new(big.Int), price)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := dlmm.NewProtocolStateUpdate(0, 16, dlmm.StaticParameters{
+		BaseFactor: 1_875, FilterPeriod: 30, DecayPeriod: 600, ReductionFactor: 5_000,
+		VariableControl: 30_000, MaxVolatility: 350_000, ProtocolShare: 1_000,
+		FunctionType: 2, CollectFeeMode: 1,
+	}, dlmm.VariableParameters{IndexReference: 0, LastUpdateTimestamp: 1_767_225_600}, []dlmm.Bin{bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, hash, err := (dlmm.Reducer{}).Reduce(context.Background(), nil, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := testSnapshot(t, "pool", data, hash)
+	quoter, err := dlmm.NewQuoter("meteora", market.Market{ID: "pool", BaseToken: "x", QuoteToken: "y"}, "x", "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	amount, _ := market.NewTokenAmount("y", big.NewInt(304_166_666))
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{
+		Snapshot: snapshot, TokenIn: "y", TokenOut: "x", AmountIn: amount,
+		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := quote.AmountOut.Units(), big.NewInt(6_081_508_320); got.Cmp(want) != 0 {
+		t.Fatalf("official-parity output = %s, want %s", got, want)
+	}
+	fees := quote.Fees()
+	if len(fees) != 1 || fees[0].Amount().Token() != "y" || fees[0].Amount().Units().Cmp(big.NewInt(91_250)) != 0 {
+		t.Fatalf("official-parity fee = %+v, want 91250 token y", fees)
+	}
+}
+
+func TestMeteoraDLMMOnlyYChargesReverseFeeOnOutput(t *testing.T) {
+	price := new(big.Int).Quo(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(20))
+	bin, err := dlmm.NewBinWithPrice(0, new(big.Int), big.NewInt(1_000_000_000), price)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := dlmm.NewProtocolStateUpdate(0, 16, dlmm.StaticParameters{BaseFactor: 1_875, CollectFeeMode: 1}, dlmm.VariableParameters{}, []dlmm.Bin{bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, hash, err := (dlmm.Reducer{}).Reduce(context.Background(), nil, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoter, _ := dlmm.NewQuoter("meteora", market.Market{ID: "pool", BaseToken: "x", QuoteToken: "y"}, "x", "y")
+	amount, _ := market.NewTokenAmount("x", big.NewInt(6_000_000_000))
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: testSnapshot(t, "pool", data, hash), TokenIn: "x", TokenOut: "y", AmountIn: amount, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := quote.AmountOut.Units(), big.NewInt(299_909_999); got.Cmp(want) != 0 {
+		t.Fatalf("OnlyY output = %s, want %s", got, want)
+	}
+	if fee := quote.Fees()[0].Amount(); fee.Token() != "y" || fee.Units().Cmp(big.NewInt(90_000)) != 0 {
+		t.Fatalf("OnlyY fee = %s %s, want 90000 y", fee.Units(), fee.Token())
+	}
+	target, _ := market.NewTokenAmount("y", big.NewInt(299_909_999))
+	exact, err := quoter.QuoteExactOutput(context.Background(), quoteport.ExactOutputInput{Snapshot: testSnapshot(t, "pool", data, hash), TokenIn: "x", TokenOut: "y", AmountOut: target, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exact.AmountIn.Units(); got.Cmp(big.NewInt(5_999_999_981)) != 0 {
+		t.Fatalf("OnlyY exact-output input = %s, want 5999999981", got)
+	}
+}
+
+func TestMeteoraDLMMLimitOrderLiquidityIsQuoted(t *testing.T) {
+	scale := new(big.Int).Lsh(big.NewInt(1), 64)
+	bin, err := dlmm.NewBinWithProtocolLiquidity(0, new(big.Int), new(big.Int), scale, big.NewInt(1_000), big.NewInt(500), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := dlmm.NewProtocolStateUpdate(0, 10, dlmm.StaticParameters{FunctionType: 2}, dlmm.VariableParameters{}, []dlmm.Bin{bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, hash, err := (dlmm.Reducer{}).Reduce(context.Background(), nil, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoter, _ := dlmm.NewQuoter("meteora", market.Market{ID: "pool", BaseToken: "x", QuoteToken: "y"}, "x", "y")
+	amount, _ := market.NewTokenAmount("y", big.NewInt(1_200))
+	quote, err := quoter.Quote(context.Background(), quoteport.Input{Snapshot: testSnapshot(t, "pool", data, hash), TokenIn: "y", TokenOut: "x", AmountIn: amount, Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := quote.AmountOut.Units(); got.Cmp(big.NewInt(1_200)) != 0 {
+		t.Fatalf("limit-order output = %s, want 1200", got)
 	}
 }
 

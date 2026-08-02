@@ -215,6 +215,23 @@ func (n *ReadOnlyNetwork) FeeForMessage(
 	return *result.Value, nil
 }
 
+// LatestBlockhash is exposed for read-only transaction construction. The
+// resulting transaction is still never signed or broadcast by this package.
+func (n *ReadOnlyNetwork) LatestBlockhash(ctx context.Context) (string, error) {
+	var result struct {
+		Value struct {
+			Blockhash string `json:"blockhash"`
+		} `json:"value"`
+	}
+	if err := n.callHTTP(ctx, "getLatestBlockhash", []any{map[string]string{"commitment": "confirmed"}}, &result); err != nil {
+		return "", fmt.Errorf("read %s latest blockhash: %w", n.label, err)
+	}
+	if strings.TrimSpace(result.Value.Blockhash) == "" {
+		return "", fmt.Errorf("read %s latest blockhash: empty result", n.label)
+	}
+	return result.Value.Blockhash, nil
+}
+
 // SimulateSignedTransaction executes an exact signed transaction against the
 // node's current confirmed state without broadcasting it.
 func (n *ReadOnlyNetwork) SimulateSignedTransaction(
