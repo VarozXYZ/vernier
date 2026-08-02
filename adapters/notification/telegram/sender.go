@@ -111,21 +111,21 @@ func trackingWindowText(update notificationport.TrackingWindowUpdate) string {
 }
 
 func trackingWindowLines(update notificationport.TrackingWindowUpdate, history []notificationport.TrackingHistoryPoint) []string {
-	icon, state := "U0001f7e2", "OPEN"
+	icon, state := "\U0001f7e2", "OPEN"
 	switch strings.ToLower(strings.TrimSpace(update.State)) {
 	case "closed":
 		icon, state = "⚪", "CLOSED"
 	case "uncertain", "failed":
-		icon, state = "U0001f7e0", "UNCERTAIN"
+		icon, state = "\U0001f7e0", "UNCERTAIN"
 	}
 	lines := []string{
 		icon + " <b>" + state + " · " + escape(strings.ReplaceAll(update.Direction, "->", "→")) + "</b>",
-		"U0001f3af <b>" + escape(compactAmount(update.Input)) + "</b>",
-		"U0001f4b1 " + escape(compactAmount(update.BuyOutput)) + " → <b>" + escape(compactAmount(update.SellOutput)) + "</b>",
-		"U0001f4c8 Net <b>" + escape(signedAmount(update.NetPnL)) + "</b> · min " + escape(compactAmount(update.Threshold)),
+		"\U0001f3af <b>" + escape(compactAmount(update.Input)) + "</b>",
+		"\U0001f4b1 " + escape(compactAmount(update.BuyOutput)) + " → <b>" + escape(compactAmount(update.SellOutput)) + "</b>",
+		"\U0001f4c8 Net <b>" + escape(signedAmount(update.NetPnL)) + "</b> · min " + escape(compactAmount(update.Threshold)),
 		"Δ open " + escape(signedAmount(update.DeltaOpening)) + " · prev " + escape(signedAmount(update.DeltaPrevious)),
-		"U0001f4ca best " + escape(signedAmount(update.BestPnL)) + " · worst " + escape(signedAmount(update.WorstPnL)),
-		"U0001f9ee point " + fmt.Sprint(update.Points) + " · changes " + fmt.Sprint(update.Changes),
+		"\U0001f4ca best " + escape(signedAmount(update.BestPnL)) + " · worst " + escape(signedAmount(update.WorstPnL)),
+		"\U0001f9ee point " + fmt.Sprint(update.Points) + " · changes " + fmt.Sprint(update.Changes),
 		"⏱ observed " + compactDuration(update.ObservedDuration) + " · market " + compactDuration(update.EconomicDuration),
 		"⚡ calc " + compactDuration(update.CalculationDuration) + " · trigger→result " + compactDuration(update.TriggerToResult),
 		"   queue " + compactDuration(update.QueueDuration) + " · buy " + compactDuration(update.BuyDuration) + " · convert " + compactDuration(update.ConversionDuration),
@@ -133,10 +133,10 @@ func trackingWindowLines(update notificationport.TrackingWindowUpdate, history [
 		"Σ calc " + compactDuration(update.CumulativeCalculation) + " · queue " + compactDuration(update.CumulativeQueue),
 	}
 	if update.DiscoveryDuration > 0 {
-		lines = append(lines, "U0001f50e discovery "+compactDuration(update.DiscoveryDuration)+" · trigger→open "+compactDuration(update.TriggerToOpen))
+		lines = append(lines, "\U0001f50e discovery "+compactDuration(update.DiscoveryDuration)+" · trigger→open "+compactDuration(update.TriggerToOpen))
 	}
 	if update.SimulationStatus != "" {
-		line := "U0001f9ea sim " + escape(update.SimulationStatus) + " · buy " + escape(update.SimulationBuyStatus) + " · sell " + escape(update.SimulationSellStatus)
+		line := "\U0001f9ea sim " + escape(update.SimulationStatus) + " · buy " + escape(update.SimulationBuyStatus) + " · sell " + escape(update.SimulationSellStatus)
 		if update.SimulationFailure != "" {
 			line += " · " + escape(update.SimulationFailure)
 		}
@@ -152,12 +152,12 @@ func trackingWindowLines(update notificationport.TrackingWindowUpdate, history [
 		}
 	}
 	if update.Reason != "" && state != "OPEN" {
-		lines = append(lines, "", "U0001f9ed "+escape(update.Reason))
+		lines = append(lines, "", "\U0001f9ed "+escape(update.Reason))
 	}
 	if update.TriggerURL != "" {
-		lines = append(lines, "U0001f517 <a href=\""+escape(update.TriggerURL)+"\">Latest trigger</a>")
+		lines = append(lines, "\U0001f517 <a href=\""+escape(update.TriggerURL)+"\">Latest trigger</a>")
 	} else if update.Trigger != "" {
-		lines = append(lines, "U0001f517 "+escape(update.Trigger))
+		lines = append(lines, "\U0001f517 "+escape(update.Trigger))
 	}
 	return lines
 }
