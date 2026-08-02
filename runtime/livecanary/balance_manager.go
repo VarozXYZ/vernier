@@ -277,6 +277,9 @@ func (m *BalanceManager) planRequirements(plan execution.SequentialPlan) ([]inve
 		new(big.Int).Mul(discoveryBase.Units(), plan.InitialInput.Units()),
 		candidate.BuyQuote.AmountIn.Units(),
 	)
+	if len(plan.Stages) < 2 {
+		return nil, fmt.Errorf("balance admission plan is incomplete")
+	}
 	sell := plan.Stages[1]
 	converted, err := m.convertUnits(discoveryBase.Token(), sell.InputToken, expected)
 	if err != nil {
