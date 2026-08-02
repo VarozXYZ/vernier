@@ -18,3 +18,24 @@ type OpportunityStore interface {
 	ListWindows(context.Context, arbitrage.WindowQuery) ([]arbitrage.WindowRecord, error)
 	Close() error
 }
+
+// TrackingStore is an optional extension used by fixed-candidate Research.
+// The point pointer allows the durable adapter to record the actual end of
+// its own write and return that timestamp to reporting/notification code.
+type TrackingStore interface {
+	OpenTrackingWindow(context.Context, *arbitrage.TrackingWindow) error
+	RecordTrackingPoint(context.Context, *arbitrage.TrackingPoint) error
+	MarkTrackingNotificationEnqueued(context.Context, arbitrage.WindowID, uint64, time.Time) error
+	CloseTrackingWindow(context.Context, arbitrage.TrackingWindowClosing) error
+	SetTrackingMessage(context.Context, arbitrage.WindowID, int64) error
+	TrackingMessage(context.Context, arbitrage.WindowID) (int64, bool, error)
+	FinalizeDanglingTracking(context.Context, time.Time) ([]arbitrage.DanglingTrackingWindow, error)
+}
+
+// SimulationStore keeps the outcome of a read-only transaction simulation
+// separate from the economic classification. A rejected or unavailable
+// simulation is evidence about execution readiness, not a reason to erase a
+// locally qualified market window.
+type SimulationStore interface {
+	RecordSimulationRound(context.Context, *arbitrage.SimulationRound) error
+}

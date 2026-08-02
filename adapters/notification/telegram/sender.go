@@ -88,6 +88,80 @@ func (s *Sender) SendOpening(ctx context.Context, alert notificationport.Opportu
 	return err
 }
 
+func (s *Sender) SendTrackingWindow(ctx context.Context, update notificationport.TrackingWindowUpdate) (int64, error) {
+	return s.send(ctx, trackingWindowText(update))
+}
+
+func (s *Sender) EditTrackingWindow(ctx context.Context, messageID int64, update notificationport.TrackingWindowUpdate) error {
+	if messageID <= 0 {
+		return fmt.Errorf("telegram tracking message ID is required")
+	}
+	return s.edit(ctx, messageID, trackingWindowText(update))
+}
+
+func trackingWindowText(update notificationport.TrackingWindowUpdate) string {
+	history := append([]notificationport.TrackingHistoryPoint(nil), update.History...)
+	for {
+		text := strings.Join(trackingWindowLines(update, history), "\n")
+		if len([]rune(text)) <= 4000 || len(history) == 0 {
+			return text
+		}
+		history = history[1:]
+	}
+}
+
+func trackingWindowLines(update notificationport.TrackingWindowUpdate, history []notificationport.TrackingHistoryPoint) []string {
+	icon, state := "U0001f7e2", "OPEN"
+	switch strings.ToLower(strings.TrimSpace(update.State)) {
+	case "closed":
+		icon, state = "⚪", "CLOSED"
+	case "uncertain", "failed":
+		icon, state = "U0001f7e0", "UNCERTAIN"
+	}
+	lines := []string{
+		icon + " <b>" + state + " · " + escape(strings.ReplaceAll(update.Direction, "->", "→")) + "</b>",
+		"U0001f3af <b>" + escape(compactAmount(update.Input)) + "</b>",
+		"U0001f4b1 " + escape(compactAmount(update.BuyOutput)) + " → <b>" + escape(compactAmount(update.SellOutput)) + "</b>",
+		"U0001f4c8 Net <b>" + escape(signedAmount(update.NetPnL)) + "</b> · min " + escape(compactAmount(update.Threshold)),
+		"Δ open " + escape(signedAmount(update.DeltaOpening)) + " · prev " + escape(signedAmount(update.DeltaPrevious)),
+		"U0001f4ca best " + escape(signedAmount(update.BestPnL)) + " · worst " + escape(signedAmount(update.WorstPnL)),
+		"U0001f9ee point " + fmt.Sprint(update.Points) + " · changes " + fmt.Sprint(update.Changes),
+		"⏱ observed " + compactDuration(update.ObservedDuration) + " · market " + compactDuration(update.EconomicDuration),
+		"⚡ calc " + compactDuration(update.CalculationDuration) + " · trigger→result " + compactDuration(update.TriggerToResult),
+		"   queue " + compactDuration(update.QueueDuration) + " · buy " + compactDuration(update.BuyDuration) + " · convert " + compactDuration(update.ConversionDuration),
+		"   sell " + compactDuration(update.SellDuration) + " · pnl " + compactDuration(update.PnLDuration) + " · persist " + compactDuration(update.PersistenceDuration),
+		"Σ calc " + compactDuration(update.CumulativeCalculation) + " · queue " + compactDuration(update.CumulativeQueue),
+	}
+	if update.DiscoveryDuration > 0 {
+		lines = append(lines, "U0001f50e discovery "+compactDuration(update.DiscoveryDuration)+" · trigger→open "+compactDuration(update.TriggerToOpen))
+	}
+	if update.SimulationStatus != "" {
+		line := "U0001f9ea sim " + escape(update.SimulationStatus) + " · buy " + escape(update.SimulationBuyStatus) + " · sell " + escape(update.SimulationSellStatus)
+		if update.SimulationFailure != "" {
+			line += " · " + escape(update.SimulationFailure)
+		}
+		lines = append(lines, line)
+		if update.SimulationError != "" {
+			lines = append(lines, "   "+escape(update.SimulationError))
+		}
+	}
+	if len(history) > 0 {
+		lines = append(lines, "", "<b>POINTS</b>")
+		for _, point := range history {
+			lines = append(lines, "+"+compactDuration(point.SinceOpening)+" · out "+escape(compactAmount(point.SellOutput))+" · net "+escape(signedAmount(point.NetPnL))+" · Δ "+escape(signedAmount(point.Delta))+" · calc "+compactDuration(point.Calculation)+" · total "+compactDuration(point.Total))
+		}
+	}
+	if update.Reason != "" && state != "OPEN" {
+		lines = append(lines, "", "U0001f9ed "+escape(update.Reason))
+	}
+	if update.TriggerURL != "" {
+		lines = append(lines, "U0001f517 <a href=\""+escape(update.TriggerURL)+"\">Latest trigger</a>")
+	} else if update.Trigger != "" {
+		lines = append(lines, "U0001f517 "+escape(update.Trigger))
+	}
+	return lines
+}
+
 func (s *Sender) SendConfigurationWarning(ctx context.Context, warning notificationport.ConfigurationWarning) error {
 	router := warning.Details["router"]
 	if router == "" {
@@ -589,7 +663,18 @@ type telegramResponse struct {
 	Result struct {
 		MessageID int64 `json:"message_id"`
 	} `json:"result"`
+	Parameters struct {
+		RetryAfter int `json:"retry_after"`
+	} `json:"parameters"`
 }
+
+type retryAfterError struct {
+	after time.Duration
+	text  string
+}
+
+func (e retryAfterError) Error() string             { return e.text }
+func (e retryAfterError) RetryAfter() time.Duration { return e.after }
 
 func (s *Sender) send(ctx context.Context, text string) (int64, error) {
 	payload := struct {
@@ -670,6 +755,11 @@ func (s *Sender) post(
 		if operation == "editMessageText" &&
 			strings.Contains(strings.ToLower(string(responseBody)), "message is not modified") {
 			return telegramResponse{OK: true}, nil
+		}
+		var decoded telegramResponse
+		_ = json.Unmarshal(responseBody, &decoded)
+		if response.StatusCode == http.StatusTooManyRequests && decoded.Parameters.RetryAfter > 0 {
+			return telegramResponse{}, retryAfterError{after: time.Duration(decoded.Parameters.RetryAfter) * time.Second, text: fmt.Sprintf("telegram %s rate limited; retry after %s", operation, time.Duration(decoded.Parameters.RetryAfter)*time.Second)}
 		}
 		return telegramResponse{}, fmt.Errorf(
 			"telegram %s failed with HTTP %d: %s",

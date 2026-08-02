@@ -16,6 +16,9 @@ import (
 )
 
 func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) error {
+	if r.config.TrackingMode == "fixed_candidate" {
+		return r.runFixedCandidateRouteStream(ctx, options)
+	}
 	if r.hasEventRefreshedMarket() {
 		return r.runEventRefreshedStream(ctx, options)
 	}

@@ -93,6 +93,9 @@ type Runner struct {
 	alertFailures          atomic.Uint64
 	warningMu              sync.Mutex
 	deliveredWarnings      map[string]struct{}
+	simulationMu           sync.RWMutex
+	simulationSnapshots    map[string]market.MarketSnapshot
+	simulationSnapshotKeys []string
 }
 
 type CostEvidence struct {
@@ -199,8 +202,10 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		referenceSources: options.ReferenceSources, referenceQuoteOverride: options.ReferenceQuoteOverride,
 		clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger,
 		openingAlerts: options.OpeningAlerts, configurationAlerts: options.ConfigurationAlerts,
-		directionalCosts:  options.DirectionalCosts,
-		deliveredWarnings: make(map[string]struct{}),
+		directionalCosts:       options.DirectionalCosts,
+		deliveredWarnings:      make(map[string]struct{}),
+		simulationSnapshots:    make(map[string]market.MarketSnapshot),
+		simulationSnapshotKeys: make([]string, 0, maxSimulationSnapshots),
 	}, nil
 }
 
@@ -327,6 +332,14 @@ func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.Arbitrag
 	if err != nil {
 		return nil, err
 	}
+	thresholdFixedValue := r.config.ProfitThresholdFixed
+	if thresholdFixedValue == nil {
+		thresholdFixedValue = new(big.Rat)
+	}
+	thresholdFixed, err := market.NewAssetQuantity(r.config.Markets[0].Quote.Token.Asset, thresholdFixedValue)
+	if err != nil {
+		return nil, err
+	}
 	if r.config.EvaluationMode == "best_buy_opposite_sell" {
 		return strategy.NewBestBuyOppositeSell(strategy.BestBuyOppositeSellConfig{
 			ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
@@ -354,6 +367,7 @@ func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.Arbitrag
 	return strategy.NewTwoMarket(strategy.TwoMarketConfig{
 		ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
 		Sources: sources, Grid: grid, Threshold: threshold, Clock: r.clock, SizingAsset: strategy.SizingAsset(r.config.SizingAsset),
+		ThresholdFixed: thresholdFixed, ThresholdBPS: r.config.ProfitThresholdBPS,
 		DirectionDiscoverySamples: discoverySamples,
 	})
 }
@@ -567,14 +581,15 @@ func (r *Runner) composeMarket(configured configuration.ResolvedMarket, registry
 				return reference.QuoteExactOutput(ctx, network, block, addresses[tokenIn], addresses[tokenOut], amount)
 			},
 		}, nil
-	case "uniswap_v3":
+	case "uniswap_v3", "pancakeswap_v3":
 		maxBase, initialQuote, baseToQuoteZero, err := v3Inputs(configured, maximum)
 		if err != nil {
 			return marketRuntime{}, err
 		}
 		adapter, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{
 			Pool: configured.Venue.Pool, MaxTickWords: configured.Venue.MaxTickWords,
-			Probes: []uniswapv3.CoverageProbe{{ZeroForOne: baseToQuoteZero, AmountIn: maxBase}, {ZeroForOne: !baseToQuoteZero, AmountIn: initialQuote}},
+			Probes:       []uniswapv3.CoverageProbe{{ZeroForOne: baseToQuoteZero, AmountIn: maxBase}, {ZeroForOne: !baseToQuoteZero, AmountIn: initialQuote}},
+			EventProfile: v3EventProfile(configured.Venue.Kind),
 		})
 		if err != nil {
 			return marketRuntime{}, err
@@ -756,7 +771,7 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 
 func adapterIDFor(kind string) string {
 	switch kind {
-	case "uniswap_v3":
+	case "uniswap_v3", "pancakeswap_v3":
 		return uniswapv3.ID
 	case "aerodrome_slipstream":
 		return aerodromeslipstream.ID
@@ -769,6 +784,13 @@ func adapterIDFor(kind string) string {
 	default:
 		return uniswapv2.ID
 	}
+}
+
+func v3EventProfile(kind string) uniswapv3.EventProfile {
+	if kind == "pancakeswap_v3" {
+		return uniswapv3.EventProfilePancakeSwapV3
+	}
+	return uniswapv3.EventProfileUniswapV3
 }
 
 func (r *Runner) cost(ctx context.Context, blocks map[string]evm.BlockReference, at time.Time) (CostEvidence, arbitrage.CostSnapshot, error) {

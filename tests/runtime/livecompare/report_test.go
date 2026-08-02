@@ -23,7 +23,13 @@ func TestSummaryOutputOmitsRunMetadataAndCalculationCurve(t *testing.T) {
 		RunID: "private-run", ConfigHash: "private-config", Status: runtimeresearch.StatusHealthy, Evaluations: 4,
 		LocalTiming: strategy.EvaluationTiming{Discovery: &strategy.DirectionDiscoveryTiming{
 			Samples: 3, Duration: 2 * time.Millisecond, Decision: "majority",
-			Selected: marketDirection("market-a", "market-b"), Probes: []strategy.DirectionProbeTiming{{Size: probeSize, Winner: "market-a", Duration: time.Millisecond}},
+			Selected: marketDirection("market-a", "market-b"), Probes: []strategy.DirectionProbeTiming{{
+				Size: probeSize, Winner: "market-a", Duration: time.Millisecond,
+				Outputs: []strategy.DirectionProbeOutput{
+					{Market: "market-a", Output: mustAssetQuantity(t, "base", "12"), Duration: 700 * time.Microsecond},
+					{Market: "market-b", Output: mustAssetQuantity(t, "base", "11"), Duration: 300 * time.Microsecond, Cached: true},
+				},
+			}},
 		}},
 	}}
 	var text bytes.Buffer
@@ -40,6 +46,15 @@ func TestSummaryOutputOmitsRunMetadataAndCalculationCurve(t *testing.T) {
 	}
 	if !strings.Contains(text.String(), "Discovery    2.00 ms (3 samples, majority)") {
 		t.Fatalf("summary output omitted direction discovery: %s", text.String())
+	}
+	for _, expected := range []string{
+		"Probe 1      10 QUOTE · total 1.00 ms",
+		"market-a  12 BASE · 700.00 us · fresh",
+		"market-b  11 BASE · 300.00 us · cached",
+	} {
+		if !strings.Contains(text.String(), expected) {
+			t.Fatalf("summary output omitted probe timing %q: %s", expected, text.String())
+		}
 	}
 
 	var jsonl bytes.Buffer
@@ -354,6 +369,15 @@ func mustTokenAmount(t *testing.T, token market.TokenID, value string) market.To
 		t.Fatal("invalid test amount")
 	}
 	amount, err := market.NewTokenAmount(token, units)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return amount
+}
+
+func mustAssetQuantity(t *testing.T, asset market.AssetID, value string) market.AssetQuantity {
+	t.Helper()
+	amount, err := market.ParseAssetQuantity(asset, value)
 	if err != nil {
 		t.Fatal(err)
 	}

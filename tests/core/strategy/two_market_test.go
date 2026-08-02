@@ -72,6 +72,67 @@ func TestTwoMarketCarriesStreamTriggerIntoOpportunities(t *testing.T) {
 	}
 }
 
+func TestTwoMarketCombinesFixedAndInputPercentageThresholdAndPinsTracking(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
+	registry := strategyRegistry(t)
+	setup, err := arbitrage.NewArbitrageSetup("setup", "pair", []market.MarketID{"market-a", "market-b"}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid, err := sizing.NewGrid([]market.AssetQuantity{quantity(t, "100"), quantity(t, "1000")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marketA, _ := registry.Market("market-a")
+	marketB, _ := registry.Market("market-b")
+	snapshots := []market.MarketSnapshot{
+		strategySnapshot(t, marketA.ID, "1000000000000", "1800000000000", now),
+		strategySnapshot(t, marketB.ID, "100000000000000", "2200000000000", now),
+	}
+	quoterA, _ := constantproduct.NewQuoter("local-a", marketA)
+	quoterB, _ := constantproduct.NewQuoter("local-b", marketB)
+	candidate, err := strategy.NewTwoMarket(strategy.TwoMarketConfig{
+		ID: "strategy", Setup: setup, Registry: registry,
+		Sources: map[market.MarketID]quoteport.Source{"market-a": quoterA, "market-b": quoterB},
+		Grid:    grid, Threshold: quantity(t, "0"), ThresholdFixed: quantity(t, "0.3"), ThresholdBPS: 5,
+		Clock: func() time.Time { return now }, SizingAsset: strategy.SizingAssetQuote,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost := arbitrage.CostSnapshot{ID: "fixed", Amount: quantity(t, "0.5"), CapturedAt: now}
+	evaluation, err := arbitrage.NewEvaluation("evaluation", "run", "strategy", "hash", snapshots, cost, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opportunities, err := candidate.Evaluate(context.Background(), evaluation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thresholds := map[string]string{}
+	for _, sized := range opportunities[0].Candidates {
+		thresholds[sized.Input.String()] = sized.EffectiveThreshold.String()
+	}
+	if thresholds["100"] != "3/10" || thresholds["1000"] != "1/2" {
+		t.Fatalf("unexpected effective thresholds: %v", thresholds)
+	}
+
+	direction := arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"}
+	pinned, timing, err := candidate.EvaluatePinnedWithTiming(context.Background(), evaluation, direction, quantity(t, "100"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned.Direction != direction || len(pinned.Candidates) != 1 || pinned.Candidates[0].Input.String() != "100" {
+		t.Fatalf("pinned evaluation resized or changed direction: %+v", pinned)
+	}
+	if len(timing.Direction.Quotes) != 2 || timing.Direction.Quotes[0].Leg != "buy" || timing.Direction.Quotes[1].Leg != "sell" {
+		t.Fatalf("unexpected pinned timing: %+v", timing)
+	}
+	if timing.EvaluationStartedAt.IsZero() || timing.EvaluationFinishedAt.IsZero() || timing.BuyStartedAt.IsZero() || timing.SellFinishedAt.IsZero() {
+		t.Fatalf("pinned stage boundaries are incomplete: %+v", timing)
+	}
+}
+
 func TestTwoMarketSeparatesEconomicClassifications(t *testing.T) {
 	tests := []struct {
 		name      string

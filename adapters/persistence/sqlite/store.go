@@ -4,10 +4,13 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +22,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 8
 
 type Store struct {
 	db   *sql.DB
@@ -69,6 +72,403 @@ func (s *Store) configure() error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) OpenTrackingWindow(ctx context.Context, window *arbitrage.TrackingWindow) error {
+	if window == nil {
+		return fmt.Errorf("tracking window is required")
+	}
+	if window.ID == "" || window.Run == "" || window.Strategy == "" || window.ConfigHash == "" ||
+		window.Direction.BuyMarket == "" || window.Direction.SellMarket == "" || window.OpenedAt.IsZero() {
+		return fmt.Errorf("tracking window is incomplete")
+	}
+	if err := window.OpeningTrigger.Validate(); err != nil {
+		return err
+	}
+	buyToken := string(window.Opening.BuyQuote.AmountOut.Token())
+	buyUnits := "0"
+	if window.Opening.BuyQuote.AmountOut.Token() != "" {
+		buyUnits = window.Opening.BuyQuote.AmountOut.Units().String()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO opportunity_tracking_windows (
+		window_id, run_id, strategy_id, config_hash, buy_market, sell_market,
+		input_asset, input_value, fixed_threshold_value, percentage_threshold_value,
+		effective_threshold_value, cost_value, opening_trigger, opened_at,
+		discovery_started_at, discovery_finished_at, opening_persisted_at,
+		opening_buy_token, opening_buy_units, opening_buy_asset, opening_buy_value, opening_sell_value, opening_net_value,
+		opening_snapshots, discovery_trace
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		string(window.ID), string(window.Run), string(window.Strategy), window.ConfigHash,
+		string(window.Direction.BuyMarket), string(window.Direction.SellMarket),
+		string(window.Input.Asset()), window.Input.String(), window.FixedThreshold.String(),
+		window.PercentageThreshold.String(), window.EffectiveThreshold.String(), window.Cost.String(),
+		trackingTrigger(window.OpeningTrigger), formatTime(window.OpenedAt),
+		formatTime(window.DiscoveryStartedAt), formatTime(window.DiscoveryFinishedAt),
+		formatOptionalTime(window.OpeningPersistedAt), buyToken, buyUnits, string(window.OpeningBuyOutput.Asset()), window.OpeningBuyOutput.String(), window.Opening.Output.String(),
+		window.Opening.NetPnL.String(), trackingSnapshots(window.OpeningSnapshots), trackingDiscoveryTrace(window.DiscoveryTrace),
+	)
+	if err != nil {
+		return fmt.Errorf("open tracking window: %w", err)
+	}
+	window.OpeningPersistedAt = time.Now().UTC()
+	if _, err := s.db.ExecContext(ctx, `UPDATE opportunity_tracking_windows SET opening_persisted_at = ? WHERE window_id = ?`, formatTime(window.OpeningPersistedAt), string(window.ID)); err != nil {
+		return fmt.Errorf("record tracking window persistence timing: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RecordTrackingPoint(ctx context.Context, point *arbitrage.TrackingPoint) error {
+	if point == nil {
+		return fmt.Errorf("tracking point is required")
+	}
+	if err := point.Validate(); err != nil {
+		return err
+	}
+	durations := point.Timestamps.Durations()
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO opportunity_tracking_points (
+		point_id, window_id, sequence, evaluation_id, trigger,
+		trigger_received_at, snapshot_captured_at, queued_at, evaluation_started_at,
+		buy_started_at, buy_finished_at, conversion_started_at, conversion_finished_at,
+		sell_started_at, sell_finished_at, pnl_started_at, pnl_finished_at,
+		persistence_started_at, persistence_finished_at, notification_enqueued_at,
+		evaluation_finished_at, snapshots, input_value, buy_output_asset, buy_output_value,
+		sell_output_value, gross_pnl_value, net_pnl_value, fixed_threshold_value,
+		percentage_threshold_value, effective_threshold_value, delta_opening_value,
+		delta_previous_value, classification, reason, economic_change,
+		snapshot_capture_nanos, queue_nanos, buy_quote_nanos, conversion_nanos,
+		sell_quote_nanos, pnl_nanos, local_calculation_nanos, persistence_nanos,
+		event_to_evaluation_nanos, event_to_persisted_nanos, notification_enqueue_nanos,
+		interval_previous_nanos, since_opening_nanos
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		point.ID, string(point.WindowID), point.Sequence, string(point.Evaluation), trackingTrigger(point.Trigger),
+		formatTime(point.Timestamps.TriggerReceivedAt), formatTime(point.Timestamps.SnapshotCapturedAt),
+		formatTime(point.Timestamps.QueuedAt), formatTime(point.Timestamps.EvaluationStartedAt),
+		formatOptionalTime(point.Timestamps.BuyStartedAt), formatOptionalTime(point.Timestamps.BuyFinishedAt),
+		formatOptionalTime(point.Timestamps.ConversionStartedAt), formatOptionalTime(point.Timestamps.ConversionFinishedAt),
+		formatOptionalTime(point.Timestamps.SellStartedAt), formatOptionalTime(point.Timestamps.SellFinishedAt),
+		formatOptionalTime(point.Timestamps.PnLStartedAt), formatOptionalTime(point.Timestamps.PnLFinishedAt),
+		formatTime(point.Timestamps.PersistenceStartedAt), formatOptionalTime(point.Timestamps.PersistenceFinishedAt),
+		formatOptionalTime(point.Timestamps.NotificationEnqueuedAt), formatOptionalTime(point.Timestamps.EvaluationFinishedAt),
+		trackingSnapshots(point.Snapshots), point.Input.String(), string(point.BuyOutput.Asset()), point.BuyOutput.String(),
+		point.SellOutput.String(), point.GrossPnL.String(), point.NetPnL.String(), point.FixedThreshold.String(),
+		point.PercentageThreshold.String(), point.EffectiveThreshold.String(), point.DeltaFromOpening.String(),
+		point.DeltaFromPrevious.String(), string(point.Classification), point.Reason, boolInt(point.EconomicChange),
+		durations.SnapshotCapture.Nanoseconds(), durations.Queue.Nanoseconds(), durations.BuyQuote.Nanoseconds(),
+		durations.DecimalConversion.Nanoseconds(), durations.SellQuote.Nanoseconds(), durations.PnLCalculation.Nanoseconds(),
+		durations.LocalCalculation.Nanoseconds(), durations.Persistence.Nanoseconds(), durations.EventToEvaluation.Nanoseconds(),
+		durations.EventToPersistedPoint.Nanoseconds(), durations.NotificationEnqueue.Nanoseconds(),
+		point.IntervalFromPrevious.Nanoseconds(), point.SinceOpening.Nanoseconds(),
+	)
+	if err != nil {
+		return fmt.Errorf("record tracking point: %w", err)
+	}
+	point.Timestamps.PersistenceFinishedAt = time.Now().UTC()
+	durations = point.Timestamps.Durations()
+	if _, err := s.db.ExecContext(ctx, `UPDATE opportunity_tracking_points SET
+		persistence_finished_at = ?, persistence_nanos = ?, event_to_persisted_nanos = ?
+		WHERE point_id = ?`, formatTime(point.Timestamps.PersistenceFinishedAt),
+		durations.Persistence.Nanoseconds(), durations.EventToPersistedPoint.Nanoseconds(), point.ID); err != nil {
+		return fmt.Errorf("record tracking point persistence timing: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MarkTrackingNotificationEnqueued(ctx context.Context, windowID arbitrage.WindowID, sequence uint64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE opportunity_tracking_points
+		SET notification_enqueued_at = ?, evaluation_finished_at = ?,
+		event_to_evaluation_nanos = CASE
+			WHEN trigger_received_at = '' THEN 0
+			ELSE MAX(0, CAST((julianday(?) - julianday(trigger_received_at)) * 86400000000000 AS INTEGER))
+		END,
+		notification_enqueue_nanos = CASE
+			WHEN persistence_finished_at = '' THEN 0
+			ELSE MAX(0, CAST((julianday(?) - julianday(persistence_finished_at)) * 86400000000000 AS INTEGER))
+		END WHERE window_id = ? AND sequence = ?`,
+		formatTime(at), formatTime(at), formatTime(at), formatTime(at), string(windowID), sequence)
+	if err != nil {
+		return fmt.Errorf("mark tracking notification enqueued: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RecordSimulationRound(ctx context.Context, round *arbitrage.SimulationRound) error {
+	if round == nil {
+		return fmt.Errorf("simulation round is required")
+	}
+	if err := round.Validate(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin simulation round: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO simulation_rounds (
+		round_id, window_id, point_sequence, requested_at, started_at, finished_at,
+		status, failure_class, error, local_qualified, local_net_asset,
+		local_net_value, local_threshold_asset, local_threshold_value,
+		simulated_net_asset, simulated_net_value
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		round.ID, string(round.WindowID), round.PointSequence, formatTime(round.RequestedAt),
+		formatTime(round.StartedAt), formatOptionalTime(round.FinishedAt), string(round.Status),
+		string(round.FailureClass), round.Error, boolInt(round.LocalQualified),
+		string(round.LocalNetPnL.Asset()), round.LocalNetPnL.String(),
+		string(round.LocalThreshold.Asset()), round.LocalThreshold.String(),
+		string(round.SimulatedNetPnL.Asset()), round.SimulatedNetPnL.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("record simulation round: %w", err)
+	}
+	for legName, leg := range map[string]arbitrage.SimulationLeg{"buy": round.Buy, "sell": round.Sell} {
+		_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO simulation_legs (
+			round_id, leg, chain, market, input_token, input_units, local_output_token,
+			local_output_units, simulated_output_token, simulated_output_units,
+			status, failure_class, error, snapshot_version, snapshot_hash, context,
+			context_position, gas_or_compute_units, started_at, finished_at, duration_nanos
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			round.ID, legName, leg.Chain, string(leg.Market), string(leg.Input.Token()), leg.Input.Units().String(),
+			string(leg.LocalOutput.Token()), leg.LocalOutput.Units().String(),
+			string(leg.SimulatedOutput.Token()), leg.SimulatedOutput.Units().String(),
+			string(leg.Status), string(leg.FailureClass), leg.Error, leg.SnapshotVersion,
+			hex.EncodeToString(leg.SnapshotHash[:]), leg.Context, leg.ContextPosition,
+			leg.GasOrComputeUnits, formatOptionalTime(leg.StartedAt), formatOptionalTime(leg.FinishedAt),
+			leg.Duration().Nanoseconds(),
+		)
+		if err != nil {
+			return fmt.Errorf("record simulation %s leg: %w", legName, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit simulation round: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CloseTrackingWindow(ctx context.Context, closing arbitrage.TrackingWindowClosing) error {
+	if closing.WindowID == "" || closing.ClosedAt.IsZero() || closing.Reason == "" {
+		return fmt.Errorf("tracking window closing is incomplete")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE opportunity_tracking_windows SET
+		status = ?, close_reason = ?, closed_at = ?, economic_duration_nanos = ?,
+		observed_duration_nanos = ?, cumulative_calculation_nanos = ?,
+		cumulative_queue_nanos = ?, maximum_queue_nanos = ?, events = ?,
+		economic_changes = ?, initial_pnl_value = ?, final_pnl_value = ?,
+		best_pnl_value = ?, worst_pnl_value = ?, latency_min_nanos = ?, latency_mean_nanos = ?,
+		latency_p50_nanos = ?, latency_p95_nanos = ?, latency_p99_nanos = ?, latency_max_nanos = ?
+		WHERE window_id = ? AND status = 'open'`,
+		string(closing.Status), closing.Reason, formatTime(closing.ClosedAt), closing.EconomicDuration.Nanoseconds(),
+		closing.ObservedDuration.Nanoseconds(), closing.CumulativeCalculation.Nanoseconds(),
+		closing.CumulativeQueue.Nanoseconds(), closing.MaximumQueue.Nanoseconds(), closing.Events,
+		closing.EconomicChanges, closing.InitialPnL.String(), closing.FinalPnL.String(), closing.BestPnL.String(),
+		closing.WorstPnL.String(), closing.LatencyMinimum.Nanoseconds(), closing.LatencyMean.Nanoseconds(),
+		closing.LatencyP50.Nanoseconds(), closing.LatencyP95.Nanoseconds(), closing.LatencyP99.Nanoseconds(),
+		closing.LatencyMaximum.Nanoseconds(), string(closing.WindowID),
+	)
+	if err != nil {
+		return fmt.Errorf("close tracking window: %w", err)
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 0 {
+		return fmt.Errorf("tracking window %q is not open", closing.WindowID)
+	}
+	return nil
+}
+
+func (s *Store) SetTrackingMessage(ctx context.Context, windowID arbitrage.WindowID, messageID int64) error {
+	if windowID == "" || messageID <= 0 {
+		return fmt.Errorf("tracking message identity is invalid")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE opportunity_tracking_windows SET telegram_message_id = ? WHERE window_id = ?`, messageID, string(windowID))
+	return err
+}
+
+func (s *Store) TrackingMessage(ctx context.Context, windowID arbitrage.WindowID) (int64, bool, error) {
+	var messageID int64
+	err := s.db.QueryRowContext(ctx, `SELECT telegram_message_id FROM opportunity_tracking_windows WHERE window_id = ?`, string(windowID)).Scan(&messageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return messageID, messageID > 0, nil
+}
+
+func (s *Store) FinalizeDanglingTracking(ctx context.Context, at time.Time) ([]arbitrage.DanglingTrackingWindow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT window_id, telegram_message_id, buy_market, sell_market,
+		input_asset, input_value, opening_buy_asset, opening_buy_value, opening_sell_value,
+		opening_net_value, effective_threshold_value, opened_at, discovery_started_at, discovery_finished_at
+		FROM opportunity_tracking_windows WHERE status = 'open' ORDER BY opened_at`)
+	if err != nil {
+		return nil, fmt.Errorf("list dangling tracking windows: %w", err)
+	}
+	type rawWindow struct {
+		id, buy, sell, inputAsset, inputValue, buyAsset, buyValue string
+		sellValue, netValue, thresholdValue, openedAt             string
+		discoveryStartedAt, discoveryFinishedAt                   string
+		messageID                                                 int64
+	}
+	var pending []rawWindow
+	for rows.Next() {
+		var item rawWindow
+		if err := rows.Scan(&item.id, &item.messageID, &item.buy, &item.sell, &item.inputAsset, &item.inputValue,
+			&item.buyAsset, &item.buyValue, &item.sellValue, &item.netValue, &item.thresholdValue, &item.openedAt,
+			&item.discoveryStartedAt, &item.discoveryFinishedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	result := make([]arbitrage.DanglingTrackingWindow, 0, len(pending))
+	for _, item := range pending {
+		if item.buyAsset == "" {
+			item.buyAsset = "base_unknown"
+		}
+		input, err := market.ParseAssetQuantity(market.AssetID(item.inputAsset), item.inputValue)
+		if err != nil {
+			return nil, err
+		}
+		buyOutput, err := market.ParseAssetQuantity(market.AssetID(item.buyAsset), item.buyValue)
+		if err != nil {
+			return nil, err
+		}
+		sellOutput, err := market.ParseAssetQuantity(market.AssetID(item.inputAsset), item.sellValue)
+		if err != nil {
+			return nil, err
+		}
+		netPnL, err := market.ParseAssetQuantity(market.AssetID(item.inputAsset), item.netValue)
+		if err != nil {
+			return nil, err
+		}
+		threshold, err := market.ParseAssetQuantity(market.AssetID(item.inputAsset), item.thresholdValue)
+		if err != nil {
+			return nil, err
+		}
+		openedAt, err := parseTime(item.openedAt)
+		if err != nil {
+			return nil, err
+		}
+		best, worst := netPnL, netPnL
+		lastTrigger, points, changes := openedAt, uint64(1), uint64(0)
+		discoveryStartedAt, err := parseTime(item.discoveryStartedAt)
+		if err != nil {
+			return nil, err
+		}
+		discoveryFinishedAt, err := parseTime(item.discoveryFinishedAt)
+		if err != nil {
+			return nil, err
+		}
+		cumulativeCalculation := nonNegativeNanos(discoveryFinishedAt.Sub(discoveryStartedAt))
+		var cumulativeQueue, maximumQueue int64
+		var latencies []int64
+		pointRows, err := s.db.QueryContext(ctx, `SELECT sequence, trigger_received_at, buy_output_asset,
+			buy_output_value, sell_output_value, net_pnl_value, economic_change,
+			local_calculation_nanos, queue_nanos, event_to_evaluation_nanos
+			FROM opportunity_tracking_points WHERE window_id = ? ORDER BY sequence`, item.id)
+		if err != nil {
+			return nil, err
+		}
+		for pointRows.Next() {
+			var sequence uint64
+			var triggerAt, pointBuyAsset, pointBuyValue, pointSellValue, pointNetValue string
+			var changed int
+			var calculationNanos, queueNanos, latencyNanos int64
+			if err := pointRows.Scan(&sequence, &triggerAt, &pointBuyAsset, &pointBuyValue, &pointSellValue, &pointNetValue, &changed, &calculationNanos, &queueNanos, &latencyNanos); err != nil {
+				pointRows.Close()
+				return nil, err
+			}
+			candidateNet, parseErr := market.ParseAssetQuantity(market.AssetID(item.inputAsset), pointNetValue)
+			if parseErr != nil {
+				pointRows.Close()
+				return nil, parseErr
+			}
+			if quantityCmp(candidateNet, best) > 0 {
+				best = candidateNet
+			}
+			if quantityCmp(candidateNet, worst) < 0 {
+				worst = candidateNet
+			}
+			buyOutput, _ = market.ParseAssetQuantity(market.AssetID(pointBuyAsset), pointBuyValue)
+			sellOutput, _ = market.ParseAssetQuantity(market.AssetID(item.inputAsset), pointSellValue)
+			netPnL = candidateNet
+			lastTrigger, _ = parseTime(triggerAt)
+			points = sequence
+			if changed != 0 {
+				changes++
+			}
+			cumulativeCalculation += calculationNanos
+			cumulativeQueue += queueNanos
+			if queueNanos > maximumQueue {
+				maximumQueue = queueNanos
+			}
+			latencies = append(latencies, latencyNanos)
+		}
+		if err := pointRows.Close(); err != nil {
+			return nil, err
+		}
+		latencyMin, latencyMean, latencyP50, latencyP95, latencyP99, latencyMax := trackingLatencyStats(latencies)
+		if _, err := s.db.ExecContext(ctx, `UPDATE opportunity_tracking_windows SET status = 'failed',
+			close_reason = 'process_interrupted', closed_at = ?, economic_duration_nanos = ?,
+			observed_duration_nanos = ?, cumulative_calculation_nanos = ?, cumulative_queue_nanos = ?,
+			maximum_queue_nanos = ?, events = ?, economic_changes = ?, initial_pnl_value = ?,
+			final_pnl_value = ?, best_pnl_value = ?, worst_pnl_value = ?, latency_min_nanos = ?,
+			latency_mean_nanos = ?, latency_p50_nanos = ?, latency_p95_nanos = ?, latency_p99_nanos = ?,
+			latency_max_nanos = ? WHERE window_id = ? AND status = 'open'`,
+			formatTime(at), nonNegativeNanos(lastTrigger.Sub(openedAt)), nonNegativeNanos(at.Sub(openedAt)),
+			cumulativeCalculation, cumulativeQueue, maximumQueue, points, changes,
+			item.netValue, netPnL.String(), best.String(), worst.String(), latencyMin, latencyMean,
+			latencyP50, latencyP95, latencyP99, latencyMax, item.id); err != nil {
+			return nil, err
+		}
+		result = append(result, arbitrage.DanglingTrackingWindow{
+			WindowID: arbitrage.WindowID(item.id), MessageID: item.messageID,
+			Direction: arbitrage.Direction{BuyMarket: market.MarketID(item.buy), SellMarket: market.MarketID(item.sell)},
+			Input:     input, BuyOutput: buyOutput, SellOutput: sellOutput, NetPnL: netPnL, Threshold: threshold,
+			BestPnL: best, WorstPnL: worst, OpenedAt: openedAt, ClosedAt: at.UTC(), LastTriggerAt: lastTrigger,
+			Points: points, EconomicChanges: changes,
+			CumulativeCalculation: time.Duration(cumulativeCalculation), CumulativeQueue: time.Duration(cumulativeQueue),
+			MaximumQueue: time.Duration(maximumQueue),
+		})
+	}
+	return result, nil
+}
+
+func quantityCmp(left, right market.AssetQuantity) int {
+	value, err := left.Cmp(right)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func nonNegativeNanos(value time.Duration) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value.Nanoseconds()
+}
+
+func trackingLatencyStats(values []int64) (minimum, mean, p50, p95, p99, maximum int64) {
+	if len(values) == 0 {
+		return 0, 0, 0, 0, 0, 0
+	}
+	ordered := append([]int64(nil), values...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	var total int64
+	for _, value := range ordered {
+		total += value
+	}
+	at := func(percentile int) int64 {
+		index := (percentile*len(ordered) + 99) / 100
+		if index < 1 {
+			index = 1
+		}
+		return ordered[index-1]
+	}
+	return ordered[0], total / int64(len(ordered)), at(50), at(95), at(99), ordered[len(ordered)-1]
 }
 
 func (s *Store) migrate() error {
@@ -146,6 +546,150 @@ func (s *Store) migrate() error {
 			observation_fingerprint TEXT NOT NULL,
 			UNIQUE(window_id, evaluation_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS opportunity_tracking_windows (
+			window_id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			strategy_id TEXT NOT NULL,
+			config_hash TEXT NOT NULL,
+			buy_market TEXT NOT NULL,
+			sell_market TEXT NOT NULL,
+			input_asset TEXT NOT NULL,
+			input_value TEXT NOT NULL,
+			fixed_threshold_value TEXT NOT NULL,
+			percentage_threshold_value TEXT NOT NULL,
+			effective_threshold_value TEXT NOT NULL,
+			cost_value TEXT NOT NULL,
+			opening_trigger TEXT NOT NULL,
+			opened_at TEXT NOT NULL,
+			discovery_started_at TEXT NOT NULL,
+			discovery_finished_at TEXT NOT NULL,
+			opening_persisted_at TEXT NOT NULL,
+			opening_buy_token TEXT NOT NULL,
+			opening_buy_units TEXT NOT NULL,
+			opening_buy_asset TEXT NOT NULL DEFAULT '',
+			opening_buy_value TEXT NOT NULL DEFAULT '0',
+			opening_sell_value TEXT NOT NULL,
+			opening_net_value TEXT NOT NULL,
+			opening_snapshots TEXT NOT NULL,
+			discovery_trace TEXT NOT NULL DEFAULT '',
+			telegram_message_id INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'open',
+			close_reason TEXT NOT NULL DEFAULT '',
+			closed_at TEXT NOT NULL DEFAULT '',
+			economic_duration_nanos INTEGER NOT NULL DEFAULT 0,
+			observed_duration_nanos INTEGER NOT NULL DEFAULT 0,
+			cumulative_calculation_nanos INTEGER NOT NULL DEFAULT 0,
+			cumulative_queue_nanos INTEGER NOT NULL DEFAULT 0,
+			maximum_queue_nanos INTEGER NOT NULL DEFAULT 0,
+			events INTEGER NOT NULL DEFAULT 0,
+			economic_changes INTEGER NOT NULL DEFAULT 0,
+			initial_pnl_value TEXT NOT NULL DEFAULT '0',
+			final_pnl_value TEXT NOT NULL DEFAULT '0',
+			best_pnl_value TEXT NOT NULL DEFAULT '0',
+			worst_pnl_value TEXT NOT NULL DEFAULT '0',
+			latency_min_nanos INTEGER NOT NULL DEFAULT 0,
+			latency_mean_nanos INTEGER NOT NULL DEFAULT 0,
+			latency_p50_nanos INTEGER NOT NULL DEFAULT 0,
+			latency_p95_nanos INTEGER NOT NULL DEFAULT 0,
+			latency_p99_nanos INTEGER NOT NULL DEFAULT 0,
+			latency_max_nanos INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS opportunity_tracking_points (
+			point_id TEXT PRIMARY KEY,
+			window_id TEXT NOT NULL REFERENCES opportunity_tracking_windows(window_id) ON DELETE CASCADE,
+			sequence INTEGER NOT NULL,
+			evaluation_id TEXT NOT NULL,
+			trigger TEXT NOT NULL,
+			trigger_received_at TEXT NOT NULL,
+			snapshot_captured_at TEXT NOT NULL,
+			queued_at TEXT NOT NULL,
+			evaluation_started_at TEXT NOT NULL,
+			buy_started_at TEXT NOT NULL,
+			buy_finished_at TEXT NOT NULL,
+			conversion_started_at TEXT NOT NULL,
+			conversion_finished_at TEXT NOT NULL,
+			sell_started_at TEXT NOT NULL,
+			sell_finished_at TEXT NOT NULL,
+			pnl_started_at TEXT NOT NULL,
+			pnl_finished_at TEXT NOT NULL,
+			persistence_started_at TEXT NOT NULL,
+			persistence_finished_at TEXT NOT NULL,
+			notification_enqueued_at TEXT NOT NULL,
+			evaluation_finished_at TEXT NOT NULL,
+			snapshots TEXT NOT NULL,
+			input_value TEXT NOT NULL,
+			buy_output_asset TEXT NOT NULL,
+			buy_output_value TEXT NOT NULL,
+			sell_output_value TEXT NOT NULL,
+			gross_pnl_value TEXT NOT NULL,
+			net_pnl_value TEXT NOT NULL,
+			fixed_threshold_value TEXT NOT NULL,
+			percentage_threshold_value TEXT NOT NULL,
+			effective_threshold_value TEXT NOT NULL,
+			delta_opening_value TEXT NOT NULL,
+			delta_previous_value TEXT NOT NULL,
+			classification TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			economic_change INTEGER NOT NULL CHECK (economic_change IN (0, 1)),
+			snapshot_capture_nanos INTEGER NOT NULL,
+			queue_nanos INTEGER NOT NULL,
+			buy_quote_nanos INTEGER NOT NULL,
+			conversion_nanos INTEGER NOT NULL,
+			sell_quote_nanos INTEGER NOT NULL,
+			pnl_nanos INTEGER NOT NULL,
+			local_calculation_nanos INTEGER NOT NULL,
+			persistence_nanos INTEGER NOT NULL,
+			event_to_evaluation_nanos INTEGER NOT NULL,
+			event_to_persisted_nanos INTEGER NOT NULL,
+			notification_enqueue_nanos INTEGER NOT NULL,
+			interval_previous_nanos INTEGER NOT NULL DEFAULT 0,
+			since_opening_nanos INTEGER NOT NULL DEFAULT 0,
+			UNIQUE(window_id, sequence)
+		)`,
+		`CREATE INDEX IF NOT EXISTS opportunity_tracking_points_window_idx ON opportunity_tracking_points(window_id, sequence)`,
+		`CREATE TABLE IF NOT EXISTS simulation_rounds (
+			round_id TEXT PRIMARY KEY,
+			window_id TEXT NOT NULL,
+			point_sequence INTEGER NOT NULL,
+			requested_at TEXT NOT NULL,
+			started_at TEXT NOT NULL,
+			finished_at TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL,
+			failure_class TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			local_qualified INTEGER NOT NULL CHECK (local_qualified IN (0, 1)),
+			local_net_asset TEXT NOT NULL DEFAULT '',
+			local_net_value TEXT NOT NULL DEFAULT '0',
+			local_threshold_asset TEXT NOT NULL DEFAULT '',
+			local_threshold_value TEXT NOT NULL DEFAULT '0',
+			simulated_net_asset TEXT NOT NULL DEFAULT '',
+			simulated_net_value TEXT NOT NULL DEFAULT '0'
+		)`,
+		`CREATE INDEX IF NOT EXISTS simulation_rounds_window_idx ON simulation_rounds(window_id, point_sequence)`,
+		`CREATE TABLE IF NOT EXISTS simulation_legs (
+			round_id TEXT NOT NULL REFERENCES simulation_rounds(round_id) ON DELETE CASCADE,
+			leg TEXT NOT NULL,
+			chain TEXT NOT NULL,
+			market TEXT NOT NULL,
+			input_token TEXT NOT NULL,
+			input_units TEXT NOT NULL,
+			local_output_token TEXT NOT NULL,
+			local_output_units TEXT NOT NULL,
+			simulated_output_token TEXT NOT NULL,
+			simulated_output_units TEXT NOT NULL,
+			status TEXT NOT NULL,
+			failure_class TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			snapshot_version INTEGER NOT NULL DEFAULT 0,
+			snapshot_hash TEXT NOT NULL DEFAULT '',
+			context TEXT NOT NULL DEFAULT '',
+			context_position INTEGER NOT NULL DEFAULT 0,
+			gas_or_compute_units INTEGER NOT NULL DEFAULT 0,
+			started_at TEXT NOT NULL DEFAULT '',
+			finished_at TEXT NOT NULL DEFAULT '',
+			duration_nanos INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(round_id, leg)
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.Exec(statement); err != nil {
@@ -163,7 +707,46 @@ func (s *Store) migrate() error {
 			}
 		}
 	}
-	if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
+	if version == 3 {
+		if _, err := tx.Exec(`ALTER TABLE opportunity_tracking_windows ADD COLUMN discovery_trace TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("apply SQLite discovery trace migration: %w", err)
+		}
+	}
+	if version == 3 || version == 4 {
+		for _, statement := range []string{
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN opening_buy_asset TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN opening_buy_value TEXT NOT NULL DEFAULT '0'`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("apply SQLite opening output migration: %w", err)
+			}
+		}
+	}
+	if version >= 3 && version <= 5 {
+		for _, statement := range []string{
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN latency_min_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN latency_mean_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN latency_p50_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN latency_p95_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN latency_p99_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE opportunity_tracking_windows ADD COLUMN latency_max_nanos INTEGER NOT NULL DEFAULT 0`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("apply SQLite latency summary migration: %w", err)
+			}
+		}
+	}
+	if version >= 3 && version <= 6 {
+		for _, statement := range []string{
+			`ALTER TABLE opportunity_tracking_points ADD COLUMN interval_previous_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE opportunity_tracking_points ADD COLUMN since_opening_nanos INTEGER NOT NULL DEFAULT 0`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return fmt.Errorf("apply SQLite point interval migration: %w", err)
+			}
+		}
+	}
+	if _, err := tx.Exec("PRAGMA user_version = 8"); err != nil {
 		return fmt.Errorf("set SQLite schema version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -582,6 +1165,61 @@ func parseTime(value string) (time.Time, error) {
 }
 
 func formatTime(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }
+
+func formatOptionalTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return formatTime(value)
+}
+
+func trackingTrigger(trigger arbitrage.TriggerMetadata) string {
+	return fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s", trigger.Market, trigger.Source,
+		trigger.Position.Kind, trigger.Position.Value, trigger.Reference.Kind,
+		trigger.Reference.Value, formatTime(trigger.At))
+}
+
+func trackingSnapshots(snapshots []arbitrage.TrackingSnapshot) string {
+	parts := make([]string, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		parts = append(parts, fmt.Sprintf("%s:%d:%s", snapshot.Market, snapshot.Version, hex.EncodeToString(snapshot.StateHash[:])))
+	}
+	return strings.Join(parts, ",")
+}
+
+func trackingDiscoveryTrace(directions []arbitrage.TrackingDiscoveryDirection) string {
+	type quote struct {
+		Leg      string `json:"leg"`
+		Input    string `json:"input"`
+		Output   string `json:"output"`
+		Duration int64  `json:"duration_nanos"`
+		Cached   bool   `json:"cached"`
+		Error    string `json:"error,omitempty"`
+	}
+	type direction struct {
+		BuyMarket  string  `json:"buy_market"`
+		SellMarket string  `json:"sell_market"`
+		Duration   int64   `json:"duration_nanos"`
+		Quotes     []quote `json:"quotes"`
+	}
+	encoded := make([]direction, 0, len(directions))
+	for _, candidate := range directions {
+		item := direction{BuyMarket: string(candidate.Direction.BuyMarket), SellMarket: string(candidate.Direction.SellMarket), Duration: candidate.Duration.Nanoseconds()}
+		for _, candidateQuote := range candidate.Quotes {
+			item.Quotes = append(item.Quotes, quote{Leg: candidateQuote.Leg, Input: formatTrackingQuantity(candidateQuote.Input), Output: formatTrackingQuantity(candidateQuote.Output), Duration: candidateQuote.Duration.Nanoseconds(), Cached: candidateQuote.Cached, Error: candidateQuote.Error})
+		}
+		encoded = append(encoded, item)
+	}
+	value, _ := json.Marshal(encoded)
+	return string(value)
+}
+
+func formatTrackingQuantity(quantity market.AssetQuantity) string {
+	if quantity.Asset() == "" {
+		return ""
+	}
+	return string(quantity.Asset()) + ":" + quantity.String()
+}
 
 func boolInt(value bool) int {
 	if value {

@@ -198,6 +198,9 @@ func writeTextSummary(writer io.Writer, report Report, options OutputOptions) er
 			readableDuration(discovery.Duration), discovery.Samples, discovery.Decision); err != nil {
 			return err
 		}
+		if err := writeReadableProbes(writer, discovery.Probes); err != nil {
+			return err
+		}
 	}
 	if len(report.Research.LocalTiming.Directions) > 0 {
 		if _, err := fmt.Fprintln(writer, "\nROUND TRIPS (parallel; buy -> sell within each route)"); err != nil {
@@ -243,6 +246,34 @@ func writeTextSummary(writer io.Writer, report Report, options OutputOptions) er
 	}
 	if _, err := fmt.Fprintf(writer, "\nTOTAL          %s\n\n", readableDuration(report.Research.LocalTiming.Duration)); err != nil {
 		return err
+	}
+	return nil
+}
+
+func writeReadableProbes(writer io.Writer, probes []strategy.DirectionProbeTiming) error {
+	for index, probe := range probes {
+		if _, err := fmt.Fprintf(writer, "    Probe %d      %s · total %s\n",
+			index+1, readableQuantity(probe.Size), readableDuration(probe.Duration)); err != nil {
+			return err
+		}
+		for _, output := range probe.Outputs {
+			status := "fresh"
+			if output.Cached {
+				status = "cached"
+			}
+			if output.Error != "" {
+				if _, err := fmt.Fprintf(writer, "      %-9s ERROR: %s · %s\n",
+					readableMarket(output.Market), output.Error, readableDuration(output.Duration)); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := fmt.Fprintf(writer, "      %-9s %s · %s · %s\n",
+				readableMarket(output.Market), readableQuantity(output.Output),
+				readableDuration(output.Duration), status); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

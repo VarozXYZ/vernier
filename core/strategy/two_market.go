@@ -80,6 +80,23 @@ type EvaluationTiming struct {
 	Directions []DirectionTiming
 }
 
+// PinnedEvaluationTiming records the dependent stages of one exact trade.
+// It is intentionally separate from grid discovery so Research can persist
+// every stage boundary without inferring timestamps from aggregate durations.
+type PinnedEvaluationTiming struct {
+	EvaluationStartedAt  time.Time
+	BuyStartedAt         time.Time
+	BuyFinishedAt        time.Time
+	ConversionStartedAt  time.Time
+	ConversionFinishedAt time.Time
+	SellStartedAt        time.Time
+	SellFinishedAt       time.Time
+	PnLStartedAt         time.Time
+	PnLFinishedAt        time.Time
+	EvaluationFinishedAt time.Time
+	Direction            DirectionTiming
+}
+
 type SizingAsset string
 
 const (
@@ -88,14 +105,16 @@ const (
 )
 
 type TwoMarketConfig struct {
-	ID          arbitrage.StrategyID
-	Setup       arbitrage.ArbitrageSetup
-	Registry    *market.Registry
-	Sources     map[market.MarketID]quoteport.Source
-	Grid        sizing.Grid
-	Threshold   market.AssetQuantity
-	Clock       Clock
-	SizingAsset SizingAsset
+	ID             arbitrage.StrategyID
+	Setup          arbitrage.ArbitrageSetup
+	Registry       *market.Registry
+	Sources        map[market.MarketID]quoteport.Source
+	Grid           sizing.Grid
+	Threshold      market.AssetQuantity
+	ThresholdFixed market.AssetQuantity
+	ThresholdBPS   uint16
+	Clock          Clock
+	SizingAsset    SizingAsset
 	// DirectionDiscoverySamples enables a quick min/mid/max-style direction
 	// probe before exhaustive sizing. Zero preserves the explicit two-direction
 	// behavior for callers that need it.
@@ -109,6 +128,8 @@ type TwoMarketCrossChainArbitrage struct {
 	sources          map[market.MarketID]quoteport.Source
 	grid             sizing.Grid
 	threshold        market.AssetQuantity
+	thresholdFixed   market.AssetQuantity
+	thresholdBPS     uint16
 	clock            Clock
 	cache            quoteCache
 	sizingAsset      market.AssetID
@@ -151,6 +172,11 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	if config.Threshold.Asset() != pair.QuoteAsset || config.Threshold.Sign() < 0 {
 		return nil, fmt.Errorf("non-negative threshold must use quote asset %q", pair.QuoteAsset)
 	}
+	if config.ThresholdBPS > 0 {
+		if config.ThresholdBPS > 10_000 || config.ThresholdFixed.Asset() != pair.QuoteAsset || config.ThresholdFixed.Sign() <= 0 || config.Threshold.Sign() != 0 {
+			return nil, fmt.Errorf("percentage threshold requires a positive quote-asset floor, 1..10000 BPS, and zero legacy threshold")
+		}
+	}
 	sources := make(map[market.MarketID]quoteport.Source, len(config.Sources))
 	for _, marketID := range config.Setup.Markets() {
 		source, exists := config.Sources[marketID]
@@ -161,7 +187,8 @@ func NewTwoMarket(config TwoMarketConfig) (*TwoMarketCrossChainArbitrage, error)
 	}
 	return &TwoMarketCrossChainArbitrage{
 		id: config.ID, setup: config.Setup, registry: config.Registry, sources: sources,
-		grid: config.Grid, threshold: config.Threshold, clock: config.Clock, sizingAsset: sizingAsset,
+		grid: config.Grid, threshold: config.Threshold, thresholdFixed: config.ThresholdFixed,
+		thresholdBPS: config.ThresholdBPS, clock: config.Clock, sizingAsset: sizingAsset,
 		discoverySamples: config.DirectionDiscoverySamples,
 		cache:            newQuoteCache(),
 	}, nil
@@ -188,6 +215,103 @@ func (s *TwoMarketCrossChainArbitrage) EvaluateWithTiming(ctx context.Context, e
 // apparently profitable remote estimate, not for normal event evaluation.
 func (s *TwoMarketCrossChainArbitrage) EvaluateFreshWithTiming(ctx context.Context, evaluation arbitrage.Evaluation) ([]arbitrage.Opportunity, EvaluationTiming, error) {
 	return s.evaluateWithTiming(ctx, evaluation, true)
+}
+
+// EvaluatePinnedWithTiming evaluates exactly one previously selected
+// direction and quote-asset input. It never consults the sizing grid and
+// therefore cannot silently resize or flip an active opportunity window.
+func (s *TwoMarketCrossChainArbitrage) EvaluatePinnedWithTiming(
+	ctx context.Context,
+	evaluation arbitrage.Evaluation,
+	direction arbitrage.Direction,
+	size market.AssetQuantity,
+) (arbitrage.Opportunity, PinnedEvaluationTiming, error) {
+	trace := PinnedEvaluationTiming{EvaluationStartedAt: s.clock().UTC()}
+	if evaluation.Strategy() != s.id {
+		return arbitrage.Opportunity{}, trace, fmt.Errorf("evaluation targets strategy %q, expected %q", evaluation.Strategy(), s.id)
+	}
+	if size.Asset() != s.sizingAsset || s.sizingAsset == "" {
+		return arbitrage.Opportunity{}, trace, fmt.Errorf("pinned size must use sizing asset %q", s.sizingAsset)
+	}
+	configured := false
+	for _, candidate := range s.setup.Directions() {
+		if candidate == direction {
+			configured = true
+			break
+		}
+	}
+	if !configured {
+		return arbitrage.Opportunity{}, trace, fmt.Errorf("pinned direction is not part of the setup")
+	}
+	opportunity := arbitrage.Opportunity{
+		Evaluation: evaluation.ID(), Run: evaluation.Run(), ConfigHash: evaluation.ConfigHash(),
+		Strategy: s.id, Direction: direction, Classification: arbitrage.ClassificationUnclassifiable,
+		SelectedIndex: -1, Threshold: s.threshold, TriggeredAt: evaluation.TriggeredAt(), StartedAt: evaluation.StartedAt(),
+	}
+	opportunity.Trigger, opportunity.HasTrigger = evaluation.Trigger()
+	buySnapshot, buyOK := evaluation.Snapshot(direction.BuyMarket)
+	sellSnapshot, sellOK := evaluation.Snapshot(direction.SellMarket)
+	if !buyOK || !sellOK {
+		opportunity.Reasons = []string{"missing_market_snapshot"}
+		return s.finishPinned(opportunity, &trace), trace, nil
+	}
+	opportunity.Snapshots = []market.SnapshotMetadata{buySnapshot.Metadata(), sellSnapshot.Metadata()}
+	for _, snapshot := range []market.MarketSnapshot{buySnapshot, sellSnapshot} {
+		if snapshot.Metadata().Health != market.HealthHealthy {
+			opportunity.Reasons = []string{"degraded_market_snapshot"}
+			return s.finishPinned(opportunity, &trace), trace, nil
+		}
+	}
+	buyMarket, buyOK := s.registry.Market(direction.BuyMarket)
+	sellMarket, sellOK := s.registry.Market(direction.SellMarket)
+	if !buyOK || !sellOK {
+		opportunity.Reasons = []string{"unknown_market"}
+		return s.finishPinned(opportunity, &trace), trace, nil
+	}
+	buyBase, _ := s.registry.Token(buyMarket.BaseToken)
+	buyQuote, _ := s.registry.Token(buyMarket.QuoteToken)
+	sellBase, _ := s.registry.Token(sellMarket.BaseToken)
+	sellQuote, _ := s.registry.Token(sellMarket.QuoteToken)
+	if s.sizingAsset != buyQuote.Asset {
+		return arbitrage.Opportunity{}, trace, fmt.Errorf("pinned tracking currently requires quote-asset sizing")
+	}
+	directionTiming := DirectionTiming{Direction: direction}
+	directionStarted := s.clock()
+	candidate, err := s.quoteSizedCandidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size, &directionTiming, false, &trace)
+	directionTiming.Duration = nonNegative(s.clock().Sub(directionStarted))
+	trace.Direction = directionTiming
+	if err != nil {
+		opportunity.Reasons = []string{err.Error()}
+		return s.finishPinned(opportunity, &trace), trace, nil
+	}
+	fixed, percentage, effective, err := s.candidateThreshold(candidate.Input, buyQuote)
+	if err != nil {
+		return arbitrage.Opportunity{}, trace, err
+	}
+	candidate.FixedThreshold = fixed
+	candidate.PercentageThreshold = percentage
+	candidate.EffectiveThreshold = effective
+	opportunity.Candidates = []arbitrage.Candidate{candidate}
+	opportunity.SelectedIndex = 0
+	opportunity.Threshold = effective
+	switch {
+	case candidate.GrossPnL.Sign() <= 0:
+		opportunity.Classification, opportunity.Reasons = arbitrage.ClassificationNoSpread, []string{"no_positive_gross_profit"}
+	case candidate.NetPnL.Sign() <= 0:
+		opportunity.Classification, opportunity.Reasons = arbitrage.ClassificationObservedSpread, []string{"costs_exceed_gross_profit"}
+	case !greaterOrEqual(candidate.NetPnL, effective):
+		opportunity.Classification, opportunity.Reasons = arbitrage.ClassificationEconomic, []string{"below_profit_threshold"}
+	default:
+		opportunity.Classification, opportunity.Reasons = arbitrage.ClassificationPolicyQualified, []string{"profit_threshold_met"}
+	}
+	return s.finishPinned(opportunity, &trace), trace, nil
+}
+
+func (s *TwoMarketCrossChainArbitrage) finishPinned(opportunity arbitrage.Opportunity, trace *PinnedEvaluationTiming) arbitrage.Opportunity {
+	finished := s.clock().UTC()
+	opportunity.FinishedAt = finished
+	trace.EvaluationFinishedAt = finished
+	return opportunity
 }
 
 func (s *TwoMarketCrossChainArbitrage) evaluateWithTiming(ctx context.Context, evaluation arbitrage.Evaluation, refresh bool) ([]arbitrage.Opportunity, EvaluationTiming, error) {
@@ -415,16 +539,36 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 	sellBase, _ := s.registry.Token(sellMarket.BaseToken)
 	sellQuote, _ := s.registry.Token(sellMarket.QuoteToken)
 
+	bestOverall := -1
+	bestQualified := -1
 	for _, size := range s.grid.Values() {
 		candidate, err := s.candidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size, timing, refresh)
 		if err != nil {
 			opportunity.Reasons = append(opportunity.Reasons, err.Error())
 			continue
 		}
-		opportunity.Candidates = append(opportunity.Candidates, candidate)
-		if opportunity.SelectedIndex < 0 || greater(candidate.NetPnL, opportunity.Candidates[opportunity.SelectedIndex].NetPnL) {
-			opportunity.SelectedIndex = len(opportunity.Candidates) - 1
+		fixedThreshold, percentageThreshold, effectiveThreshold, thresholdErr := s.candidateThreshold(candidate.Input, buyQuote)
+		if thresholdErr != nil {
+			opportunity.Reasons = append(opportunity.Reasons, "threshold_failed: "+thresholdErr.Error())
+			continue
 		}
+		candidate.FixedThreshold = fixedThreshold
+		candidate.PercentageThreshold = percentageThreshold
+		candidate.EffectiveThreshold = effectiveThreshold
+		opportunity.Candidates = append(opportunity.Candidates, candidate)
+		index := len(opportunity.Candidates) - 1
+		if bestOverall < 0 || greater(candidate.NetPnL, opportunity.Candidates[bestOverall].NetPnL) {
+			bestOverall = index
+		}
+		if greaterOrEqual(candidate.NetPnL, effectiveThreshold) &&
+			(bestQualified < 0 || greater(candidate.NetPnL, opportunity.Candidates[bestQualified].NetPnL)) {
+			bestQualified = index
+		}
+	}
+	if bestQualified >= 0 {
+		opportunity.SelectedIndex = bestQualified
+	} else {
+		opportunity.SelectedIndex = bestOverall
 	}
 	if opportunity.SelectedIndex < 0 {
 		if len(opportunity.Reasons) == 0 {
@@ -434,6 +578,7 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 	}
 
 	selected := opportunity.Candidates[opportunity.SelectedIndex]
+	opportunity.Threshold = selected.EffectiveThreshold
 	switch {
 	case selected.GrossPnL.Sign() <= 0:
 		opportunity.Classification = arbitrage.ClassificationNoSpread
@@ -441,7 +586,7 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 	case selected.NetPnL.Sign() <= 0:
 		opportunity.Classification = arbitrage.ClassificationObservedSpread
 		opportunity.Reasons = []string{"costs_exceed_gross_profit"}
-	case !greaterOrEqual(selected.NetPnL, s.threshold):
+	case !greaterOrEqual(selected.NetPnL, selected.EffectiveThreshold):
 		opportunity.Classification = arbitrage.ClassificationEconomic
 		opportunity.Reasons = []string{"below_profit_threshold"}
 	default:
@@ -451,9 +596,42 @@ func (s *TwoMarketCrossChainArbitrage) evaluateDirection(ctx context.Context, ev
 	return s.finish(opportunity)
 }
 
+func (s *TwoMarketCrossChainArbitrage) candidateThreshold(input market.AssetQuantity, quote market.Token) (market.AssetQuantity, market.AssetQuantity, market.AssetQuantity, error) {
+	zero, err := market.NewAssetQuantity(input.Asset(), new(big.Rat))
+	if err != nil {
+		return market.AssetQuantity{}, market.AssetQuantity{}, market.AssetQuantity{}, err
+	}
+	if s.thresholdBPS == 0 {
+		return s.threshold, zero, s.threshold, nil
+	}
+	inputUnits, err := input.ToTokenAmount(quote)
+	if err != nil {
+		return market.AssetQuantity{}, market.AssetQuantity{}, market.AssetQuantity{}, err
+	}
+	numerator := new(big.Int).Mul(inputUnits.Units(), new(big.Int).SetUint64(uint64(s.thresholdBPS)))
+	denominator := big.NewInt(10_000)
+	percentageUnits := new(big.Int).Quo(numerator, denominator)
+	if new(big.Int).Mod(numerator, denominator).Sign() != 0 {
+		percentageUnits.Add(percentageUnits, big.NewInt(1))
+	}
+	percentageToken, err := market.NewTokenAmount(quote.ID, percentageUnits)
+	if err != nil {
+		return market.AssetQuantity{}, market.AssetQuantity{}, market.AssetQuantity{}, err
+	}
+	percentage, err := percentageToken.ToAssetQuantity(quote)
+	if err != nil {
+		return market.AssetQuantity{}, market.AssetQuantity{}, market.AssetQuantity{}, err
+	}
+	effective := s.thresholdFixed
+	if greater(percentage, effective) {
+		effective = percentage
+	}
+	return s.thresholdFixed, percentage, effective, nil
+}
+
 func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, size market.AssetQuantity, timing *DirectionTiming, refresh bool) (arbitrage.Candidate, error) {
 	if s.sizingAsset == buyQuote.Asset {
-		return s.quoteSizedCandidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size, timing, refresh)
+		return s.quoteSizedCandidate(ctx, evaluation, direction, buySnapshot, sellSnapshot, buyBase, buyQuote, sellBase, sellQuote, size, timing, refresh, nil)
 	}
 	targetBase, err := size.ToTokenAmount(buyBase)
 	if err != nil || targetBase.IsZero() {
@@ -502,15 +680,21 @@ func (s *TwoMarketCrossChainArbitrage) candidate(ctx context.Context, evaluation
 	}, nil
 }
 
-func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, budget market.AssetQuantity, timing *DirectionTiming, refresh bool) (arbitrage.Candidate, error) {
+func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, evaluation arbitrage.Evaluation, direction arbitrage.Direction, buySnapshot, sellSnapshot market.MarketSnapshot, buyBase, buyQuote, sellBase, sellQuote market.Token, budget market.AssetQuantity, timing *DirectionTiming, refresh bool, trace *PinnedEvaluationTiming) (arbitrage.Candidate, error) {
 	buyInput, err := budget.ToTokenAmount(buyQuote)
 	if err != nil || buyInput.IsZero() {
 		return arbitrage.Candidate{}, fmt.Errorf("size_rounds_to_zero")
+	}
+	if trace != nil {
+		trace.BuyStartedAt = s.clock().UTC()
 	}
 	buy, err := s.input(ctx, s.sources[direction.BuyMarket], quoteport.Input{
 		Snapshot: buySnapshot, TokenIn: buyQuote.ID, TokenOut: buyBase.ID, AmountIn: buyInput,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	}, timing, "buy", refresh)
+	if trace != nil {
+		trace.BuyFinishedAt = s.clock().UTC()
+	}
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_quote_failed: %w", err)
 	}
@@ -521,14 +705,26 @@ func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, 
 	if err != nil || baseReceived.Sign() <= 0 {
 		return arbitrage.Candidate{}, fmt.Errorf("buy_output_invalid")
 	}
+	if trace != nil {
+		trace.ConversionStartedAt = s.clock().UTC()
+	}
 	sellInput, err := baseReceived.ToTokenAmount(sellBase)
+	if trace != nil {
+		trace.ConversionFinishedAt = s.clock().UTC()
+	}
 	if err != nil || sellInput.IsZero() {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_input_rounds_to_zero")
+	}
+	if trace != nil {
+		trace.SellStartedAt = s.clock().UTC()
 	}
 	sell, err := s.input(ctx, s.sources[direction.SellMarket], quoteport.Input{
 		Snapshot: sellSnapshot, TokenIn: sellBase.ID, TokenOut: sellQuote.ID, AmountIn: sellInput,
 		Purpose: market.QuotePurposeResearchDiscovery, QuotedAt: evaluation.StartedAt(),
 	}, timing, "sell", refresh)
+	if trace != nil {
+		trace.SellFinishedAt = s.clock().UTC()
+	}
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_quote_failed: %w", err)
 	}
@@ -539,9 +735,15 @@ func (s *TwoMarketCrossChainArbitrage) quoteSizedCandidate(ctx context.Context, 
 	if err != nil {
 		return arbitrage.Candidate{}, fmt.Errorf("sell_output_invalid")
 	}
+	if trace != nil {
+		trace.PnLStartedAt = s.clock().UTC()
+	}
 	input, _ := buyInput.ToAssetQuantity(buyQuote)
 	gross, _ := output.Sub(input)
 	net, _ := gross.Sub(evaluation.Cost().Amount)
+	if trace != nil {
+		trace.PnLFinishedAt = s.clock().UTC()
+	}
 	return arbitrage.Candidate{
 		Size: budget, Input: input, Output: output, GrossPnL: gross, Cost: evaluation.Cost(), NetPnL: net,
 		BuyQuote: buy, SellQuote: sell,
