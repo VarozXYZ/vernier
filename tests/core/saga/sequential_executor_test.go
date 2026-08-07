@@ -1028,10 +1028,10 @@ func TestSequentialExecutorCanReturnBaseAndSellAtOriginWithoutAnotherBridge(t *t
 func TestSequentialExecutorRejectsPreflightBeforeCreatingOperation(t *testing.T) {
 	plan := sequentialPlan(t)
 	driver := &sequentialDriver{
-		preflightErr: executionport.NewStageError(
-			executionport.DispositionRejected,
-			errors.New("sell simulation reverted"),
-		),
+		// Provider adapters may return an ordinary error. The executor owns the
+		// knowledge that preflight has not broadcast anything and must classify
+		// that error as definitively rejected.
+		preflightErr: errors.New("sell simulation reverted"),
 	}
 	journal := &sequentialJournal{}
 	executor, _ := saga.NewSequentialExecutor(
