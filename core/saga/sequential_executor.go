@@ -122,7 +122,16 @@ func (e *SequentialExecutor) Execute(
 					}
 				}
 			}
-			return result, fmt.Errorf("swap preflight: %w", err)
+			// Preflight validation never broadcasts. Even when a provider returns
+			// an untyped error, the result is therefore definitively rejected and
+			// safe to re-evaluate without recovery or an execution alert.
+			return result, fmt.Errorf(
+				"swap preflight: %w",
+				executionport.NewStageError(
+					executionport.DispositionRejected,
+					err,
+				),
+			)
 		}
 		defer preflight.DiscardPreflight(operationID)
 	}
