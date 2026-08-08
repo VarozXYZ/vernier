@@ -22,6 +22,21 @@ func (e *SequentialExecutor) executePrefundedParallel(
 	if !ok {
 		return result, fmt.Errorf("prefunded_parallel swap driver is unavailable")
 	}
+	// Parallel swaps do not pass through the sequential stage loop, so publish
+	// both start timestamps explicitly before either broadcast begins.
+	sellInput, err := plan.ParallelSellInput()
+	if err != nil {
+		return result, err
+	}
+	for _, request := range []domainexecution.SequentialStageRequest{
+		{Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[0], Input: plan.InitialInput},
+		{Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[1], Input: sellInput},
+	} {
+		if err := request.Validate(); err != nil {
+			return result, err
+		}
+		e.observe(func(observer executionport.SequentialObserver) { observer.StageStarted(request) })
+	}
 	settlements, swapErr := parallel.ExecuteParallelSwaps(ctx, operation.ID, plan, e.journal)
 	for _, settlement := range settlements {
 		if err := e.recordParallelSettlement(ctx, &operation, &result, settlement); err != nil {
@@ -46,28 +61,44 @@ func (e *SequentialExecutor) executePrefundedParallel(
 	}
 
 	bridgeStages := []domainexecution.SequentialStagePlan{plan.Stages[2], plan.Stages[3]}
+	type preparedBridge struct {
+		request domainexecution.SequentialStageRequest
+		driver  executionport.SequentialStageDriver
+	}
+	prepared := make([]preparedBridge, len(bridgeStages))
+	// Resolve every dependency and driver before starting either irreversible
+	// transfer. A preparation error must never leave the other bridge running
+	// in an unobserved goroutine.
+	for index, stage := range bridgeStages {
+		input, err := e.resolveInput(plan, stage, plan.InitialInput, outputs)
+		if err != nil {
+			return result, fmt.Errorf("prepare parallel %s: %w", stage.Stage, err)
+		}
+		driver, err := e.drivers.Driver(stage.Stage)
+		if err != nil {
+			return result, fmt.Errorf("prepare parallel %s: %w", stage.Stage, err)
+		}
+		prepared[index] = preparedBridge{
+			request: domainexecution.SequentialStageRequest{
+				Operation: operation.ID, Plan: plan.ID, Stage: stage, Input: input,
+			},
+			driver: driver,
+		}
+	}
 	type bridgeResult struct {
 		settlement domainexecution.SequentialStageSettlement
 		err        error
 	}
 	bridges := make([]bridgeResult, 2)
 	var group sync.WaitGroup
-	for index, stage := range bridgeStages {
-		index, stage := index, stage
-		input, err := e.resolveInput(plan, stage, plan.InitialInput, outputs)
-		if err != nil {
-			return result, err
-		}
-		request := domainexecution.SequentialStageRequest{Operation: operation.ID, Plan: plan.ID, Stage: stage, Input: input}
-		driver, err := e.drivers.Driver(stage.Stage)
-		if err != nil {
-			return result, err
-		}
+	for index := range prepared {
+		index := index
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			e.observe(func(observer executionport.SequentialObserver) { observer.StageStarted(request) })
-			bridges[index].settlement, bridges[index].err = driver.ExecuteStage(ctx, request, e.journal)
+			item := prepared[index]
+			e.observe(func(observer executionport.SequentialObserver) { observer.StageStarted(item.request) })
+			bridges[index].settlement, bridges[index].err = item.driver.ExecuteStage(ctx, item.request, e.journal)
 		}()
 	}
 	group.Wait()
@@ -115,8 +146,10 @@ func (e *SequentialExecutor) recordParallelSettlement(
 	}
 	result.Settlements = append(result.Settlements, settlement)
 	result.Costs = append(result.Costs, settlement.Costs...)
-	operation.CurrentStage = settlement.Request.Stage.Ordinal
-	operation.CurrentAmount = settlement.ActualOutput
+	if settlement.Request.Stage.Ordinal >= operation.CurrentStage {
+		operation.CurrentStage = settlement.Request.Stage.Ordinal
+		operation.CurrentAmount = settlement.ActualOutput
+	}
 	operation.UpdatedAt = settlement.ObservedAt
 	e.observe(func(observer executionport.SequentialObserver) { observer.StageSettled(settlement) })
 	return nil
@@ -126,23 +159,25 @@ func calculateParallelEconomics(plan domainexecution.SequentialPlan, result *exe
 	if result == nil || len(result.Settlements) < 2 || plan.BaseAsset == "" || plan.QuoteAsset == "" {
 		return fmt.Errorf("parallel realized economics input is incomplete")
 	}
-	var buy, sell domainexecution.SequentialStageSettlement
+	var buy domainexecution.SequentialStageSettlement
+	sales := make([]domainexecution.SequentialStageSettlement, 0, 2)
 	for _, settlement := range result.Settlements {
-		switch settlement.Request.Stage.Stage {
-		case domainexecution.StageBuy:
+		switch settlement.Request.Stage.Ordinal {
+		case 1:
 			buy = settlement
-		case domainexecution.StageSell:
-			sell = settlement
+		case 2:
+			sales = append(sales, settlement)
+		default:
+			if settlement.Request.Stage.Stage == domainexecution.StageSell &&
+				settlement.Request.Stage.Branch == domainexecution.BranchCircuitBreaker {
+				sales = append(sales, settlement)
+			}
 		}
 	}
-	if buy.ActualOutput.IsZero() || sell.ActualOutput.IsZero() {
+	if buy.ActualOutput.IsZero() || len(sales) == 0 {
 		return fmt.Errorf("parallel swap settlements are incomplete")
 	}
 	qIn, err := parallelHumanAmount(plan, buy.ActualInput)
-	if err != nil {
-		return err
-	}
-	qOut, err := parallelHumanAmount(plan, sell.ActualOutput)
 	if err != nil {
 		return err
 	}
@@ -150,9 +185,19 @@ func calculateParallelEconomics(plan domainexecution.SequentialPlan, result *exe
 	if err != nil {
 		return err
 	}
-	bSell, err := parallelHumanAmount(plan, sell.ActualInput)
-	if err != nil {
-		return err
+	qOut := new(big.Rat)
+	bSell := new(big.Rat)
+	for _, sale := range sales {
+		saleQuote, amountErr := parallelHumanAmount(plan, sale.ActualOutput)
+		if amountErr != nil {
+			return amountErr
+		}
+		saleBase, amountErr := parallelHumanAmount(plan, sale.ActualInput)
+		if amountErr != nil {
+			return amountErr
+		}
+		qOut.Add(qOut, saleQuote)
+		bSell.Add(bSell, saleBase)
 	}
 	quoteDeltaRat := new(big.Rat).Sub(qOut, qIn)
 	baseDeltaRat := new(big.Rat).Sub(bBuy, bSell)
@@ -176,7 +221,7 @@ func calculateParallelEconomics(plan domainexecution.SequentialPlan, result *exe
 		}
 	}
 	net, _ := gross.Sub(external)
-	result.FinalAmount = sell.ActualOutput
+	result.FinalAmount = sales[len(sales)-1].ActualOutput
 	result.QuoteDelta, result.BaseDelta, result.MarkedBase, result.MarkPrice = quoteDelta, baseDelta, marked, mark
 	result.ExecutionCost, result.ExternalCost = total, external
 	result.RealizedGross, result.RealizedNetPnL = gross, net

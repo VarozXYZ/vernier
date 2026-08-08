@@ -657,6 +657,32 @@ func classifyRecoverySwapError(
 	}
 	text := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(text, "\"custom\":6024"),
+		strings.Contains(text, "custom program error: 0x1788"):
+		if binding.SpendableBalance != nil {
+			balance, balanceErr := binding.SpendableBalance.SpendableBalance(
+				ctx, input.Token(),
+			)
+			if balanceErr != nil {
+				return executionport.NewRecoveryError(
+					executionport.RecoveryFailureTemporary,
+					fmt.Errorf("inspect balance after jupiter 6024: %w", balanceErr),
+				)
+			}
+			if balance.Cmp(input.Units()) < 0 {
+				return executionport.NewRecoveryError(
+					executionport.RecoveryFailureBalanceMismatch,
+					fmt.Errorf(
+						"jupiter 6024 confirms insufficient token inventory: spendable=%s required=%s: %w",
+						balance, input.Units(), err,
+					),
+				)
+			}
+		}
+		return executionport.NewRecoveryError(
+			executionport.RecoveryFailureTemporary,
+			fmt.Errorf("jupiter 6024 requires balance, fee, or rent reconciliation: %w", err),
+		)
 	case strings.Contains(text, "return amount is not enough"),
 		strings.Contains(text, "too little received"),
 		strings.Contains(text, "slippage"):

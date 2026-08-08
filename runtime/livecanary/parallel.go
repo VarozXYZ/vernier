@@ -392,21 +392,7 @@ func (d *SwapDriver) broadcastPreparedSwap(
 }
 
 func (d *SwapDriver) parallelSellInput(plan execution.SequentialPlan) (market.TokenAmount, error) {
-	candidate, err := selectedCandidate(plan.Opportunity)
-	if err != nil {
-		return market.TokenAmount{}, err
-	}
-	if candidate.BuyQuote.AmountIn.IsZero() || candidate.SellQuote.AmountIn.IsZero() {
-		return market.TokenAmount{}, fmt.Errorf("parallel discovery amounts are incomplete")
-	}
-	units := new(big.Int).Quo(
-		new(big.Int).Mul(candidate.SellQuote.AmountIn.Units(), plan.InitialInput.Units()),
-		candidate.BuyQuote.AmountIn.Units(),
-	)
-	if units.Sign() <= 0 {
-		return market.TokenAmount{}, fmt.Errorf("parallel sell input rounds to zero")
-	}
-	return market.NewTokenAmount(candidate.SellQuote.AmountIn.Token(), units)
+	return plan.ParallelSellInput()
 }
 
 func (d *SwapDriver) simulateEconomic(
