@@ -175,7 +175,7 @@ type progressOperation struct {
 	initial   market.TokenAmount
 	started   time.Time
 	stage     execution.SequentialStageRequest
-	stageAt   time.Time
+	stageAt   map[int]time.Time
 	pending   []notificationport.LiveExecutionEvent
 	visible   bool
 }
@@ -215,7 +215,7 @@ func (o *ProgressObserver) OperationStarted(
 	direction := o.planDirection(plan)
 	value := progressOperation{
 		direction: direction, initial: plan.InitialInput,
-		started: operation.StartedAt,
+		started: operation.StartedAt, stageAt: make(map[int]time.Time),
 	}
 	event := notificationport.LiveExecutionEvent{
 		Kind:      notificationport.LiveExecutionStarted,
@@ -284,7 +284,11 @@ func (o *ProgressObserver) StageStarted(
 	}
 	o.mu.Lock()
 	value := o.operations[request.Operation]
-	value.stage, value.stageAt = request, now
+	value.stage = request
+	if value.stageAt == nil {
+		value.stageAt = make(map[int]time.Time)
+	}
+	value.stageAt[request.Stage.Ordinal] = now
 	visible := value.visible
 	if !visible {
 		value.pending = append(value.pending, event)
@@ -302,7 +306,7 @@ func (o *ProgressObserver) StageSettled(
 	now := o.clock().UTC()
 	o.mu.Lock()
 	value := o.operations[settlement.Request.Operation]
-	stageAt := value.stageAt
+	stageAt := value.stageAt[settlement.Request.Stage.Ordinal]
 	o.mu.Unlock()
 	duration := time.Duration(0)
 	if !stageAt.IsZero() {

@@ -160,7 +160,41 @@ func (p SequentialPlan) Validate() error {
 			ordinals[stage.Ordinal] = struct{}{}
 		}
 	}
+	if p.EffectivePolicy() == PolicyPrefundedParallel {
+		if err := p.validateParallelDependencies(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (p SequentialPlan) validateParallelDependencies() error {
+	expectedStages := []SequentialStage{StageBuy, StageSell, StageBridgeBase, StageBridgeQuoteReturn}
+	expectedInputs := []int{0, 0, 1, 2}
+	expectedDependencies := [][]int{nil, nil, {1}, {2}}
+	for index, stage := range p.Stages {
+		if stage.Ordinal != index+1 || stage.Stage != expectedStages[index] ||
+			stage.InputFromOrdinal != expectedInputs[index] ||
+			!sameOrdinals(stage.DependsOn, expectedDependencies[index]) {
+			return fmt.Errorf(
+				"prefunded parallel stage %d has sequential or invalid dependencies",
+				stage.Ordinal,
+			)
+		}
+	}
+	return nil
+}
+
+func sameOrdinals(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // InputFor resolves a typed stage input only from durable economic
@@ -169,6 +203,10 @@ func (p SequentialPlan) InputFor(
 	stage SequentialStagePlan,
 	outputs map[int]market.TokenAmount,
 ) (market.TokenAmount, error) {
+	if p.EffectivePolicy() == PolicyPrefundedParallel &&
+		stage.Ordinal == 2 && stage.Stage == StageSell {
+		return p.ParallelSellInput()
+	}
 	if stage.InputFromOrdinal == 0 {
 		if stage.Ordinal != 1 {
 			return market.TokenAmount{}, fmt.Errorf(
@@ -193,6 +231,32 @@ func (p SequentialPlan) InputFor(
 	// selected stage driver. Returning the immutable source settlement here
 	// keeps that conversion explicit and deterministic.
 	return source, nil
+}
+
+// ParallelSellInput fixes the sale input from discovery and the configured
+// execution notional. It never depends on the realized purchase output.
+func (p SequentialPlan) ParallelSellInput() (market.TokenAmount, error) {
+	if p.EffectivePolicy() != PolicyPrefundedParallel ||
+		p.Opportunity.SelectedIndex < 0 ||
+		p.Opportunity.SelectedIndex >= len(p.Opportunity.Candidates) {
+		return market.TokenAmount{}, fmt.Errorf("parallel sell intent is unavailable")
+	}
+	candidate := p.Opportunity.Candidates[p.Opportunity.SelectedIndex]
+	if candidate.BuyQuote.AmountIn.IsZero() ||
+		candidate.SellQuote.AmountIn.IsZero() || p.InitialInput.IsZero() {
+		return market.TokenAmount{}, fmt.Errorf("parallel discovery amounts are incomplete")
+	}
+	units := new(big.Int).Quo(
+		new(big.Int).Mul(
+			candidate.SellQuote.AmountIn.Units(),
+			p.InitialInput.Units(),
+		),
+		candidate.BuyQuote.AmountIn.Units(),
+	)
+	if units.Sign() <= 0 {
+		return market.TokenAmount{}, fmt.Errorf("parallel sell input rounds to zero")
+	}
+	return market.NewTokenAmount(candidate.SellQuote.AmountIn.Token(), units)
 }
 
 // ReturnExitStages replaces the normal destination sale and quote-token
@@ -410,6 +474,10 @@ func NewPrefundedParallelPlan(
 		return SequentialPlan{}, err
 	}
 	plan.Policy = PolicyPrefundedParallel
+	plan.Stages[1].DependsOn = nil
+	plan.Stages[1].InputFromOrdinal = 0
+	plan.Stages[2].DependsOn = []int{1}
+	plan.Stages[3].DependsOn = []int{2}
 	// Valuation assets and token decimals are supplied by the setup-neutral
 	// runtime planner before the final validation.
 	return plan, nil

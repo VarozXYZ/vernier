@@ -485,6 +485,16 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		BaseAsset: market.AssetID(baseAsset), QuoteAsset: market.AssetID(quoteAsset),
 		TokenDecimals: tokenDecimals, CreatedAt: createdAt.UTC(),
 	}
+	if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel {
+		// Snapshots written before the parallel lifecycle acquired independent
+		// bridge dependencies contain the prefunded-sequential graph. Normalize
+		// that durable intent during recovery instead of reproducing the unsafe
+		// ordering or making an otherwise recoverable operation unreadable.
+		plan.Stages[1].DependsOn = nil
+		plan.Stages[1].InputFromOrdinal = 0
+		plan.Stages[2].DependsOn = []int{1}
+		plan.Stages[3].DependsOn = []int{2}
+	}
 	if err := plan.Validate(); err != nil {
 		return domainexecution.SequentialPlan{}, err
 	}

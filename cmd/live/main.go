@@ -121,6 +121,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		"",
 		"close one manually reconciled operation barrier by exact operation ID",
 	)
+	markReconciled := flags.String(
+		"mark-reconciled-operation",
+		"",
+		"mark one active operation as manually reconciled without broadcasting",
+	)
+	reconciliationNote := flags.String(
+		"reconciliation-note",
+		"",
+		"required audit note for --mark-reconciled-operation",
+	)
 	acknowledgeValidation := flags.String(
 		"acknowledge-blocked-validation", "",
 		"release one exact validation-blocked operation after manual verification",
@@ -168,6 +178,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			stderr,
 			"live: -acknowledge-reconciled-operation cannot be combined with execution flags",
 		)
+		return 2
+	}
+	if strings.TrimSpace(*markReconciled) != "" &&
+		(*arm || *dryRun || *costObserve || *recoverOnly || *once ||
+			strings.TrimSpace(*acknowledgeReconciled) != "" ||
+			strings.TrimSpace(*retryBlockedRecovery) != "" ||
+			strings.TrimSpace(*confirmCanary) != "" ||
+			strings.TrimSpace(*confirmLive) != "" ||
+			strings.TrimSpace(*forceCanaryDirection) != "" ||
+			strings.TrimSpace(*refuelOnce) != "" ||
+			strings.TrimSpace(*reconciliationNote) == "") {
+		fmt.Fprintln(stderr, "live: --mark-reconciled-operation requires --reconciliation-note and cannot be combined with runtime flags")
 		return 2
 	}
 	if strings.TrimSpace(*acknowledgeValidation) != "" {
@@ -281,6 +303,30 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(
 			stdout,
 			"live_reconciliation operation=%s state=%s journal=%s\n",
+			operationID,
+			execution.SequentialReconciledManually,
+			config.OperationalStorePath,
+		)
+		return 0
+	}
+	if operationID := strings.TrimSpace(*markReconciled); operationID != "" {
+		store, openErr := sqlitestore.OpenSequentialLive(config.OperationalStorePath)
+		if openErr != nil {
+			fmt.Fprintf(stderr, "live: open operational journal: %v\n", openErr)
+			return 1
+		}
+		defer store.Close()
+		if markErr := store.MarkSequentialOperationReconciled(
+			ctx,
+			execution.OperationID(operationID),
+			*reconciliationNote,
+		); markErr != nil {
+			fmt.Fprintf(stderr, "live: %v\n", markErr)
+			return 1
+		}
+		fmt.Fprintf(
+			stdout,
+			"live_reconciliation operation=%s state=%s journal=%s broadcast=disabled\n",
 			operationID,
 			execution.SequentialReconciledManually,
 			config.OperationalStorePath,

@@ -480,7 +480,8 @@ func (s *SequentialLiveStore) RecordSequentialResult(
 	result executionport.SequentialResult,
 ) error {
 	if result.Operation == "" || result.FinalAmount.IsZero() ||
-		(len(result.Settlements) != 4 && len(result.Settlements) != 2) ||
+		(len(result.Settlements) != 5 && len(result.Settlements) != 4 &&
+			len(result.Settlements) != 2) ||
 		result.ExecutionCost.Asset() == "" ||
 		result.ExternalCost.Asset() != result.ExecutionCost.Asset() ||
 		result.RealizedGross.Asset() != result.ExecutionCost.Asset() ||
@@ -1114,6 +1115,50 @@ func (s *SequentialLiveStore) AcknowledgeManualReconciliation(
 			"operation %s is not awaiting manual reconciliation or recovery unblock",
 			operationID,
 		)
+	}
+	return nil
+}
+
+// MarkSequentialOperationReconciled closes an active operation after the
+// operator has completed its recovery outside the runtime. It never broadcasts
+// and retains the operator's note as audit evidence.
+func (s *SequentialLiveStore) MarkSequentialOperationReconciled(
+	ctx context.Context,
+	operationID domainexecution.OperationID,
+	note string,
+) error {
+	if strings.TrimSpace(string(operationID)) == "" {
+		return fmt.Errorf("reconciled operation ID is required")
+	}
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return fmt.Errorf("manual reconciliation note is required")
+	}
+	const auditPrefix = "manual reconciliation completed: "
+	result, err := s.db.ExecContext(ctx, `UPDATE sequential_live_operations
+		SET state=?,
+			last_error=CASE
+				WHEN last_error='' THEN ?
+				ELSE last_error || ' | ' || ?
+			END,
+			updated_at=?
+		WHERE operation_id=? AND state IN (?, ?, ?, ?)`,
+		domainexecution.SequentialReconciledManually,
+		auditPrefix+note,
+		auditPrefix+note,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		operationID,
+		domainexecution.SequentialRunning,
+		domainexecution.SequentialRecovering,
+		domainexecution.SequentialRecoveryBlocked,
+		domainexecution.SequentialManualIntervention,
+	)
+	if err != nil {
+		return fmt.Errorf("mark operation reconciled: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return fmt.Errorf("operation %s is not an active operation requiring reconciliation", operationID)
 	}
 	return nil
 }

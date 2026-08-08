@@ -420,8 +420,9 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 					cancelStream()
 					<-streamResult
 					return fmt.Errorf(
-						"operation %s recovery blocked: %w",
+						"operation %s recovery blocked after execution failure %q: %w",
 						event.Operation,
+						event.Err,
 						recoveryErr,
 					)
 				}

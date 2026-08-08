@@ -186,6 +186,16 @@ func (c *SequentialRecoveryCoordinator) resume(
 		outputs[ordinal] = settlement.ActualOutput
 		settled[ordinal] = true
 	}
+	if parallelEconomicLegsSettled(snapshot.Plan, settled) {
+		// Both economic legs are already durable. A stale exit decision from a
+		// sequential recovery path must never replace the two independent
+		// inventory-rebalance bridges or authorize a second sale.
+		stages = append(
+			[]domainexecution.SequentialStagePlan(nil),
+			snapshot.Plan.Stages...,
+		)
+		result.ExitDecision = nil
+	}
 	if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
 		parallelBuyRestoredOnSellChain(snapshot.Plan, snapshot.Settlements) {
 		// The confirmed sale and the compensating ExactIn purchase occurred on
@@ -193,10 +203,9 @@ func (c *SequentialRecoveryCoordinator) resume(
 		// emitting either rebalance bridge would create a new imbalance.
 		settled[3], settled[4] = true, true
 	}
-	if (snapshot.Plan.EffectivePolicy() ==
-		domainexecution.PolicyPrefundedSequential ||
-		snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel) &&
-		settled[1] && snapshot.ExitDecision == nil {
+	if shouldSelectInitialPrefundedExit(
+		snapshot.Plan, settled, snapshot.ExitDecision,
+	) {
 		selected, selectErr := c.selectPrefundedRecoveryExit(
 			ctx, snapshot.Plan, operation.ID, outputs[1], result.Costs, nil,
 		)
@@ -430,6 +439,14 @@ func (c *SequentialRecoveryCoordinator) resume(
 				snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel) &&
 				stage.Ordinal == 2 &&
 				executionport.IsDefinitiveFailure(stageErr) {
+				if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel && settled[2] {
+					blockErr := fmt.Errorf(
+						"%w: refusing duplicate parallel sale after its durable settlement",
+						ErrSequentialRecoveryBlocked,
+					)
+					_ = c.block(context.WithoutCancel(ctx), operation, blockErr)
+					return result, blockErr
+				}
 				selected, selectErr := c.selectPrefundedRecoveryExit(
 					ctx, snapshot.Plan, operation.ID, outputs[1],
 					result.Costs, stageErr,
@@ -571,6 +588,23 @@ func (c *SequentialRecoveryCoordinator) resume(
 		return result, err
 	}
 	return result, nil
+}
+
+func parallelEconomicLegsSettled(
+	plan domainexecution.SequentialPlan,
+	settled map[int]bool,
+) bool {
+	return plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+		settled[1] && settled[2]
+}
+
+func shouldSelectInitialPrefundedExit(
+	plan domainexecution.SequentialPlan,
+	settled map[int]bool,
+	decision *domainexecution.SequentialExitDecision,
+) bool {
+	return plan.EffectivePolicy() == domainexecution.PolicyPrefundedSequential &&
+		settled[1] && decision == nil
 }
 
 func parallelBuyRestoredOnSellChain(
