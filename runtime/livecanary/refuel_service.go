@@ -377,9 +377,54 @@ func (s *RefuelService) execute(
 ) (executionport.RefuelRecord, error) {
 	spend, err := s.refuelSpend(ctx, executor, force)
 	if err != nil || spend.Asset() == "" {
-		return executionport.RefuelRecord{}, err
+		return s.identifyAttempt(
+			executionport.RefuelRecord{},
+			executor.Chain(),
+		), err
 	}
-	return executor.Execute(ctx, spend, s.journal)
+	record, err := executor.Execute(ctx, spend, s.journal)
+	record = s.identifyAttempt(record, executor.Chain())
+	// Only a failure carrying a valid transaction identity (or an explicit
+	// outcome_unknown state) can represent an uncertain broadcast. Generic
+	// pre-broadcast errors must remain known failures even if an implementation
+	// forgot to attach a structured recovery kind.
+	if err != nil &&
+		executionport.RecoveryKind(err) == executionport.RecoveryFailureUncertain &&
+		record.State != executionport.RefuelOutcomeUnknown &&
+		record.Identity.Validate() != nil {
+		err = executionport.NewRecoveryError(
+			executionport.RecoveryFailureTemporary,
+			err,
+		)
+	}
+	return record, err
+}
+
+func (s *RefuelService) identifyAttempt(
+	record executionport.RefuelRecord,
+	chain market.ChainID,
+) executionport.RefuelRecord {
+	now := s.clock().UTC()
+	if record.ID == "" {
+		record.ID = fmt.Sprintf(
+			"refuel-attempt-%s-%d",
+			chain,
+			now.UnixNano(),
+		)
+	}
+	if record.Chain == "" {
+		record.Chain = chain
+	}
+	if record.State == "" {
+		record.State = executionport.RefuelFailed
+	}
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = now
+	}
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = now
+	}
+	return record
 }
 
 func (s *RefuelService) refuelSpend(

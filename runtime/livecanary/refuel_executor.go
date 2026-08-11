@@ -126,13 +126,23 @@ func (e *SwapRefuelExecutor) Execute(
 	}
 	record, prepared, beforeUnits, err := e.prepare(ctx, spend)
 	if err != nil {
-		return record, err
+		// Preparation happens before durable persistence and broadcast. Its
+		// failure is therefore definitive and must never be promoted to an
+		// uncertain on-chain outcome by the generic error classifier.
+		return record, executionport.NewRecoveryError(
+			executionport.RecoveryFailureTemporary,
+			err,
+		)
 	}
 	if err := journal.CreateRefuel(
 		context.WithoutCancel(ctx),
 		record,
 	); err != nil {
-		return record, err
+		// No broadcast is permitted before the prepared record is durable.
+		return record, executionport.NewRecoveryError(
+			executionport.RecoveryFailureTemporary,
+			err,
+		)
 	}
 	broadcast, err := e.config.Binding.TxManager.Broadcast(ctx, prepared)
 	if err != nil || !broadcast.Accepted {
@@ -284,9 +294,38 @@ func (e *SwapRefuelExecutor) prepare(
 			err,
 		)
 	}
-	prepared, err := e.config.Binding.TxManager.Prepare(ctx, artifact)
-	if err != nil {
-		return executionport.RefuelRecord{}, chainport.PreparedTransaction{}, nil, err
+	var prepared chainport.PreparedTransaction
+	compactRebuilds := 0
+	for {
+		artifact.Leg.ExpectedOutput = artifact.ValidatedQuote.AmountOut
+		prepared, err = e.config.Binding.TxManager.Prepare(ctx, artifact)
+		if err == nil {
+			break
+		}
+		var oversized *executionport.ArtifactTooLargeError
+		compact, supportsCompact :=
+			e.config.Binding.Validator.(executionport.CompactValidator)
+		if !errors.As(err, &oversized) ||
+			!supportsCompact || compactRebuilds >= 3 {
+			return executionport.RefuelRecord{},
+				chainport.PreparedTransaction{}, nil, err
+		}
+		validation.RequestedAt = e.config.Clock().UTC()
+		artifact, err = compact.ValidateCompact(
+			ctx,
+			validation,
+			artifact,
+		)
+		if err != nil {
+			return executionport.RefuelRecord{},
+				chainport.PreparedTransaction{}, nil,
+				fmt.Errorf(
+					"compact refuel artifact after %d-byte transaction: %w",
+					oversized.ActualBytes,
+					err,
+				)
+		}
+		compactRebuilds++
 	}
 	simulator := e.config.Binding.TxManager.(chainport.PreparedTransactionSimulator)
 	if err := simulator.SimulatePrepared(ctx, prepared); err != nil {
