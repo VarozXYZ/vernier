@@ -154,6 +154,7 @@ type fakeRefuelExecutor struct {
 	previewCalls int
 	executeCalls int
 	executeErr   error
+	emptyOnError bool
 }
 
 func (e *fakeRefuelExecutor) Chain() market.ChainID { return e.chain }
@@ -177,6 +178,9 @@ func (e *fakeRefuelExecutor) Execute(
 	_ executionport.RefuelJournal,
 ) (executionport.RefuelRecord, error) {
 	e.executeCalls++
+	if e.emptyOnError && e.executeErr != nil {
+		return executionport.RefuelRecord{}, e.executeErr
+	}
 	amount, _ := market.NewTokenAmount("quote", big.NewInt(13_000_000))
 	return executionport.RefuelRecord{
 		ID: "armed", Chain: e.chain, State: executionport.RefuelCompleted,
@@ -280,6 +284,45 @@ func TestUncertainRefuelBlocksGate(t *testing.T) {
 	}
 	if gate.State() != livecanary.RuntimeGateRecoveryBlocked {
 		t.Fatalf("gate state = %s", gate.State())
+	}
+}
+
+func TestPostOperationPreBroadcastRefuelFailureDoesNotStopLive(t *testing.T) {
+	gate := livecanary.NewRuntimeGate()
+	_ = gate.Transition(
+		livecanary.RuntimeGateStarting,
+		livecanary.RuntimeGateIdle,
+	)
+	_ = gate.Transition(
+		livecanary.RuntimeGateIdle,
+		livecanary.RuntimeGateExecuting,
+	)
+	executors := []*fakeRefuelExecutor{
+		newFakeRefuelExecutor(t, "chain-a"),
+		newFakeRefuelExecutor(t, "chain-b"),
+	}
+	executors[0].emptyOnError = true
+	executors[0].executeErr = &executionport.ArtifactTooLargeError{
+		ActualBytes: 1_248, MaximumBytes: 1_232,
+	}
+	aboveThreshold, _ := market.NewAssetQuantity(
+		"usd",
+		big.NewRat(6, 1),
+	)
+	executors[1].balance.QuoteValue = aboveThreshold
+
+	service := newRefuelService(t, gate, executors)
+	if err := service.MaintainAfterOperation(
+		context.Background(),
+		livecanary.RuntimeGateExecuting,
+	); err != nil {
+		t.Fatalf("known pre-broadcast failure stopped Live: %v", err)
+	}
+	if gate.State() != livecanary.RuntimeGateExecuting {
+		t.Fatalf("gate state = %s", gate.State())
+	}
+	if executors[0].executeCalls != 1 {
+		t.Fatalf("refuel executions = %d", executors[0].executeCalls)
 	}
 }
 
