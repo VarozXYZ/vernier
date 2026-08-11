@@ -652,6 +652,13 @@ type balanceRecoveryDriver struct {
 	balances *BalanceManager
 }
 
+var (
+	_ executionport.SequentialStageDriver         = balanceRecoveryDriver{}
+	_ executionport.SequentialRecoveryDriver      = balanceRecoveryDriver{}
+	_ executionport.SequentialParallelBuyRecovery = balanceRecoveryDriver{}
+	_ executionport.SequentialInputConverter      = balanceRecoveryDriver{}
+)
+
 func (d balanceRecoveryDriver) ExecuteStage(
 	ctx context.Context,
 	request execution.SequentialStageRequest,
@@ -674,6 +681,53 @@ func (d balanceRecoveryDriver) RecoverStage(
 	if err != nil {
 		return settlement, err
 	}
+	return d.observeRecoveredSettlement(ctx, settlement, transactions)
+}
+
+// RecoverParallelBuy preserves the specialized recovery capability exposed by
+// SwapDriver. Without this forwarding method, wrapping the buy driver for
+// balance tracking erases SequentialParallelBuyRecovery from its method set and
+// blocks recovery after a confirmed parallel sale and reverted purchase.
+func (d balanceRecoveryDriver) RecoverParallelBuy(
+	ctx context.Context,
+	operation execution.OperationID,
+	plan execution.SequentialPlan,
+	transactions []executionport.SequentialTransactionRecord,
+	journal executionport.SequentialJournal,
+) (execution.SequentialStageSettlement, error) {
+	recovery, ok := d.driver.(executionport.SequentialParallelBuyRecovery)
+	if !ok {
+		return execution.SequentialStageSettlement{},
+			fmt.Errorf("parallel buy recovery driver is unavailable")
+	}
+	settlement, err := recovery.RecoverParallelBuy(
+		ctx, operation, plan, transactions, journal,
+	)
+	if err != nil {
+		return settlement, err
+	}
+	return d.observeRecoveredSettlement(ctx, settlement, transactions)
+}
+
+// ConvertStageInput preserves the setup-neutral, in-memory token conversion
+// capability of wrapped swap drivers. Recovery wrappers must not narrow the
+// method set of the underlying driver.
+func (d balanceRecoveryDriver) ConvertStageInput(
+	stage execution.SequentialStagePlan,
+	source market.TokenAmount,
+) (market.TokenAmount, error) {
+	converter, ok := d.driver.(executionport.SequentialInputConverter)
+	if !ok {
+		return market.TokenAmount{}, fmt.Errorf("recovery input converter is unavailable")
+	}
+	return converter.ConvertStageInput(stage, source)
+}
+
+func (d balanceRecoveryDriver) observeRecoveredSettlement(
+	ctx context.Context,
+	settlement execution.SequentialStageSettlement,
+	transactions []executionport.SequentialTransactionRecord,
+) (execution.SequentialStageSettlement, error) {
 	var balanceErr error
 	if recoveredExistingIdentity(settlement, transactions) {
 		chains := []market.ChainID{settlement.Request.Stage.SourceChain}
