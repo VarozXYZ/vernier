@@ -35,6 +35,7 @@ import (
 type DestinationEvidence struct {
 	Identity string
 	Balance  *big.Int
+	Amount   *big.Int
 	Source   string
 }
 
@@ -42,6 +43,17 @@ type DestinationWatcher interface {
 	Await(context.Context, *big.Int) (DestinationEvidence, error)
 	Balance(context.Context) (*big.Int, error)
 	Close()
+}
+
+// DestinationTransferReader reconstructs a destination credit from a known
+// fill transaction. It is optional because not every chain exposes a cheap,
+// unambiguous token-transfer receipt. Implementations must only return credits
+// for the configured token and recipient.
+type DestinationTransferReader interface {
+	TransferByIdentity(
+		context.Context,
+		string,
+	) (DestinationEvidence, bool, error)
 }
 
 func destinationChainForDirection(
@@ -247,7 +259,6 @@ func resumeArmedWithWatcher(
 	if !ok || minimum.Sign() <= 0 {
 		return fmt.Errorf("persisted operation %s has invalid expected output", operation.ID)
 	}
-	target := new(big.Int).Add(new(big.Int).Set(before), minimum)
 	endpoints, err := config.ResolveEndpoints(requiredEnvLookup)
 	if err != nil {
 		return err
@@ -271,7 +282,8 @@ func resumeArmedWithWatcher(
 	fmt.Fprintf(
 		output,
 		"resume operation=%s source_tx=%s destination=%s balance_before=%s balance_current=%s target=%s\n",
-		operation.ID, operation.SourceIdentity, destinationChain, before, current, target,
+		operation.ID, operation.SourceIdentity, destinationChain, before, current,
+		new(big.Int).Add(new(big.Int).Set(before), minimum),
 	)
 
 	status, statusErr := client.DepositStatus(ctx, operation.SourceIdentity)
@@ -282,7 +294,9 @@ func resumeArmedWithWatcher(
 			_ = store.Mark(ctx, operation.ID, "failed", err)
 			return err
 		case across.DepositFilled:
-			if current.Cmp(target) >= 0 {
+			if current.Cmp(
+				new(big.Int).Add(new(big.Int).Set(before), minimum),
+			) >= 0 {
 				return completeResumedDestination(
 					ctx, output, store, operation.ID, destinationChain,
 					status.FillTransaction, before, current,
@@ -294,7 +308,8 @@ func resumeArmedWithWatcher(
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	evidence, err := AwaitDestinationConfirmation(
-		waitCtx, output, watcher, client, operation.SourceIdentity, target,
+		waitCtx, output, watcher, client, operation.SourceIdentity,
+		before, minimum,
 	)
 	if err != nil {
 		_ = store.Mark(ctx, operation.ID, "outcome_unknown", err)
@@ -468,9 +483,9 @@ func executeArmedWithWatcher(
 
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	targetBalance := new(big.Int).Add(new(big.Int).Set(before), minimumOutput)
 	evidence, err := AwaitDestinationConfirmation(
-		waitCtx, output, watcher, client, sourceIdentity, targetBalance,
+		waitCtx, output, watcher, client, sourceIdentity,
+		before, minimumOutput,
 	)
 	if err != nil {
 		_ = store.Mark(ctx, operationID, "outcome_unknown", err)
@@ -985,6 +1000,14 @@ func (w *evmDestinationWatcher) Await(ctx context.Context, target *big.Int) (Des
 	for {
 		select {
 		case event := <-w.events:
+			amount, amountErr := evmTransferAmount(event, w.token, w.recipient)
+			if amountErr == nil && amount.Sign() > 0 {
+				balance, _ := erc20Balance(ctx, w.http, w.token, w.recipient)
+				return DestinationEvidence{
+					Identity: event.TxHash.Hex(), Balance: balance, Amount: amount,
+					Source: "evm_transfer_websocket",
+				}, nil
+			}
 			balance, err := erc20Balance(ctx, w.http, w.token, w.recipient)
 			if err == nil && balance.Cmp(target) >= 0 {
 				return DestinationEvidence{Identity: event.TxHash.Hex(), Balance: balance, Source: "evm_transfer_websocket"}, nil
@@ -995,6 +1018,60 @@ func (w *evmDestinationWatcher) Await(ctx context.Context, target *big.Int) (Des
 			return DestinationEvidence{}, ctx.Err()
 		}
 	}
+}
+
+func (w *evmDestinationWatcher) TransferByIdentity(
+	ctx context.Context,
+	identity string,
+) (DestinationEvidence, bool, error) {
+	if len(identity) != 66 || !strings.HasPrefix(identity, "0x") {
+		return DestinationEvidence{}, false,
+			fmt.Errorf("destination transaction identity is invalid")
+	}
+	receipt, err := w.http.TransactionReceipt(ctx, common.HexToHash(identity))
+	if err != nil {
+		return DestinationEvidence{}, false, err
+	}
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		return DestinationEvidence{}, false, nil
+	}
+	amount := new(big.Int)
+	for _, event := range receipt.Logs {
+		value, valueErr := evmTransferAmount(*event, w.token, w.recipient)
+		if valueErr == nil {
+			amount.Add(amount, value)
+		}
+	}
+	if amount.Sign() <= 0 {
+		return DestinationEvidence{}, false, nil
+	}
+	balance, err := erc20Balance(ctx, w.http, w.token, w.recipient)
+	if err != nil {
+		return DestinationEvidence{}, false, err
+	}
+	return DestinationEvidence{
+		Identity: identity, Balance: balance, Amount: amount,
+		Source: "evm_transfer_receipt",
+	}, true, nil
+}
+
+func evmTransferAmount(
+	event types.Log,
+	token common.Address,
+	recipient common.Address,
+) (*big.Int, error) {
+	transferTopic := crypto.Keccak256Hash(
+		[]byte("Transfer(address,address,uint256)"),
+	)
+	recipientTopic := common.BytesToHash(
+		common.LeftPadBytes(recipient.Bytes(), 32),
+	)
+	if event.Removed || event.Address != token || len(event.Topics) < 3 ||
+		event.Topics[0] != transferTopic || event.Topics[2] != recipientTopic ||
+		len(event.Data) == 0 || len(event.Data) > 32 {
+		return nil, fmt.Errorf("log is not a matching ERC-20 transfer")
+	}
+	return new(big.Int).SetBytes(event.Data), nil
 }
 
 func (w *evmDestinationWatcher) Close() {
@@ -1090,14 +1167,20 @@ func AwaitDestinationConfirmation(
 		DepositStatus(context.Context, string) (across.Status, error)
 	},
 	source string,
-	target *big.Int,
+	balanceBefore *big.Int,
+	minimumOutput *big.Int,
 ) (DestinationEvidence, error) {
 	if watcher == nil || client == nil || strings.TrimSpace(source) == "" ||
-		target == nil || target.Sign() <= 0 {
+		balanceBefore == nil || balanceBefore.Sign() < 0 ||
+		minimumOutput == nil || minimumOutput.Sign() <= 0 {
 		return DestinationEvidence{}, fmt.Errorf(
 			"destination confirmation input is incomplete",
 		)
 	}
+	target := new(big.Int).Add(
+		new(big.Int).Set(balanceBefore),
+		minimumOutput,
+	)
 	evidenceChannel := make(chan DestinationEvidence, 4)
 	watcherErrors := make(chan error, 1)
 	statusErrors := make(chan error, 1)
@@ -1119,12 +1202,47 @@ func AwaitDestinationConfirmation(
 
 	fillIdentity := ""
 	var balanceEvidence *DestinationEvidence
+	transferEvidence := make(map[string]DestinationEvidence)
+	attributedTransfer := func(
+		evidence DestinationEvidence,
+	) (DestinationEvidence, bool) {
+		if evidence.Amount == nil ||
+			evidence.Amount.Cmp(minimumOutput) < 0 {
+			return DestinationEvidence{}, false
+		}
+		evidence.Balance = new(big.Int).Add(
+			new(big.Int).Set(balanceBefore),
+			evidence.Amount,
+		)
+		return evidence, true
+	}
 	for {
 		select {
 		case evidence := <-evidenceChannel:
 			switch evidence.Source {
 			case "across_status":
 				fillIdentity = evidence.Identity
+				key := strings.ToLower(strings.TrimSpace(fillIdentity))
+				if transfer, exists := transferEvidence[key]; exists {
+					if attributed, ok := attributedTransfer(transfer); ok {
+						attributed.Source += "+across_status"
+						return attributed, nil
+					}
+				}
+				if reader, ok := watcher.(DestinationTransferReader); ok {
+					transfer, found, readErr := reader.TransferByIdentity(
+						ctx,
+						fillIdentity,
+					)
+					if readErr != nil {
+						nonBlockingError(balanceErrors, readErr)
+					} else if found {
+						if attributed, valid := attributedTransfer(transfer); valid {
+							attributed.Source += "+across_status"
+							return attributed, nil
+						}
+					}
+				}
 				current, err := watcher.Balance(ctx)
 				if err != nil {
 					nonBlockingError(balanceErrors, err)
@@ -1149,6 +1267,17 @@ func AwaitDestinationConfirmation(
 					return *balanceEvidence, nil
 				}
 			default:
+				if evidence.Amount != nil && evidence.Identity != "" {
+					key := strings.ToLower(strings.TrimSpace(evidence.Identity))
+					transferEvidence[key] = evidence
+					if fillIdentity != "" &&
+						key == strings.ToLower(strings.TrimSpace(fillIdentity)) {
+						if attributed, ok := attributedTransfer(evidence); ok {
+							attributed.Source += "+across_status"
+							return attributed, nil
+						}
+					}
+				}
 				if evidence.Balance != nil && evidence.Balance.Cmp(target) >= 0 {
 					copy := evidence
 					balanceEvidence = &copy
@@ -1253,7 +1382,6 @@ func pollAcrossStatusReader(
 			}:
 			case <-ctx.Done():
 			}
-			return
 		}
 		if err == nil {
 			lastError = ""
