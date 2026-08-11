@@ -13,9 +13,10 @@ import (
 )
 
 type confirmationTestWatcher struct {
-	balance  *big.Int
-	awaitErr error
-	evidence *acrossbridgecanary.DestinationEvidence
+	balance           *big.Int
+	awaitErr          error
+	evidence          *acrossbridgecanary.DestinationEvidence
+	recoveredEvidence *acrossbridgecanary.DestinationEvidence
 }
 
 func (w *confirmationTestWatcher) Await(
@@ -52,6 +53,7 @@ func TestDestinationBalanceEventCannotConfirmWithoutAcrossFill(t *testing.T) {
 			State: across.DepositPending,
 		}},
 		"source",
+		big.NewInt(0),
 		target,
 	)
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -64,6 +66,16 @@ func (w *confirmationTestWatcher) Balance(context.Context) (*big.Int, error) {
 }
 
 func (*confirmationTestWatcher) Close() {}
+
+func (w *confirmationTestWatcher) TransferByIdentity(
+	_ context.Context,
+	identity string,
+) (acrossbridgecanary.DestinationEvidence, bool, error) {
+	if w.recoveredEvidence == nil || w.recoveredEvidence.Identity != identity {
+		return acrossbridgecanary.DestinationEvidence{}, false, nil
+	}
+	return *w.recoveredEvidence, true, nil
+}
 
 type confirmationTestStatus struct {
 	status across.Status
@@ -95,6 +107,7 @@ func TestAcrossFilledStatusAndBalanceConfirmWhenWebsocketMissesEvent(t *testing.
 			FillTransaction: "0xfill",
 		}},
 		"source",
+		big.NewInt(0),
 		big.NewInt(1_000_000),
 	)
 	if err != nil {
@@ -103,6 +116,46 @@ func TestAcrossFilledStatusAndBalanceConfirmWhenWebsocketMissesEvent(t *testing.
 	if evidence.Identity != "0xfill" ||
 		evidence.Balance.Cmp(big.NewInt(1_000_000)) != 0 ||
 		evidence.Source != "across_status+destination_balance" {
+		t.Fatalf("unexpected evidence: %+v", evidence)
+	}
+}
+
+func TestAcrossFillReceiptConfirmsAttributedTransferDespiteLowerNetBalance(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	before := big.NewInt(1_000_000)
+	minimum := big.NewInt(500_000)
+	actual := big.NewInt(510_000)
+	evidence, err := acrossbridgecanary.AwaitDestinationConfirmation(
+		ctx,
+		&bytes.Buffer{},
+		&confirmationTestWatcher{
+			// A concurrent debit keeps the wallet below before+minimum even
+			// though the correlated destination transfer was successful.
+			balance:  big.NewInt(1_010_000),
+			awaitErr: errors.New("websocket event was already consumed"),
+			recoveredEvidence: &acrossbridgecanary.DestinationEvidence{
+				Identity: "0xfill", Amount: actual,
+				Balance: big.NewInt(1_010_000), Source: "evm_transfer_receipt",
+			},
+		},
+		confirmationTestStatus{status: across.Status{
+			State: across.DepositFilled, FillTransaction: "0xfill",
+		}},
+		"source",
+		before,
+		minimum,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.Amount == nil || evidence.Amount.Cmp(actual) != 0 ||
+		evidence.Balance.Cmp(big.NewInt(1_510_000)) != 0 ||
+		evidence.Source != "evm_transfer_receipt+across_status" {
 		t.Fatalf("unexpected evidence: %+v", evidence)
 	}
 }
