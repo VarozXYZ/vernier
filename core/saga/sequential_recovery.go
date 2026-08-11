@@ -753,7 +753,17 @@ func (c *SequentialRecoveryCoordinator) resolveRecoveryInput(
 		}
 	}
 	var input market.TokenAmount
-	if stage.InputFromOrdinal == 0 && stage.Ordinal > 1 {
+	if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+		stage.Ordinal == 2 && stage.Stage == domainexecution.StageSell {
+		// The parallel sale is an independent prefunded leg. Its immutable
+		// discovery-sized input must not be replaced with the realized output
+		// of the purchase while recovering the opposite leg.
+		var err error
+		input, err = plan.InputFor(stage, outputs)
+		if err != nil {
+			return market.TokenAmount{}, err
+		}
+	} else if stage.InputFromOrdinal == 0 && stage.Ordinal > 1 {
 		input = legacyCurrent
 	} else {
 		var err error
