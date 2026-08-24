@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VarozXYZ/vernier/domain/arbitrage"
+	"github.com/VarozXYZ/vernier/domain/market"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 )
 
@@ -19,6 +21,9 @@ func TestLoadLiveConfigResolvesExecutionPolicy(t *testing.T) {
 	if config.LiveID != "synthetic_live" || config.RunID != "synthetic-run" ||
 		config.BuildToBroadcastTimeout != 250*time.Millisecond || config.EVMDeadline != 20*time.Second {
 		t.Fatalf("unexpected resolved identity or timeouts: %+v", config)
+	}
+	if config.EnvironmentSource != "process_plus_file" {
+		t.Fatalf("default environment source = %q", config.EnvironmentSource)
 	}
 	if config.SQLiteSynchronous != "FULL" || config.ExecutionCost.RatString() != "1/20" ||
 		config.MaximumExecutionCost.RatString() != "1/2" ||
@@ -40,11 +45,70 @@ func TestLoadLiveConfigResolvesExecutionPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadLiveConfigResolvesOptionalDirectionalMinimumsAndPreservesFallback(t *testing.T) {
+	manifest := writeLiveConfig(t, "0.05")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := strings.Replace(string(data),
+		`    min_net_profit: {asset: quote, amount: "0.20"}`,
+		`    min_net_profit: {asset: quote, amount: "0.20"}
+    directional_min_net_profit:
+      - {buy_market: market_a, sell_market: market_b, asset: quote, amount: "1.00"}
+      - {buy_market: market_b, sell_market: market_a, asset: quote, amount: "0.20"}`,
+		1)
+	if updated == string(data) {
+		t.Fatal("test fixture minimum was not found")
+	}
+	if err := os.WriteFile(policyPath, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.MinimumNet.RatString() != "1/5" {
+		t.Fatalf("fallback minimum=%s want=1/5", config.MinimumNet)
+	}
+	direction := arbitrage.Direction{BuyMarket: market.MarketID("market_a"), SellMarket: market.MarketID("market_b")}
+	if got := config.DirectionalMinimumNet[direction]; got == nil || got.RatString() != "1" {
+		t.Fatalf("directional minimum=%v want=1", got)
+	}
+}
+
 func TestLoadLiveConfigRejectsZeroExecutionCost(t *testing.T) {
 	manifest := writeLiveConfig(t, "0")
 	_, err := configuration.LoadLiveConfig(manifest)
 	if err == nil || !strings.Contains(err.Error(), "live execution cost must be positive") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadLiveConfigRejectsStaleCostFallbackOutsideOptInHybridModel(t *testing.T) {
+	manifest := writeLiveConfig(t, "0.05")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	raw, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(
+		string(raw),
+		"    max_execution_cost: {asset: quote, amount: \"0.50\"}\n",
+		"    max_execution_cost: {asset: quote, amount: \"0.50\"}\n"+
+			"    stale_cost_fallback: {asset: quote, amount: \"0.15\"}\n",
+		1,
+	))
+	if err := os.WriteFile(policyPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = configuration.LoadLiveConfig(manifest)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"requires supported all-EVM observed complete-flow costs",
+	) {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -97,6 +161,67 @@ func TestLoadLiveConfigPromotesSequentialExecutionAtDiscoveryNotional(t *testing
 	}
 }
 
+func TestLoadLiveConfigRetainsOptionalForcedInputAlongsideLiveInput(t *testing.T) {
+	manifest := writeSequentialLiveConfig(t, "750")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	raw, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(
+		string(raw),
+		"    execution_input: {asset: quote, amount: \"750\"}\n",
+		"    execution_input: {asset: quote, amount: \"750\"}\n    canary_input: {asset: quote, amount: \"1\"}\n",
+		1,
+	))
+	if err := os.WriteFile(policyPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ExecutionInput.RatString() != "750" || config.CanaryInput.RatString() != "1" {
+		t.Fatalf("live input=%v forced input=%v", config.ExecutionInput, config.CanaryInput)
+	}
+}
+
+func TestLoadLiveConfigResolvesDiscreteExecutionInputs(t *testing.T) {
+	manifest := writeSequentialLiveConfig(t, "750")
+	policyPath := filepath.Join(filepath.Dir(manifest), "policy.yaml")
+	raw, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := strings.Replace(string(raw),
+		`    notional: {asset: quote, amount: "750"}
+    execution_input: {asset: quote, amount: "750"}`,
+		`    notional: {asset: quote, amount: "1000"}
+    execution_inputs:
+      - {asset: quote, amount: "250"}
+      - {asset: quote, amount: "500"}
+      - {asset: quote, amount: "750"}
+      - {asset: quote, amount: "1000"}`, 1)
+	if updated == string(raw) {
+		t.Fatal("sequential sizing fixture was not found")
+	}
+	if err := os.WriteFile(policyPath, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := configuration.LoadLiveConfig(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ExecutionInput.RatString() != "1000" || len(config.ExecutionInputs) != 4 {
+		t.Fatalf("unexpected execution grid: max=%v values=%v", config.ExecutionInput, config.ExecutionInputs)
+	}
+	for index, want := range []string{"250", "500", "750", "1000"} {
+		if got := config.ExecutionInputs[index].RatString(); got != want {
+			t.Fatalf("execution input[%d]=%s want=%s", index, got, want)
+		}
+	}
+}
+
 func TestSchemaV2ActiveLiveSelectsCompiledPolicyAndInventoryProfile(t *testing.T) {
 	manifest := writeSequentialLiveConfig(t, "750")
 	directory := filepath.Dir(manifest)
@@ -125,6 +250,7 @@ inventory_profiles:
       - {chain: chain_b, token: quote_b, allocation_cap: "1000", target: "800", buffer: "10"}
   dual_prefunded:
     kind: prefunded
+    capacity_mode: confirmed_balance
     balances:
       - {chain: chain_a, token: base_a, allocation_cap: "1000", target: "800", buffer: "10"}
       - {chain: chain_a, token: quote_a, allocation_cap: "1000", target: "800", buffer: "10"}
@@ -177,12 +303,13 @@ live:
 	}
 	if transported.ExecutionPolicyKind != "transported_sequential" ||
 		transported.InventoryKind != "transported" ||
-		len(transported.Inventory) != 2 {
+		len(transported.Inventory) != 2 || transported.CostModel != "" {
 		t.Fatalf("unexpected transported profile: %+v", transported)
 	}
 	if prefunded.ExecutionPolicyKind != "prefunded_sequential" ||
 		prefunded.InventoryKind != "prefunded" ||
-		len(prefunded.Inventory) != 4 {
+		prefunded.InventoryCapacityMode != "confirmed_balance" ||
+		len(prefunded.Inventory) != 4 || prefunded.CostModel != "" {
 		t.Fatalf("unexpected prefunded profile: %+v", prefunded)
 	}
 }

@@ -182,6 +182,7 @@ func (s *LiveService) transfer(
 		},
 		NativeAssets:     s.config.NativeAssets,
 		NonceCoordinator: s.config.NonceCoordinator,
+		SourcePhase:      acrossSourcePhase(operationID),
 	}
 	err = executeArmedWithWatcher(
 		ctx, s.config.Output, s.config.Configuration, s.config.Client,
@@ -289,7 +290,7 @@ func (s *LiveService) RecoverTransfer(
 	var source *executionport.SequentialTransactionRecord
 	for index := range transactions {
 		record := &transactions[index]
-		if record.Phase != "across_source" {
+		if !strings.HasPrefix(record.Phase, "across_source") {
 			continue
 		}
 		if source == nil || record.PreparedAt.After(source.PreparedAt) {
@@ -298,7 +299,7 @@ func (s *LiveService) RecoverTransfer(
 	}
 	if source == nil || source.Status == "rejected" {
 		operationID := acrossLiveOperationID(request)
-		if source == nil {
+		if source == nil || source.Status == "rejected" {
 			// The deterministic first attempt may have persisted only its
 			// inner "created" row. No outer prepared identity means it is
 			// safe to create a fresh source attempt under a distinct audit ID.
@@ -356,6 +357,21 @@ func (s *LiveService) RecoverTransfer(
 		s.config.Timeout,
 		watcher,
 	); err != nil {
+		var rejected *solanaSourceRejectedError
+		if errors.As(err, &rejected) {
+			if markErr := journal.MarkTransaction(
+				context.WithoutCancel(ctx), request.Operation,
+				request.Stage.Ordinal, source.Phase, "rejected",
+			); markErr != nil {
+				return crosschainport.LiveTransferResult{}, markErr
+			}
+			return s.transfer(
+				ctx, request, journal,
+				acrossLiveOperationID(request)+fmt.Sprintf(
+					"-recovery-%d", time.Now().UTC().UnixNano(),
+				),
+			)
+		}
 		return crosschainport.LiveTransferResult{},
 			executionport.NewRecoveryError(
 				executionport.RecoveryFailureUncertain,
@@ -404,6 +420,19 @@ func (s *LiveService) RecoverTransfer(
 		ObservedAt:               time.Now().UTC(),
 		Evidence:                 "across_durable_destination_reconciliation",
 	}, nil
+}
+
+func acrossSourcePhase(operationID string) string {
+	const recovery = "-recovery-"
+	index := strings.LastIndex(operationID, recovery)
+	if index < 0 {
+		return "across_source"
+	}
+	suffix := strings.TrimSpace(operationID[index+len(recovery):])
+	if suffix == "" {
+		return "across_source_recovery"
+	}
+	return "across_source_recovery_" + suffix
 }
 
 func acrossLiveOperationID(

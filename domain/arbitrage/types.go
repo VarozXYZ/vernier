@@ -81,10 +81,16 @@ type Evaluation struct {
 	snapshots   []market.MarketSnapshot
 	cost        CostSnapshot
 	costs       map[Direction]CostSnapshot
+	conversions map[conversionPair]market.QuoteConversionSnapshot
 	trigger     TriggerMetadata
 	hasTrigger  bool
 	triggeredAt time.Time
 	startedAt   time.Time
+}
+
+type conversionPair struct {
+	input  market.TokenID
+	output market.TokenID
 }
 
 func NewEvaluation(id EvaluationID, run ResearchRunID, strategy StrategyID, configHash string, snapshots []market.MarketSnapshot, cost CostSnapshot, triggeredAt, startedAt time.Time) (Evaluation, error) {
@@ -143,7 +149,8 @@ func (e Evaluation) WithTrigger(trigger TriggerMetadata) Evaluation {
 	trigger.At = trigger.At.UTC()
 	return Evaluation{id: e.id, run: e.run, strategy: e.strategy, configHash: e.configHash,
 		snapshots: append([]market.MarketSnapshot(nil), e.snapshots...), cost: e.cost, costs: cloneCosts(e.costs),
-		trigger: trigger, hasTrigger: true, triggeredAt: e.triggeredAt, startedAt: e.startedAt}
+		conversions: cloneConversions(e.conversions),
+		trigger:     trigger, hasTrigger: true, triggeredAt: e.triggeredAt, startedAt: e.startedAt}
 }
 
 // WithDirectionalCosts returns an immutable evaluation copy with one cost for
@@ -190,6 +197,45 @@ func (e Evaluation) Snapshot(id market.MarketID) (market.MarketSnapshot, bool) {
 	return market.MarketSnapshot{}, false
 }
 
+// WithQuoteConversions fixes immutable FX observations for the complete
+// evaluation. Conversion is economic normalization, not a cost component.
+func (e Evaluation) WithQuoteConversions(snapshots []market.QuoteConversionSnapshot) (Evaluation, error) {
+	if len(snapshots) == 0 {
+		return e, nil
+	}
+	conversions := make(map[conversionPair]market.QuoteConversionSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		if !snapshot.ValidAt(e.startedAt) {
+			return Evaluation{}, fmt.Errorf("quote conversion snapshot is stale or invalid")
+		}
+		pair := conversionPair{input: snapshot.Input.Token(), output: snapshot.Output.Token()}
+		if _, duplicate := conversions[pair]; duplicate {
+			return Evaluation{}, fmt.Errorf("duplicate quote conversion %s -> %s", pair.input, pair.output)
+		}
+		conversions[pair] = snapshot
+	}
+	e.snapshots = append([]market.MarketSnapshot(nil), e.snapshots...)
+	e.costs = cloneCosts(e.costs)
+	e.conversions = conversions
+	return e, nil
+}
+
+func (e Evaluation) QuoteConversion(input, output market.TokenID) (market.QuoteConversionSnapshot, bool) {
+	snapshot, ok := e.conversions[conversionPair{input: input, output: output}]
+	return snapshot, ok
+}
+
+func cloneConversions(source map[conversionPair]market.QuoteConversionSnapshot) map[conversionPair]market.QuoteConversionSnapshot {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[conversionPair]market.QuoteConversionSnapshot, len(source))
+	for pair, snapshot := range source {
+		result[pair] = snapshot
+	}
+	return result
+}
+
 type Classification string
 
 const (
@@ -214,6 +260,12 @@ type Candidate struct {
 	EffectiveThreshold  market.AssetQuantity
 	BuyQuote            market.Quote
 	SellQuote           market.Quote
+	// Valuation is present for prefunded candidates whose independently fixed
+	// base input must be revalued later without consulting a new price source.
+	Valuation *ValuationSnapshot
+	// QuoteConversion is fixed when the two markets use different quote
+	// tokens for the same economic asset.
+	QuoteConversion *market.QuoteConversionSnapshot
 }
 
 type Opportunity struct {

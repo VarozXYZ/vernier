@@ -20,6 +20,14 @@ type SequentialRecoveryObserver interface {
 	RecoveryBlocked(domainexecution.SequentialOperation, error)
 }
 
+type sequentialRecoveryAbortedObserver interface {
+	RecoveryAborted(
+		domainexecution.SequentialOperation,
+		executionport.SequentialResult,
+		error,
+	)
+}
+
 type SequentialRecoveryConfig struct {
 	Journal          executionport.SequentialJournal
 	RecoveryJournal  executionport.SequentialRecoveryJournal
@@ -149,6 +157,12 @@ func (c *SequentialRecoveryCoordinator) RecoverActive(
 	if err != nil {
 		return result, true, err
 	}
+	if result.TerminalState == domainexecution.SequentialAborted {
+		if observer, ok := c.config.Observer.(sequentialRecoveryAbortedObserver); ok {
+			observer.RecoveryAborted(active, result, errors.New(result.TerminalError))
+		}
+		return result, true, nil
+	}
 	if c.config.Observer != nil {
 		c.config.Observer.RecoveryCompleted(result)
 	}
@@ -196,7 +210,7 @@ func (c *SequentialRecoveryCoordinator) resume(
 		)
 		result.ExitDecision = nil
 	}
-	if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+	if snapshot.Plan.IsPrefundedDualInventory() &&
 		parallelBuyRestoredOnSellChain(snapshot.Plan, snapshot.Settlements) {
 		// The confirmed sale and the compensating ExactIn purchase occurred on
 		// the same chain. Quote and base inventory are already restored there;
@@ -206,9 +220,12 @@ func (c *SequentialRecoveryCoordinator) resume(
 	if shouldSelectInitialPrefundedExit(
 		snapshot.Plan, settled, snapshot.ExitDecision,
 	) {
-		selected, selectErr := c.selectPrefundedRecoveryExit(
-			ctx, snapshot.Plan, operation.ID, outputs[1], result.Costs, nil,
-		)
+		var cause error
+		if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedTriggerFirst {
+			cause = fmt.Errorf("trigger-first second leg failed before recovery selection")
+		}
+		selected, selectErr := c.selectPrefundedRecoveryExit(ctx, snapshot.Plan,
+			operation.ID, outputs[1], result.Costs, cause)
 		if selectErr != nil {
 			_ = c.block(context.WithoutCancel(ctx), operation, selectErr)
 			return result, selectErr
@@ -300,9 +317,15 @@ func (c *SequentialRecoveryCoordinator) resume(
 				return result, sleepErr
 			}
 		}
-		if stage.Ordinal == 1 && snapshot.Plan.EffectivePolicy() ==
-			domainexecution.PolicyPrefundedParallel && settled[2] &&
+		if stage.Ordinal == 1 && snapshot.Plan.IsPrefundedDualInventory() && settled[2] &&
 			allTransactionsDefinitiveOrAbsent(transactions) {
+			if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedTriggerFirst &&
+				definitiveTransactionCount(transactions) >= 2 {
+				blockErr := fmt.Errorf("%w: selected trigger-first buy recovery reverted; manual intervention is required",
+					ErrSequentialRecoveryBlocked)
+				_ = c.block(context.WithoutCancel(ctx), operation, blockErr)
+				return result, blockErr
+			}
 			recovery, ok := c.config.Drivers.Buy.(executionport.SequentialParallelBuyRecovery)
 			if !ok {
 				blockErr := fmt.Errorf("parallel buy recovery selector is unavailable")
@@ -339,14 +362,17 @@ func (c *SequentialRecoveryCoordinator) resume(
 		}
 		if stage.Ordinal == 1 &&
 			allTransactionsDefinitiveOrAbsent(transactions) {
+			abortErr := fmt.Errorf("initial purchase had no confirmed economic effect")
 			if err := c.config.Journal.FinishSequentialOperation(
 				context.WithoutCancel(ctx),
 				operation.ID,
 				domainexecution.SequentialAborted,
-				fmt.Errorf("initial purchase had no confirmed economic effect"),
+				abortErr,
 			); err != nil {
 				return result, err
 			}
+			result.TerminalState = domainexecution.SequentialAborted
+			result.TerminalError = abortErr.Error()
 			return result, nil
 		}
 		driver, _ := c.config.Drivers.Driver(stage.Stage)
@@ -358,6 +384,11 @@ func (c *SequentialRecoveryCoordinator) resume(
 			c.config.Journal,
 		)
 		if stageErr != nil {
+			// Process shutdown is not an economic or reconciliation failure. Keep
+			// the durable operation recoverable so the next process can resume it.
+			if errors.Is(stageErr, context.Canceled) {
+				return result, stageErr
+			}
 			failureCosts := executionport.ErrorCosts(stageErr)
 			if len(failureCosts) > 0 {
 				failureJournal, ok :=
@@ -382,6 +413,13 @@ func (c *SequentialRecoveryCoordinator) resume(
 				result.Costs = append(result.Costs, failureCosts...)
 			}
 			kind := executionport.RecoveryKind(stageErr)
+			if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedTriggerFirst &&
+				result.ExitDecision != nil && executionport.IsDefinitiveFailure(stageErr) {
+				blockErr := fmt.Errorf("%w: selected trigger-first recovery exit reverted; manual intervention is required: %v",
+					ErrSequentialRecoveryBlocked, stageErr)
+				_ = c.block(context.WithoutCancel(ctx), operation, blockErr)
+				return result, blockErr
+			}
 			if kind == executionport.RecoveryFailureInsufficientNative &&
 				c.emergencyRefuel != nil {
 				if refuelErr := c.emergencyRefuel(
@@ -436,10 +474,10 @@ func (c *SequentialRecoveryCoordinator) resume(
 			}
 			if (snapshot.Plan.EffectivePolicy() ==
 				domainexecution.PolicyPrefundedSequential ||
-				snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel) &&
+				snapshot.Plan.IsPrefundedDualInventory()) &&
 				stage.Ordinal == 2 &&
 				executionport.IsDefinitiveFailure(stageErr) {
-				if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel && settled[2] {
+				if snapshot.Plan.IsPrefundedDualInventory() && settled[2] {
 					blockErr := fmt.Errorf(
 						"%w: refusing duplicate parallel sale after its durable settlement",
 						ErrSequentialRecoveryBlocked,
@@ -562,7 +600,7 @@ func (c *SequentialRecoveryCoordinator) resume(
 	}
 	result.FinalAmount = current
 	var economicsErr error
-	if snapshot.Plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel {
+	if snapshot.Plan.IsPrefundedDualInventory() {
 		economicsErr = calculateParallelEconomics(snapshot.Plan, &result)
 	} else {
 		economicsErr = calculateSequentialEconomics(snapshot.Plan, &result)
@@ -590,11 +628,21 @@ func (c *SequentialRecoveryCoordinator) resume(
 	return result, nil
 }
 
+func definitiveTransactionCount(records []executionport.SequentialTransactionRecord) int {
+	count := 0
+	for _, record := range records {
+		if record.Status == "confirmed_revert" || record.Status == "rejected" {
+			count++
+		}
+	}
+	return count
+}
+
 func parallelEconomicLegsSettled(
 	plan domainexecution.SequentialPlan,
 	settled map[int]bool,
 ) bool {
-	return plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+	return plan.IsPrefundedDualInventory() &&
 		settled[1] && settled[2]
 }
 
@@ -603,8 +651,9 @@ func shouldSelectInitialPrefundedExit(
 	settled map[int]bool,
 	decision *domainexecution.SequentialExitDecision,
 ) bool {
-	return plan.EffectivePolicy() == domainexecution.PolicyPrefundedSequential &&
-		settled[1] && decision == nil
+	return (plan.EffectivePolicy() == domainexecution.PolicyPrefundedSequential ||
+		plan.EffectivePolicy() == domainexecution.PolicyPrefundedTriggerFirst) &&
+		settled[1] && !settled[2] && decision == nil
 }
 
 func parallelBuyRestoredOnSellChain(
@@ -753,7 +802,7 @@ func (c *SequentialRecoveryCoordinator) resolveRecoveryInput(
 		}
 	}
 	var input market.TokenAmount
-	if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+	if plan.IsPrefundedDualInventory() &&
 		stage.Ordinal == 2 && stage.Stage == domainexecution.StageSell {
 		// The parallel sale is an independent prefunded leg. Its immutable
 		// discovery-sized input must not be replaced with the realized output
@@ -794,6 +843,9 @@ func (c *SequentialRecoveryCoordinator) block(
 	operation domainexecution.SequentialOperation,
 	cause error,
 ) error {
+	if errors.Is(cause, context.Canceled) {
+		return nil
+	}
 	err := c.config.RecoveryJournal.SetSequentialRecoveryState(
 		ctx,
 		operation.ID,

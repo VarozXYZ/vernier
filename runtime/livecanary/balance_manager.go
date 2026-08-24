@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/inventory"
 	"github.com/VarozXYZ/vernier/domain/market"
@@ -22,22 +23,26 @@ import (
 const (
 	defaultBalanceReconcileInterval = time.Minute
 	defaultBalanceAlertInterval     = 5 * time.Minute
+	defaultBalanceReadTimeout       = 10 * time.Second
 )
 
 type PhysicalBalanceReader func(context.Context) (*big.Int, error)
 
 type BalanceManagerConfig struct {
-	Balances      []configuration.ResolvedInventoryBalance
-	Readers       map[inventory.Key]PhysicalBalanceReader
-	NativeTokens  map[market.ChainID]market.Token
-	Accounts      map[market.ChainID]execution.AccountID
-	Gate          *RuntimeGate
-	Notifier      *LiveNotifier
-	Logger        *slog.Logger
-	Output        io.Writer
-	PollInterval  time.Duration
-	AlertInterval time.Duration
-	Clock         func() time.Time
+	Balances                    []configuration.ResolvedInventoryBalance
+	Readers                     map[inventory.Key]PhysicalBalanceReader
+	NativeTokens                map[market.ChainID]market.Token
+	Accounts                    map[market.ChainID]execution.AccountID
+	MarketChains                map[market.MarketID]market.ChainID
+	UseConfirmedBalanceCapacity bool
+	Gate                        *RuntimeGate
+	Notifier                    *LiveNotifier
+	Logger                      *slog.Logger
+	Output                      io.Writer
+	PollInterval                time.Duration
+	AlertInterval               time.Duration
+	ReadTimeout                 time.Duration
+	Clock                       func() time.Time
 }
 
 type balanceShortage struct {
@@ -93,6 +98,9 @@ func NewBalanceManager(config BalanceManagerConfig) (*BalanceManager, error) {
 	if config.AlertInterval <= 0 {
 		config.AlertInterval = defaultBalanceAlertInterval
 	}
+	if config.ReadTimeout <= 0 {
+		config.ReadTimeout = defaultBalanceReadTimeout
+	}
 	if config.Clock == nil {
 		config.Clock = time.Now
 	}
@@ -122,7 +130,9 @@ func (m *BalanceManager) Warm(ctx context.Context) error {
 		targetUnits := amount.Units()
 		bufferUnits := new(big.Int)
 		if balance, ok := configured[key]; ok {
-			capUnits = ratToUnits(balance.AllocationCap, balance.Token.Decimals)
+			if !m.config.UseConfirmedBalanceCapacity {
+				capUnits = ratToUnits(balance.AllocationCap, balance.Token.Decimals)
+			}
 			targetUnits = ratToUnits(balance.Target, balance.Token.Decimals)
 			bufferUnits = ratToUnits(balance.Buffer, balance.Token.Decimals)
 		}
@@ -150,6 +160,25 @@ func (m *BalanceManager) Warm(ctx context.Context) error {
 	return nil
 }
 
+// CandidateEligible checks both independently prefunded inputs against the
+// current in-memory spendable projection. It performs no RPC reads.
+func (m *BalanceManager) CandidateEligible(direction arbitrage.Direction, candidate arbitrage.Candidate) bool {
+	if m == nil || candidate.BuyQuote.AmountIn.IsZero() || candidate.SellQuote.AmountIn.IsZero() {
+		return false
+	}
+	buyChain, buyOK := m.config.MarketChains[direction.BuyMarket]
+	sellChain, sellOK := m.config.MarketChains[direction.SellMarket]
+	if !buyOK || !sellOK {
+		return false
+	}
+	buyAvailable, err := m.Available(buyChain, candidate.BuyQuote.AmountIn.Token())
+	if err != nil || buyAvailable.Cmp(candidate.BuyQuote.AmountIn.Units()) < 0 {
+		return false
+	}
+	sellAvailable, err := m.Available(sellChain, candidate.SellQuote.AmountIn.Token())
+	return err == nil && sellAvailable.Cmp(candidate.SellQuote.AmountIn.Units()) >= 0
+}
+
 func (m *BalanceManager) readAll(ctx context.Context) (map[inventory.Key]market.TokenAmount, error) {
 	type result struct {
 		key   inventory.Key
@@ -160,7 +189,9 @@ func (m *BalanceManager) readAll(ctx context.Context) (map[inventory.Key]market.
 	for key, reader := range m.config.Readers {
 		key, reader := key, reader
 		go func() {
-			units, err := reader(ctx)
+			readCtx, cancel := context.WithTimeout(ctx, m.config.ReadTimeout)
+			defer cancel()
+			units, err := reader(readCtx)
 			results <- result{key: key, units: units, err: err}
 		}()
 	}
@@ -256,7 +287,7 @@ func (m *BalanceManager) planRequirements(plan execution.SequentialPlan) ([]inve
 	}
 	result := []inventory.Requirement{{Key: buyKey, Amount: plan.InitialInput}}
 	if plan.EffectivePolicy() != execution.PolicyPrefundedSequential &&
-		plan.EffectivePolicy() != execution.PolicyPrefundedParallel {
+		!plan.IsPrefundedDualInventory() {
 		return result, nil
 	}
 	if len(plan.Stages) < 2 {
@@ -270,7 +301,7 @@ func (m *BalanceManager) planRequirements(plan execution.SequentialPlan) ([]inve
 		return nil, fmt.Errorf("balance admission buy quote is incomplete")
 	}
 	discoveryBase := candidate.BuyQuote.AmountOut
-	if plan.EffectivePolicy() == execution.PolicyPrefundedParallel {
+	if plan.IsPrefundedDualInventory() {
 		if candidate.SellQuote.AmountIn.IsZero() {
 			return nil, fmt.Errorf("balance admission sell quote is incomplete")
 		}
@@ -493,6 +524,7 @@ func (m *BalanceManager) ReconcileChains(
 	ctx context.Context,
 	chains ...market.ChainID,
 ) error {
+	const readTimeout = 10 * time.Second
 	wanted := make(map[market.ChainID]struct{}, len(chains))
 	for _, chain := range chains {
 		wanted[chain] = struct{}{}
@@ -507,7 +539,9 @@ func (m *BalanceManager) ReconcileChains(
 		if _, ok := wanted[key.Chain]; !ok {
 			continue
 		}
-		units, err := reader(ctx)
+		readCtx, cancel := context.WithTimeout(ctx, readTimeout)
+		units, err := reader(readCtx)
+		cancel()
 		if err != nil {
 			return fmt.Errorf("reconcile %s/%s: %w", key.Chain, key.Token, err)
 		}

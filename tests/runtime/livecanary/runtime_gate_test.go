@@ -117,6 +117,28 @@ func TestRuntimeGateAllowsPostExecutionRefuelWithoutOpeningIdleWindow(t *testing
 	}
 }
 
+func TestRuntimeGateCoalescesWhileRestorationCapacityIsBlocked(t *testing.T) {
+	gate := livecanary.NewRuntimeGate()
+	if err := gate.Transition(livecanary.RuntimeGateStarting, livecanary.RuntimeGateIdle); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Transition(livecanary.RuntimeGateIdle, livecanary.RuntimeGateExecuting); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Transition(livecanary.RuntimeGateExecuting, livecanary.RuntimeGateCapacityBlocked); err != nil {
+		t.Fatal(err)
+	}
+	if gate.EvaluationAllowed() {
+		t.Fatal("capacity-blocked gate allowed a stale economic evaluation")
+	}
+	if err := gate.Transition(livecanary.RuntimeGateCapacityBlocked, livecanary.RuntimeGateIdle); err != nil {
+		t.Fatal(err)
+	}
+	if !gate.EvaluationAllowed() {
+		t.Fatal("released restoration capacity did not reopen evaluation")
+	}
+}
+
 func TestRuntimeGateConcurrentLeaseHasSingleWinner(t *testing.T) {
 	gate := livecanary.NewRuntimeGate()
 	if err := gate.Transition(

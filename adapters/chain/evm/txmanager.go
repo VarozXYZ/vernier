@@ -171,6 +171,32 @@ func (m *TxManager) MarkNonceUsed(nonce uint64) {
 	m.nonce = nonce + 1
 }
 
+// ResyncNonce refreshes the pending nonce after a deterministic all-fanout
+// nonce_too_low rejection. The coordinator remains monotonic so a lagging RPC
+// can never make a future transaction reuse an in-process nonce.
+func (m *TxManager) ResyncNonce(ctx context.Context, rejectedNonce uint64) (uint64, error) {
+	pending, err := m.primary.PendingNonceAt(ctx, m.address)
+	if err != nil {
+		return 0, fmt.Errorf("refresh EVM pending nonce: %w", err)
+	}
+	if pending <= rejectedNonce {
+		return 0, fmt.Errorf(
+			"refreshed EVM pending nonce %d has not advanced beyond rejected nonce %d",
+			pending,
+			rejectedNonce,
+		)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.warmed {
+		return 0, fmt.Errorf("EVM nonce coordinator is not warmed")
+	}
+	if pending > m.nonce {
+		m.nonce = pending
+	}
+	return m.nonce, nil
+}
+
 // Warm preloads nonce and fee inputs so Prepare performs no network calls.
 func (m *TxManager) Warm(ctx context.Context) error {
 	chainID, err := m.primary.ChainID(ctx)
@@ -489,6 +515,7 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 		}()
 	}
 	var failures []error
+	allNonceTooLow := true
 	for attempt := 1; attempt <= len(m.fanout); attempt++ {
 		result := <-results
 		if result.err == nil || isKnownTransaction(result.err) {
@@ -499,11 +526,24 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 				Attempts: attempt, AcceptedAt: m.clock().UTC(),
 			}, nil
 		}
+		class := fanoutErrorClass(result.err)
+		if class != "nonce_too_low" {
+			allNonceTooLow = false
+		}
 		failures = append(failures, fanoutFailure{
 			endpoint: result.name,
-			class:    fanoutErrorClass(result.err),
+			class:    class,
 			cause:    result.err,
 		})
+	}
+	joined := errors.Join(failures...)
+	if allNonceTooLow && len(failures) == len(m.fanout) {
+		return chainport.BroadcastResult{
+				Identity: prepared.Identity, Disposition: chainport.BroadcastRejected,
+				Attempts: len(m.fanout),
+			}, &chainport.AllFanoutNonceTooLowError{
+				Nonce: transaction.Nonce(), Attempts: len(m.fanout), Err: joined,
+			}
 	}
 	disposition := chainport.BroadcastRejected
 	for _, failure := range failures {
@@ -517,7 +557,42 @@ func (m *TxManager) Broadcast(ctx context.Context, prepared chainport.PreparedTr
 	}
 	return chainport.BroadcastResult{
 		Identity: prepared.Identity, Disposition: disposition, Attempts: len(m.fanout),
-	}, errors.Join(failures...)
+	}, joined
+}
+
+// BroadcastPrimary sends exactly once through the configured primary RPC.
+// It deliberately emits no fanout telemetry because no fanout endpoint is
+// involved. Unknown transport outcomes still consume the nonce and require
+// reconciliation before any retry.
+func (m *TxManager) BroadcastPrimary(
+	ctx context.Context,
+	prepared chainport.PreparedTransaction,
+) (chainport.BroadcastResult, error) {
+	if prepared.Leg.Account != m.account || len(prepared.SignedPayload) == 0 {
+		return chainport.BroadcastResult{}, fmt.Errorf("EVM prepared transaction is invalid")
+	}
+	var transaction types.Transaction
+	if err := transaction.UnmarshalBinary(prepared.SignedPayload); err != nil {
+		return chainport.BroadcastResult{}, err
+	}
+	sendErr := m.primary.SendTransaction(ctx, &transaction)
+	if sendErr == nil || isKnownTransaction(sendErr) {
+		m.MarkNonceUsed(transaction.Nonce())
+		return chainport.BroadcastResult{
+			Identity: prepared.Identity, Disposition: chainport.BroadcastAccepted,
+			Accepted: true, Endpoint: "primary", Attempts: 1,
+			AcceptedAt: m.clock().UTC(),
+		}, nil
+	}
+	disposition := chainport.BroadcastRejected
+	if broadcastMayHaveSucceeded(sendErr) {
+		disposition = chainport.BroadcastPossible
+		m.MarkNonceUsed(transaction.Nonce())
+	}
+	return chainport.BroadcastResult{
+		Identity: prepared.Identity, Disposition: disposition,
+		Endpoint: "primary", Attempts: 1,
+	}, sendErr
 }
 
 func (m *TxManager) Reconcile(ctx context.Context, step execution.OperationStep) (execution.Settlement, error) {
@@ -607,6 +682,59 @@ func (m *TxManager) Reconcile(ctx context.Context, step execution.OperationStep)
 	}, nil
 }
 
+func (m *TxManager) ReconcileReceiptStatus(
+	ctx context.Context,
+	identity execution.TransactionIdentity,
+) (execution.TechnicalState, error) {
+	if identity.Chain != m.chain || identity.Account != m.account ||
+		!common.IsHexHash(identity.Hash) {
+		return execution.StateOutcomeUnknown, fmt.Errorf("EVM receipt identity is invalid")
+	}
+	hash := common.HexToHash(identity.Hash)
+	type receiptResult struct {
+		name    string
+		receipt *types.Receipt
+		err     error
+	}
+	results := make(chan receiptResult, len(m.fanout))
+	lookupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for name, client := range m.fanout {
+		name, client := name, client
+		go func() {
+			receiptCtx, receiptCancel := context.WithTimeout(lookupCtx, m.fanoutRequestTimeout)
+			defer receiptCancel()
+			receipt, err := client.TransactionReceipt(receiptCtx, hash)
+			results <- receiptResult{name: name, receipt: receipt, err: err}
+		}()
+	}
+	var unavailable []error
+	notFound := 0
+	for range m.fanout {
+		result := <-results
+		if errors.Is(result.err, geth.NotFound) ||
+			result.err == nil && result.receipt == nil {
+			notFound++
+			continue
+		}
+		if result.err != nil {
+			unavailable = append(unavailable, fanoutFailure{
+				endpoint: result.name, class: fanoutErrorClass(result.err), cause: result.err,
+			})
+			continue
+		}
+		cancel()
+		if result.receipt.Status == types.ReceiptStatusSuccessful {
+			return execution.StateConfirmedSuccess, nil
+		}
+		return execution.StateConfirmedRevert, nil
+	}
+	if len(unavailable) == len(m.fanout) || notFound == 0 && len(unavailable) > 0 {
+		return execution.StateOutcomeUnknown, errors.Join(unavailable...)
+	}
+	return execution.StateOutcomeUnknown, nil
+}
+
 func fanoutErrorClass(err error) string {
 	if err == nil {
 		return "accepted"
@@ -668,5 +796,8 @@ func broadcastMayHaveSucceeded(err error) bool {
 }
 
 var _ chainport.TxManager = (*TxManager)(nil)
+var _ chainport.PrimaryBroadcaster = (*TxManager)(nil)
+var _ chainport.ReceiptStatusReconciler = (*TxManager)(nil)
 var _ chainport.EVMNonceCoordinator = (*TxManager)(nil)
+var _ chainport.EVMNonceResynchronizer = (*TxManager)(nil)
 var _ chainport.PreparedTransactionSimulator = (*TxManager)(nil)

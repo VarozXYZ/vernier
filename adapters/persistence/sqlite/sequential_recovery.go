@@ -14,6 +14,7 @@ import (
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
+	"github.com/VarozXYZ/vernier/internal/safeerr"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 )
 
@@ -183,7 +184,7 @@ func (s *SequentialLiveStore) SetSequentialRecoveryState(
 	}
 	message := ""
 	if cause != nil {
-		message = cause.Error()
+		message = safeerr.Message(cause)
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE sequential_live_operations
 		SET state=?, last_error=?, updated_at=?
@@ -230,7 +231,7 @@ func (s *SequentialLiveStore) RecordSequentialRecoveryAttempt(
 		FROM sequential_live_recovery_attempts
 		WHERE operation_id=?`,
 		attempt.Operation, attempt.Ordinal, attempt.Action, attempt.Reason,
-		attempt.Detail, attempt.Attempt,
+		safeerr.Sanitize(attempt.Detail), attempt.Attempt,
 		attempt.CreatedAt.UTC().Format(time.RFC3339Nano), retryAt,
 		attempt.Operation,
 	); err != nil {
@@ -244,7 +245,8 @@ func (s *SequentialLiveStore) RecordSequentialRecoveryAttempt(
 			WHERE operation_id=? AND ordinal=?
 			ORDER BY prepared_at DESC LIMIT 1
 		)`,
-		attempt.Reason, attempt.Attempt, retryAt, attempt.Detail,
+		attempt.Reason, attempt.Attempt, retryAt,
+		safeerr.Sanitize(attempt.Detail),
 		attempt.CreatedAt.UTC().Format(time.RFC3339Nano),
 		attempt.Operation, attempt.Ordinal,
 		attempt.Operation, attempt.Ordinal,
@@ -485,7 +487,7 @@ func (s *SequentialLiveStore) loadSequentialPlan(
 		BaseAsset: market.AssetID(baseAsset), QuoteAsset: market.AssetID(quoteAsset),
 		TokenDecimals: tokenDecimals, CreatedAt: createdAt.UTC(),
 	}
-	if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel {
+	if plan.IsPrefundedDualInventory() {
 		// Snapshots written before the parallel lifecycle acquired independent
 		// bridge dependencies contain the prefunded-sequential graph. Normalize
 		// that durable intent during recovery instead of reproducing the unsafe
@@ -624,6 +626,20 @@ func (s *SequentialLiveStore) loadSequentialTransactions(
 	return result, rows.Err()
 }
 
+// SequentialTransactions returns the durable transaction identities for one
+// operation without reconstructing its economic plan. Manual recovery tools
+// use this narrow view to resume a bridge from already-persisted identities;
+// they must never use it to authorize a replacement transaction.
+func (s *SequentialLiveStore) SequentialTransactions(
+	ctx context.Context,
+	operationID domainexecution.OperationID,
+) ([]executionport.SequentialTransactionRecord, error) {
+	if operationID == "" {
+		return nil, fmt.Errorf("sequential operation ID is required")
+	}
+	return s.loadSequentialTransactions(ctx, operationID)
+}
+
 func (s *SequentialLiveStore) loadSequentialSettlements(
 	ctx context.Context,
 	operation domainexecution.SequentialOperation,
@@ -674,7 +690,7 @@ func (s *SequentialLiveStore) loadSequentialSettlements(
 		if err != nil {
 			return nil, nil, err
 		}
-		if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel &&
+		if plan.IsPrefundedDualInventory() &&
 			ordinal == 1 && input.Token() != stage.InputToken {
 			sell := plan.Stages[1]
 			if input.Token() != sell.OutputToken || output.Token() != sell.InputToken {

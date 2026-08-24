@@ -53,7 +53,7 @@ func (r *Runner) RunSimulationCanary(ctx context.Context, input market.AssetQuan
 			return nil, fmt.Errorf("canary route %s did not publish a snapshot", configured.ID)
 		}
 		routes[configured.ID] = route
-		sources[configured.ID] = route.route.Source
+		sources[configured.ID] = route.source
 		snapshots = append(snapshots, snapshot)
 	}
 	_ = routes

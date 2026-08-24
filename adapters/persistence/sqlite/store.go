@@ -22,7 +22,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 8
+const schemaVersion = 9
 
 type Store struct {
 	db   *sql.DB
@@ -72,6 +72,56 @@ func (s *Store) configure() error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) RecordExecutableValidationRound(ctx context.Context, round *arbitrage.ExecutableValidationRound) error {
+	if round == nil {
+		return fmt.Errorf("executable validation round is required")
+	}
+	if err := round.Validate(); err != nil {
+		return err
+	}
+	started := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO executable_validation_rounds (
+		round_id, window_id, point_sequence, buy_market, sell_market, status,
+		failure_stage, failure_class, error, requested_at, route_finished_at,
+		build_finished_at, simulation_finished_at, local_recaptured_at,
+		recalculated_at, persisted_at, discovery_output_asset, discovery_output_value,
+		build_output_asset, build_output_value, discovery_net_asset, discovery_net_value,
+		final_net_asset, final_net_value, threshold_asset, threshold_value,
+		remote_market, local_market, initial_local_snapshot, final_local_snapshot,
+		route_hash, build_hash, route_http_status, build_http_status,
+		route_duration_nanos, build_duration_nanos, build_attempts
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		round.ID, string(round.WindowID), round.PointSequence, string(round.Direction.BuyMarket), string(round.Direction.SellMarket), string(round.Status),
+		round.FailureStage, round.FailureClass, round.Error, formatTime(round.RequestedAt), formatOptionalTime(round.RouteFinishedAt),
+		formatOptionalTime(round.BuildFinishedAt), formatOptionalTime(round.SimulationFinishedAt), formatOptionalTime(round.LocalRecapturedAt),
+		formatOptionalTime(round.RecalculatedAt), formatTime(started), string(round.DiscoveryOutput.Asset()), round.DiscoveryOutput.String(),
+		string(round.BuildOutput.Asset()), quantityString(round.BuildOutput), string(round.DiscoveryNet.Asset()), round.DiscoveryNet.String(),
+		string(round.FinalNet.Asset()), quantityString(round.FinalNet), string(round.Threshold.Asset()), round.Threshold.String(),
+		string(round.RemoteMarket), string(round.LocalMarket), trackingSnapshot(round.InitialLocalSnapshot), trackingSnapshot(round.FinalLocalSnapshot),
+		round.RouteHash, round.BuildHash, round.RouteHTTPStatus, round.BuildHTTPStatus, round.RouteDuration.Nanoseconds(), round.BuildDuration.Nanoseconds(), round.BuildAttempts,
+	)
+	if err != nil {
+		return fmt.Errorf("record executable validation round: %w", err)
+	}
+	round.PersistedAt = time.Now().UTC()
+	return nil
+}
+
+func quantityString(value market.AssetQuantity) string {
+	if value.Asset() == "" {
+		return "0"
+	}
+	return value.String()
+}
+
+func trackingSnapshot(value market.SnapshotMetadata) string {
+	if value.Market == "" {
+		return ""
+	}
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
 }
 
 func (s *Store) OpenTrackingWindow(ctx context.Context, window *arbitrage.TrackingWindow) error {
@@ -690,6 +740,47 @@ func (s *Store) migrate() error {
 			duration_nanos INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY(round_id, leg)
 		)`,
+		`CREATE TABLE IF NOT EXISTS executable_validation_rounds (
+			round_id TEXT PRIMARY KEY,
+			window_id TEXT NOT NULL,
+			point_sequence INTEGER NOT NULL,
+			buy_market TEXT NOT NULL,
+			sell_market TEXT NOT NULL,
+			status TEXT NOT NULL,
+			failure_stage TEXT NOT NULL DEFAULT '',
+			failure_class TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			requested_at TEXT NOT NULL,
+			route_finished_at TEXT NOT NULL DEFAULT '',
+			build_finished_at TEXT NOT NULL DEFAULT '',
+			simulation_finished_at TEXT NOT NULL DEFAULT '',
+			local_recaptured_at TEXT NOT NULL DEFAULT '',
+			recalculated_at TEXT NOT NULL DEFAULT '',
+			persisted_at TEXT NOT NULL,
+			discovery_output_asset TEXT NOT NULL,
+			discovery_output_value TEXT NOT NULL,
+			build_output_asset TEXT NOT NULL DEFAULT '',
+			build_output_value TEXT NOT NULL DEFAULT '0',
+			discovery_net_asset TEXT NOT NULL,
+			discovery_net_value TEXT NOT NULL,
+			final_net_asset TEXT NOT NULL DEFAULT '',
+			final_net_value TEXT NOT NULL DEFAULT '0',
+			threshold_asset TEXT NOT NULL,
+			threshold_value TEXT NOT NULL,
+			remote_market TEXT NOT NULL,
+			local_market TEXT NOT NULL,
+			initial_local_snapshot TEXT NOT NULL,
+			final_local_snapshot TEXT NOT NULL DEFAULT '',
+			route_hash TEXT NOT NULL DEFAULT '',
+			build_hash TEXT NOT NULL DEFAULT '',
+			route_http_status INTEGER NOT NULL DEFAULT 0,
+			build_http_status INTEGER NOT NULL DEFAULT 0,
+			route_duration_nanos INTEGER NOT NULL DEFAULT 0,
+			build_duration_nanos INTEGER NOT NULL DEFAULT 0,
+			build_attempts INTEGER NOT NULL DEFAULT 0,
+			UNIQUE(window_id, point_sequence)
+		)`,
+		`CREATE INDEX IF NOT EXISTS executable_validation_window_idx ON executable_validation_rounds(window_id, point_sequence)`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.Exec(statement); err != nil {
@@ -746,7 +837,7 @@ func (s *Store) migrate() error {
 			}
 		}
 	}
-	if _, err := tx.Exec("PRAGMA user_version = 8"); err != nil {
+	if _, err := tx.Exec("PRAGMA user_version = 9"); err != nil {
 		return fmt.Errorf("set SQLite schema version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

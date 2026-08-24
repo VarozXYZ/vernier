@@ -231,6 +231,23 @@ func OptimizeTwoStageSplit(ctx context.Context, request TwoStageSplitRequest) (T
 	if err != nil {
 		return TwoStageSplitResult{}, err
 	}
+	// Integer pool math can make a dust-sized intermediate branch return zero.
+	// Such an allocation may tie on total output, but it cannot be represented
+	// as an executable route because its second stage has no positive input or
+	// output. Prefer the best direct-only allocation in that case. This also
+	// keeps every input unit accounted for instead of silently dropping dust.
+	if len(direct) > 0 && (finalEvidence.intermediate.Sign() > 0 && finalEvidence.second.output.Sign() == 0 ||
+		allocatedPositive(outer.allocation[len(direct):]) && finalEvidence.intermediate.Sign() == 0) {
+		directPlan, directErr := optimizeIndependent(ctx, request.TotalInput, direct, settings)
+		if directErr != nil {
+			return TwoStageSplitResult{}, fmt.Errorf("optimize direct-only fallback: %w", directErr)
+		}
+		outer.allocation = append(cloneAllocation(directPlan.allocations), zeroAllocation(len(first))...)
+		_, finalEvidence, err = evaluateFlow(ctx, outer.allocation)
+		if err != nil {
+			return TwoStageSplitResult{}, err
+		}
+	}
 
 	directAllocations, err := materializeAllocations(ctx, direct, outer.allocation[:len(direct)])
 	if err != nil {
@@ -265,6 +282,15 @@ func OptimizeTwoStageSplit(ctx context.Context, request TwoStageSplitRequest) (T
 		GloballyVerified: outer.exhaustive && allSecondGloballyVerified,
 		Metrics:          metrics,
 	}, nil
+}
+
+func allocatedPositive(allocation []*big.Int) bool {
+	for _, amount := range allocation {
+		if amount != nil && amount.Sign() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func optimizeIndependent(

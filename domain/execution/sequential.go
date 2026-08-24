@@ -17,6 +17,7 @@ const (
 	PolicyTransportedSequential ExecutionPolicyKind = "transported_sequential"
 	PolicyPrefundedSequential   ExecutionPolicyKind = "prefunded_sequential"
 	PolicyPrefundedParallel     ExecutionPolicyKind = "prefunded_parallel"
+	PolicyPrefundedTriggerFirst ExecutionPolicyKind = "prefunded_trigger_first"
 )
 
 // SequentialStage identifies the typed capabilities used by dependent plans.
@@ -127,6 +128,11 @@ func (p SequentialPlan) EffectivePolicy() ExecutionPolicyKind {
 	return p.Policy
 }
 
+func (p SequentialPlan) IsPrefundedDualInventory() bool {
+	return p.EffectivePolicy() == PolicyPrefundedParallel ||
+		p.EffectivePolicy() == PolicyPrefundedTriggerFirst
+}
+
 func (p SequentialPlan) Validate() error {
 	if p.ID == "" || p.InitialInput.IsZero() || p.CreatedAt.IsZero() ||
 		len(p.Stages) == 0 {
@@ -137,11 +143,11 @@ func (p SequentialPlan) Validate() error {
 		if len(p.Stages) != 4 {
 			return fmt.Errorf("transported sequential plan requires four main stages")
 		}
-	case PolicyPrefundedSequential, PolicyPrefundedParallel:
+	case PolicyPrefundedSequential, PolicyPrefundedParallel, PolicyPrefundedTriggerFirst:
 		if len(p.Stages) != 4 || len(p.CircuitBreaker) != 1 {
 			return fmt.Errorf("prefunded plan requires four main stages and one circuit-breaker stage")
 		}
-		if p.EffectivePolicy() == PolicyPrefundedParallel &&
+		if p.IsPrefundedDualInventory() &&
 			(p.BaseAsset == "" || p.QuoteAsset == "" || len(p.TokenDecimals) == 0) {
 			return fmt.Errorf("prefunded parallel plan requires durable valuation metadata")
 		}
@@ -160,7 +166,7 @@ func (p SequentialPlan) Validate() error {
 			ordinals[stage.Ordinal] = struct{}{}
 		}
 	}
-	if p.EffectivePolicy() == PolicyPrefundedParallel {
+	if p.IsPrefundedDualInventory() {
 		if err := p.validateParallelDependencies(); err != nil {
 			return err
 		}
@@ -203,7 +209,7 @@ func (p SequentialPlan) InputFor(
 	stage SequentialStagePlan,
 	outputs map[int]market.TokenAmount,
 ) (market.TokenAmount, error) {
-	if p.EffectivePolicy() == PolicyPrefundedParallel &&
+	if p.IsPrefundedDualInventory() &&
 		stage.Ordinal == 2 && stage.Stage == StageSell {
 		return p.ParallelSellInput()
 	}
@@ -236,7 +242,7 @@ func (p SequentialPlan) InputFor(
 // ParallelSellInput fixes the sale input from discovery and the configured
 // execution notional. It never depends on the realized purchase output.
 func (p SequentialPlan) ParallelSellInput() (market.TokenAmount, error) {
-	if p.EffectivePolicy() != PolicyPrefundedParallel ||
+	if !p.IsPrefundedDualInventory() ||
 		p.Opportunity.SelectedIndex < 0 ||
 		p.Opportunity.SelectedIndex >= len(p.Opportunity.Candidates) {
 		return market.TokenAmount{}, fmt.Errorf("parallel sell intent is unavailable")

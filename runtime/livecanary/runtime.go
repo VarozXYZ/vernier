@@ -15,6 +15,7 @@ import (
 	"github.com/VarozXYZ/vernier/domain/market"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 	notificationport "github.com/VarozXYZ/vernier/ports/notification"
+	persistenceport "github.com/VarozXYZ/vernier/ports/persistence"
 	"github.com/VarozXYZ/vernier/runtime/livecompare"
 )
 
@@ -34,11 +35,49 @@ type Runtime struct {
 	recovery           sequentialRecovery
 	refuel             *RefuelService
 	balances           *BalanceManager
+	restorationJournal persistenceport.RestorationJournal
+	restorationResumer interface{ ResumePending(context.Context) error }
+	restorationWaiter  interface{ WaitForPending(context.Context) error }
+	capacity           interface {
+		CapacityAvailable() bool
+		CapacityChanges() <-chan struct{}
+	}
 	execute            bool
 	forcedDirection    *arbitrage.Direction
 	exitAfterOperation bool
 
 	closeOnce sync.Once
+}
+
+func (r *Runtime) SetRestorationResumer(resumer interface{ ResumePending(context.Context) error }) {
+	r.restorationResumer = resumer
+	if waiter, ok := resumer.(interface{ WaitForPending(context.Context) error }); ok {
+		r.restorationWaiter = waiter
+	}
+}
+
+func (r *Runtime) waitForRestorations(ctx context.Context) error {
+	if r.restorationWaiter == nil {
+		return nil
+	}
+	if err := r.restorationWaiter.WaitForPending(ctx); err != nil {
+		return fmt.Errorf("await asynchronous restorations: %w", err)
+	}
+	return nil
+}
+
+func (r *Runtime) SetCapacitySource(source interface {
+	CapacityAvailable() bool
+	CapacityChanges() <-chan struct{}
+}) {
+	r.capacity = source
+}
+
+func (r *Runtime) transitionAfterCapacity(from RuntimeGateState) error {
+	if r.capacity != nil && !r.capacity.CapacityAvailable() {
+		return r.gate.Transition(from, RuntimeGateCapacityBlocked)
+	}
+	return r.gate.Transition(from, RuntimeGateIdle)
 }
 
 // SetExitAfterOperation makes the runtime stop after the first admitted
@@ -110,6 +149,7 @@ func NewRuntimeWithGate(
 }
 
 func (r *Runtime) Run(ctx context.Context) (runErr error) {
+	fmt.Fprintln(r.output, "live_startup phase=runtime_run_started")
 	startedAt := time.Now().UTC()
 	if r.notifier != nil {
 		r.notifier.NotifyRuntime(notificationport.LiveRuntimeEvent{
@@ -153,12 +193,14 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		}
 	}
 	if r.recovery != nil {
+		fmt.Fprintln(r.output, "live_startup phase=recovery_transition_started")
 		if err := r.gate.Transition(
 			startupState,
 			RuntimeGateRecovering,
 		); err != nil {
 			return err
 		}
+		fmt.Fprintln(r.output, "live_startup phase=recover_active_started")
 		recovered, found, recoveryErr := r.recovery.RecoverActive(ctx)
 		if recoveryErr != nil {
 			_ = r.gate.Transition(
@@ -176,21 +218,28 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				recovered.FinalAmount,
 			)
 		}
-		if err := r.gate.Transition(
-			RuntimeGateRecovering,
-			RuntimeGateIdle,
-		); err != nil {
+		if r.restorationResumer != nil {
+			if err := r.restorationResumer.ResumePending(ctx); err != nil {
+				_ = r.gate.Transition(RuntimeGateRecovering, RuntimeGateRecoveryBlocked)
+				return fmt.Errorf("resume asynchronous restorations: %w", err)
+			}
+		}
+		if err := r.transitionAfterCapacity(RuntimeGateRecovering); err != nil {
 			return err
 		}
 		if found && r.exitAfterOperation {
 			r.stopGate()
-			return nil
+			return r.waitForRestorations(ctx)
 		}
-	} else if err := r.gate.Transition(
-		startupState,
-		RuntimeGateIdle,
-	); err != nil {
-		return err
+	} else {
+		if r.restorationResumer != nil {
+			if err := r.restorationResumer.ResumePending(ctx); err != nil {
+				return fmt.Errorf("resume asynchronous restorations: %w", err)
+			}
+		}
+		if err := r.transitionAfterCapacity(startupState); err != nil {
+			return err
+		}
 	}
 	defer r.stopGate()
 	go func() {
@@ -202,6 +251,19 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 			OpportunityStore:     r.opportunityStore,
 			ReevaluationRequests: reevaluate,
 			EvaluationGate:       r.gate,
+			ForcedDirection:      r.forcedDirection,
+			OnCoalescedTrigger: func(trigger arbitrage.TriggerMetadata) error {
+				if r.restorationJournal == nil {
+					return nil
+				}
+				return r.restorationJournal.CoalesceReevaluation(streamCtx, trigger)
+			},
+			OnCoalescedEvaluationReleased: func() error {
+				if r.restorationJournal == nil {
+					return nil
+				}
+				return r.restorationJournal.ClearReevaluation(streamCtx)
+			},
 			OnQualifiedOpportunity: func(opportunity arbitrage.Opportunity) error {
 				if !r.execute || r.forcedDirection != nil {
 					return nil
@@ -259,9 +321,19 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				if err != nil || r.forcedDirection == nil || forcedOffered {
 					return err
 				}
-				opportunity, forceErr := ForceOpportunity(
+				executable := report.ExecutableCandidate
+				if report.ImmediateCandidate != nil &&
+					report.ImmediateDirection == *r.forcedDirection {
+					executable = report.ImmediateCandidate
+				} else if report.Validation == nil ||
+					report.Validation.Status != arbitrage.ValidationConfirmed ||
+					executable == nil {
+					return nil
+				}
+				opportunity, forceErr := ForceExecutableOpportunity(
 					report.Research.Opportunities,
 					*r.forcedDirection,
+					executable,
 				)
 				if forceErr != nil {
 					return forceErr
@@ -315,6 +387,10 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	}
 
 	for {
+		var capacityChanges <-chan struct{}
+		if r.capacity != nil {
+			capacityChanges = r.capacity.CapacityChanges()
+		}
 		select {
 		case <-ctx.Done():
 			cancelStream()
@@ -327,6 +403,13 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				cancelStream()
 				<-streamResult
 				return fmt.Errorf("gas refuel runtime: %w", err)
+			}
+		case <-capacityChanges:
+			if r.gate.State() == RuntimeGateCapacityBlocked && r.capacity.CapacityAvailable() {
+				if err := r.gate.Transition(RuntimeGateCapacityBlocked, RuntimeGateIdle); err != nil {
+					return err
+				}
+				r.requestPostFlowEvaluation(ctx, reevaluate)
 			}
 		case event := <-r.manager.Events():
 			var simulationInvariant *executionport.SimulationInvariantError
@@ -413,6 +496,12 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				recovered, found, recoveryErr :=
 					r.recovery.RecoverActive(ctx)
 				if recoveryErr != nil {
+					if errors.Is(recoveryErr, context.Canceled) ||
+						errors.Is(ctx.Err(), context.Canceled) {
+						cancelStream()
+						<-streamResult
+						return context.Canceled
+					}
 					_ = r.gate.Transition(
 						RuntimeGateRecovering,
 						RuntimeGateRecoveryBlocked,
@@ -442,7 +531,7 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				if r.exitAfterOperation {
 					cancelStream()
 					<-streamResult
-					return nil
+					return r.waitForRestorations(ctx)
 				}
 				if err := r.maintainAfterOperation(
 					ctx,
@@ -455,11 +544,10 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 						err,
 					)
 				}
-				r.requestPostFlowEvaluation(ctx, reevaluate)
-				_ = r.gate.Transition(
-					RuntimeGateRecovering,
-					RuntimeGateIdle,
-				)
+				if r.capacity == nil || r.capacity.CapacityAvailable() {
+					r.requestPostFlowEvaluation(ctx, reevaluate)
+				}
+				_ = r.transitionAfterCapacity(RuntimeGateRecovering)
 				continue
 			}
 			fmt.Fprintf(
@@ -477,12 +565,12 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 			if r.exitAfterOperation {
 				cancelStream()
 				<-streamResult
-				return nil
+				return r.waitForRestorations(ctx)
 			}
 			if r.forcedDirection != nil {
 				cancelStream()
 				<-streamResult
-				return nil
+				return r.waitForRestorations(ctx)
 			}
 			// Events produced by this operation may have been evaluated while
 			// Manager was busy and therefore deliberately not queued. Request
@@ -496,13 +584,16 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 				<-streamResult
 				return fmt.Errorf("post-operation refuel: %w", err)
 			}
-			r.requestPostFlowEvaluation(ctx, reevaluate)
-			_ = r.gate.Transition(
-				RuntimeGateExecuting,
-				RuntimeGateIdle,
-			)
+			if r.capacity == nil || r.capacity.CapacityAvailable() {
+				r.requestPostFlowEvaluation(ctx, reevaluate)
+			}
+			_ = r.transitionAfterCapacity(RuntimeGateExecuting)
 		}
 	}
+}
+
+func (r *Runtime) SetRestorationJournal(journal persistenceport.RestorationJournal) {
+	r.restorationJournal = journal
 }
 
 func (r *Runtime) maintainAfterOperation(
@@ -566,6 +657,12 @@ func (r *Runtime) RecoverOnly(ctx context.Context) error {
 		)
 	} else {
 		fmt.Fprintln(r.output, "live_recovery status=idle active_operation=false")
+	}
+	if r.restorationResumer != nil {
+		if err := r.restorationResumer.ResumePending(ctx); err != nil {
+			_ = r.gate.Transition(RuntimeGateRecovering, RuntimeGateRecoveryBlocked)
+			return fmt.Errorf("resume asynchronous restorations: %w", err)
+		}
 	}
 	if err := r.gate.Transition(
 		RuntimeGateRecovering,

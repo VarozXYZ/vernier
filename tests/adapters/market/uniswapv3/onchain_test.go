@@ -55,6 +55,25 @@ func (n *rpcNetwork) CodeAt(context.Context, evm.BlockReference, common.Address)
 }
 func (*rpcNetwork) Close() {}
 
+type batchRPCNetwork struct {
+	*rpcNetwork
+	batches int
+}
+
+func (n *batchRPCNetwork) BatchCallContracts(ctx context.Context, block evm.BlockReference,
+	calls []evm.ContractCall) ([][]byte, error) {
+	n.batches++
+	results := make([][]byte, len(calls))
+	for index, call := range calls {
+		result, err := n.CallContract(ctx, block, call.Message)
+		if err != nil {
+			return nil, err
+		}
+		results[index] = result
+	}
+	return results, nil
+}
+
 func TestCoveredQuoteFailsClosedOutsideLoadedWords(t *testing.T) {
 	coverage, err := uniswapv3.NewTickCoverage(0, 0)
 	if err != nil {
@@ -81,7 +100,7 @@ func TestBootstrapLoadsCanonicalPoolStateAtOneBlockHash(t *testing.T) {
 	pool := common.HexToAddress("0x1000000000000000000000000000000000000001")
 	token0 := common.HexToAddress("0x2000000000000000000000000000000000000002")
 	token1 := common.HexToAddress("0x3000000000000000000000000000000000000003")
-	network := &rpcNetwork{pool: pool, responses: map[string][]byte{
+	network := &batchRPCNetwork{rpcNetwork: &rpcNetwork{pool: pool, responses: map[string][]byte{
 		selector("token0()"):          packValues(t, []string{"address"}, token0),
 		selector("token1()"):          packValues(t, []string{"address"}, token1),
 		selector("fee()"):             packValues(t, []string{"uint24"}, big.NewInt(3000)),
@@ -89,7 +108,7 @@ func TestBootstrapLoadsCanonicalPoolStateAtOneBlockHash(t *testing.T) {
 		selector("liquidity()"):       packValues(t, []string{"uint128"}, big.NewInt(1_000_000_000_000)),
 		selector("slot0()"):           packValues(t, []string{"uint160", "int24", "uint16", "uint16", "uint16", "uint8", "bool"}, q96(), big.NewInt(0), uint16(0), uint16(0), uint16(0), uint8(0), true),
 		selector("tickBitmap(int16)"): packValues(t, []string{"uint256"}, big.NewInt(0)),
-	}}
+	}}}
 	adapter, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{Pool: pool, MaxTickWords: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -115,6 +134,9 @@ func TestBootstrapLoadsCanonicalPoolStateAtOneBlockHash(t *testing.T) {
 		if call.To == nil || *call.To != pool || network.blocks[index] != block {
 			t.Fatal("pool load escaped configured pool or block hash")
 		}
+	}
+	if network.batches != 1 {
+		t.Fatalf("initial immutable pool state used %d batches, want 1", network.batches)
 	}
 }
 

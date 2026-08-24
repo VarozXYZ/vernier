@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,6 +149,8 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 
 	gate := runtimeresearch.NewTriggerGate(10_000)
 	evaluations := 0
+	costsEverReady := r.directionalCosts == nil
+	startupCostWarmAttempted := false
 	idleSequence := uint64(0)
 	retrySequence := uint64(0)
 	var pending *streamSignal
@@ -172,6 +175,11 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 						r.config.Markets,
 					)) {
 						pending = &signal
+						if options.OnCoalescedTrigger != nil {
+							if err := options.OnCoalescedTrigger(signal.trigger); err != nil {
+								return err
+							}
+						}
 					}
 				case at := <-options.ReevaluationRequests:
 					retrySequence++
@@ -181,6 +189,11 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 						retrySequence,
 					)
 					pending = &signal
+					if options.OnCoalescedTrigger != nil {
+						if err := options.OnCoalescedTrigger(signal.trigger); err != nil {
+							return err
+						}
+					}
 				case <-options.EvaluationGate.EvaluationChanges():
 				}
 			}
@@ -202,6 +215,11 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 					default:
 						goto reevaluationRequestsDrained
 					}
+				}
+			}
+			if pending != nil && options.OnCoalescedEvaluationReleased != nil {
+				if err := options.OnCoalescedEvaluationReleased(); err != nil {
+					return err
 				}
 			}
 		reevaluationRequestsDrained:
@@ -267,10 +285,12 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 			setup.Directions(), fixedCostEvidence, fixedCost,
 		)
 		if !costsReady {
-			r.logger.Warn(
-				"complete-flow cost cache is unavailable or stale; evaluation cannot qualify",
-				"reason", "cost_cache_stale",
-			)
+			if costsEverReady {
+				r.logger.Warn(
+					"complete-flow cost cache is unavailable or stale; evaluation cannot qualify",
+					"reason", "cost_cache_stale",
+				)
+			}
 			costEvidence, cost, directionalCosts, err =
 				r.unavailableRemoteCosts(setup.Directions())
 			if err != nil {
@@ -288,6 +308,32 @@ func (r *Runner) runRemoteAggregatorStream(ctx context.Context, options StreamOp
 		}
 		if observer, ok := r.directionalCosts.(DirectionalCostObserver); ok {
 			observer.Observe(research.Opportunities)
+		}
+		if costsReady {
+			costsEverReady = true
+		}
+		if !costsReady && !costsEverReady {
+			// The first complete remote quotes are the input to the route-aware
+			// cost model. Keep this calibration round internal, warm immediately,
+			// and let the oracle's OnReady edge request one fresh evaluation.
+			if !startupCostWarmAttempted {
+				startupCostWarmAttempted = true
+				if warmer, ok := r.directionalCosts.(DirectionalCostWarmer); ok {
+					r.logger.Info("initial complete-flow cost calibration started")
+					if warmErr := warmer.Warm(runCtx); warmErr != nil {
+						r.logger.Warn(
+							"initial complete-flow cost calibration failed; background retry remains active",
+						)
+					} else {
+						r.logger.Info("initial complete-flow cost calibration completed")
+					}
+				}
+			}
+			pending = drainLatestRemoteSignal(signals, r.config.Markets, gate)
+			if pending != nil {
+				resetIdle()
+			}
+			continue
 		}
 		if !costsReady {
 			for index := range research.Opportunities {
@@ -379,6 +425,7 @@ func (r *Runner) remoteEvaluationCosts(
 	now := r.clock().UTC()
 	costs := make(map[arbitrage.Direction]arbitrage.CostSnapshot, len(directions))
 	var maximum arbitrage.CostSnapshot
+	fallbackUsed := false
 	for _, direction := range directions {
 		cost, ok := r.directionalCosts.Snapshot(direction, now)
 		if !ok || cost.ID == "" || cost.Amount.Asset() == "" ||
@@ -388,16 +435,24 @@ func (r *Runner) remoteEvaluationCosts(
 		if maximum.ID == "" || cost.Amount.Rat().Cmp(maximum.Amount.Rat()) > 0 {
 			maximum = cost
 		}
+		fallbackUsed = fallbackUsed || strings.HasPrefix(
+			cost.ID,
+			"complete-flow/fixed-stale-fallback/",
+		)
 		costs[direction] = cost
 	}
 	if maximum.ID == "" {
 		return CostEvidence{}, arbitrage.CostSnapshot{}, nil, false
 	}
+	model := "complete_flow_cache"
+	if fallbackUsed {
+		model = "complete_flow_stale_fallback"
+	}
 	return CostEvidence{
 		FixedAmount: maximum.Amount.Rat(),
 		FixedAsset:  maximum.Amount.Asset(),
 		Cost:        maximum.Amount,
-		Model:       "complete_flow_cache",
+		Model:       model,
 		Available:   true,
 	}, maximum, costs, true
 }

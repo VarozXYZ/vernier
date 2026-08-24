@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
+	localexecution "github.com/VarozXYZ/vernier/adapters/execution/local"
 	"github.com/VarozXYZ/vernier/adapters/feed/evmlogs"
 	"github.com/VarozXYZ/vernier/adapters/feed/solanalogs"
 	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
@@ -31,18 +32,30 @@ type routeChildRuntime struct {
 	mirror    *marketstate.Mirror
 	source    quoteport.Source
 	feed      feedport.Feed
+	venue     evmlogs.Venue
 	bootstrap func(context.Context) (market.EventData, market.SourcePosition, market.SourceReference, error)
 }
 
 type routeRuntime struct {
-	config   configuration.ResolvedMarket
-	route    *crosschain.Route
-	children []routeChildRuntime
+	config     configuration.ResolvedMarket
+	route      composedRoute
+	source     quoteport.Source
+	executable localexecution.ExecutableSource
+	children   []routeChildRuntime
+	batchFeed  feedport.Feed
+}
+
+type composedRoute interface {
+	Apply(context.Context, market.MarketEvent) (feedport.ApplyResult, error)
+	ApplyBatch(context.Context, []market.MarketEvent) (feedport.ApplyResult, error)
+	Reset(context.Context, market.MarketEvent) (feedport.ApplyResult, error)
+	SetChildHealth(context.Context, market.MarketID, feedport.HealthUpdate) error
+	Snapshot() (market.MarketSnapshot, bool)
 }
 
 func (r *Runner) requiresRouteRuntime() bool {
 	for _, configured := range r.config.Markets {
-		if configured.QuoteSource != "" || len(configured.Path) != 1 || r.config.Chains[configured.Venue.Chain].Kind == "solana" {
+		if configured.QuoteSource != "" || configured.SplitRoute != nil || len(configured.Path) != 1 || r.config.Chains[configured.Venue.Chain].Kind == "solana" {
 			return true
 		}
 	}
@@ -84,7 +97,7 @@ func (r *Runner) runRoutes(ctx context.Context) (Report, error) {
 			return Report{}, fmt.Errorf("route %s did not publish a snapshot", configured.ID)
 		}
 		r.logger.Info("route bootstrap complete", "market", configured.ID, "hops", len(route.children), "version", snapshot.Metadata().Version)
-		source := quoteport.Source(route.route.Source)
+		source := route.source
 		if configured.ReferenceQuote != "" {
 			reference, err := r.externalSource(configured, source)
 			if err != nil {
@@ -135,6 +148,9 @@ func (r *Runner) buildRoute(ctx context.Context, configured configuration.Resolv
 	if !ok {
 		return routeRuntime{}, fmt.Errorf("registry is missing route market")
 	}
+	if configured.SplitRoute != nil {
+		return r.buildSplitRoute(ctx, configured, candidate, maximum, blocks, now, bootstrap)
+	}
 	children := make([]routeChildRuntime, 0, len(configured.Path))
 	routeChildren := make([]crosschain.Child, 0, len(configured.Path))
 	for index, hop := range configured.Path {
@@ -152,8 +168,13 @@ func (r *Runner) buildRoute(ctx context.Context, configured configuration.Resolv
 	if err != nil {
 		return routeRuntime{}, err
 	}
+	var executable localexecution.ExecutableSource
+	if len(configured.Path) == 1 {
+		executable = localexecution.SingleMarketSource{Market: configured.ID, Source: route.Source}
+		r.registerLocalExecutable(configured.ID, executable)
+	}
 	if !bootstrap {
-		return routeRuntime{config: configured, route: route, children: children}, nil
+		return routeRuntime{config: configured, route: route, source: route.Source, executable: executable, children: children}, nil
 	}
 	for index := range children {
 		data, position, reference, err := children[index].bootstrap(ctx)
@@ -168,7 +189,85 @@ func (r *Runner) buildRoute(ctx context.Context, configured configuration.Resolv
 			return routeRuntime{}, err
 		}
 	}
-	return routeRuntime{config: configured, route: route, children: children}, nil
+	return routeRuntime{config: configured, route: route, source: route.Source, executable: executable, children: children}, nil
+}
+
+func (r *Runner) buildSplitRoute(ctx context.Context, configured configuration.ResolvedMarket,
+	candidate market.Market, maximum market.AssetQuantity, blocks map[string]evm.BlockReference,
+	now time.Time, bootstrap bool) (routeRuntime, error) {
+	resolved := configured.SplitRoute
+	all := make([]configuration.ResolvedHop, 0,
+		len(resolved.Direct)+len(resolved.FirstStage)+len(resolved.SecondStage))
+	all = append(all, resolved.Direct...)
+	all = append(all, resolved.FirstStage...)
+	all = append(all, resolved.SecondStage...)
+	children := make([]routeChildRuntime, 0, len(all))
+	legs := make(map[string]crosschain.SplitLeg, len(all))
+	mirrors := make([]feedport.Mirror, 0, len(all))
+	for index, hop := range all {
+		childID := market.MarketID(fmt.Sprintf("%s/pool/%s", configured.ID, hop.Pool))
+		childMarket := market.Market{ID: childID, Pair: candidate.Pair,
+			Chain: market.ChainID(hop.Venue.Chain), Path: market.PathID(fmt.Sprintf("%s/pool-path/%d", configured.ID, index)),
+			BaseToken: hop.In.Token.ID, QuoteToken: hop.Out.Token.ID}
+		sourceID := market.SourceID(fmt.Sprintf("%s/pool/%d", hop.Venue.Chain, index))
+		child, err := r.buildChild(ctx, configured, hop, childMarket, sourceID, maximum, blocks, nil, now)
+		if err != nil {
+			return routeRuntime{}, err
+		}
+		children = append(children, child)
+		mirrors = append(mirrors, child.mirror)
+		legs[hop.Pool] = crosschain.SplitLeg{Market: childMarket, Source: child.source}
+	}
+	mapLegs := func(hops []configuration.ResolvedHop) []crosschain.SplitLeg {
+		result := make([]crosschain.SplitLeg, 0, len(hops))
+		for _, hop := range hops {
+			result = append(result, legs[hop.Pool])
+		}
+		return result
+	}
+	route, err := crosschain.NewSplitRoute(crosschain.SplitRouteConfig{
+		Candidate: candidate, Source: market.SourceID(configured.Chain + "/split-route"),
+		Intermediate: resolved.Intermediate.Token.ID, Direct: mapLegs(resolved.Direct),
+		First: mapLegs(resolved.FirstStage), Second: mapLegs(resolved.SecondStage),
+		Mirrors: mirrors, Clock: func() time.Time { return r.clock().UTC() },
+	})
+	if err != nil {
+		return routeRuntime{}, err
+	}
+	runtime := routeRuntime{config: configured, route: route, source: route.Source,
+		executable: route.Source, children: children}
+	r.registerLocalExecutable(configured.ID, route.Source)
+	targets := make([]evmlogs.MultiTarget, 0, len(children))
+	for index, child := range children {
+		targets = append(targets, evmlogs.MultiTarget{Market: child.market.ID, Source: child.sourceID,
+			Venue: child.venue, SuppressEvaluationTrigger: all[index].SuppressEvaluationTrigger})
+	}
+	batchFeed, err := evmlogs.NewMulti(evmlogs.MultiConfig{Market: configured.ID,
+		Network: r.networks[resolved.Chain], Targets: targets, Clock: r.clock, Logger: r.logger,
+		TransactionBoundaryOnly: true})
+	if err != nil {
+		return routeRuntime{}, err
+	}
+	runtime.batchFeed = batchFeed
+	if !bootstrap {
+		return runtime, nil
+	}
+	for index := range children {
+		data, position, reference, err := children[index].bootstrap(ctx)
+		if err != nil {
+			return routeRuntime{}, fmt.Errorf("bootstrap split pool %d: %w", index, err)
+		}
+		event, err := market.NewMarketEvent(market.MarketEvent{Market: children[index].market.ID,
+			Source: children[index].sourceID, Position: position, Reference: reference,
+			Finality: market.FinalityPreconfirmed, ReceivedAt: now, Data: data})
+		if err != nil {
+			return routeRuntime{}, err
+		}
+		if _, err := route.Apply(ctx, event); err != nil {
+			return routeRuntime{}, err
+		}
+	}
+	return runtime, nil
 }
 
 func (r *Runner) buildChild(ctx context.Context, configured configuration.ResolvedMarket, hop configuration.ResolvedHop, childMarket market.Market, sourceID market.SourceID, maximum market.AssetQuantity, blocks map[string]evm.BlockReference, slots map[string]uint64, now time.Time) (routeChildRuntime, error) {
@@ -189,7 +288,7 @@ func (r *Runner) buildChild(ctx context.Context, configured configuration.Resolv
 	if err != nil {
 		return routeChildRuntime{}, err
 	}
-	return routeChildRuntime{market: childMarket, sourceID: sourceID, mirror: mirror, source: source, feed: feed, bootstrap: func(ctx context.Context) (market.EventData, market.SourcePosition, market.SourceReference, error) {
+	return routeChildRuntime{market: childMarket, sourceID: sourceID, mirror: mirror, source: source, feed: feed, venue: venue, bootstrap: func(ctx context.Context) (market.EventData, market.SourcePosition, market.SourceReference, error) {
 		data, err := venue.Bootstrap(ctx, network, block)
 		return data, market.SourcePosition{Kind: evmlogs.BlockPositionKind, Value: block.Number}, market.SourceReference{Kind: evmlogs.BlockHashReferenceKind, Value: block.Hash.Hex()}, err
 	}}, nil
@@ -256,6 +355,10 @@ func (r *Runner) composeEVMHop(hop configuration.ResolvedHop, candidate market.M
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		maxBase, initialQuote, err = overrideV3CoverageProbes(hop, maxBase, initialQuote)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 		adapter, err := uniswapv3.NewAdapter(uniswapv3.OnChainConfig{Pool: hop.Venue.Pool, MaxTickWords: hop.Venue.MaxTickWords, Probes: []uniswapv3.CoverageProbe{{ZeroForOne: zeroForOne, AmountIn: maxBase}, {ZeroForOne: !zeroForOne, AmountIn: initialQuote}}, EventProfile: v3EventProfile(hop.Venue.Kind)})
 		if err != nil {
 			return nil, nil, nil, err
@@ -268,6 +371,10 @@ func (r *Runner) composeEVMHop(hop configuration.ResolvedHop, candidate market.M
 		return adapter, uniswapv3.Reducer{}, local, err
 	case "aerodrome_slipstream":
 		maxBase, initialQuote, zeroForOne, err := v3Inputs(configured, hopMaximum(maximum, hop))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		maxBase, initialQuote, err = overrideV3CoverageProbes(hop, maxBase, initialQuote)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -284,6 +391,29 @@ func (r *Runner) composeEVMHop(hop configuration.ResolvedHop, candidate market.M
 	default:
 		return nil, nil, nil, fmt.Errorf("unsupported EVM venue kind %q", hop.Venue.Kind)
 	}
+}
+
+func overrideV3CoverageProbes(hop configuration.ResolvedHop, input, output *big.Int) (*big.Int, *big.Int, error) {
+	if hop.CoverageProbeIn == nil && hop.CoverageProbeOut == nil {
+		return input, output, nil
+	}
+	in, err := market.NewAssetQuantity(hop.In.Token.Asset, hop.CoverageProbeIn)
+	if err != nil {
+		return nil, nil, err
+	}
+	inAmount, err := in.ToTokenAmount(hop.In.Token)
+	if err != nil {
+		return nil, nil, err
+	}
+	out, err := market.NewAssetQuantity(hop.Out.Token.Asset, hop.CoverageProbeOut)
+	if err != nil {
+		return nil, nil, err
+	}
+	outAmount, err := out.ToTokenAmount(hop.Out.Token)
+	if err != nil {
+		return nil, nil, err
+	}
+	return inAmount.Units(), outAmount.Units(), nil
 }
 
 func hopMaximum(maximum market.AssetQuantity, hop configuration.ResolvedHop) market.AssetQuantity {

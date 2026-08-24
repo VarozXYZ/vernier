@@ -151,7 +151,12 @@ func runSimulationCanary(ctx context.Context, args []string, stdout, stderr io.W
 			network.Close()
 		}
 	}()
-	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks})
+	conversionBook, err := livecompare.StartQuoteConversions(ctx, config, os.LookupEnv, nil, logger)
+	if err != nil {
+		fmt.Fprintf(stderr, "research simulation-canary: quote conversions: %v\n", err)
+		return 2
+	}
+	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks, QuoteConversions: conversionBook})
 	if err != nil {
 		fmt.Fprintf(stderr, "research simulation-canary: invalid composition: %v\n", err)
 		return 2
@@ -268,7 +273,12 @@ func runCompareLive(ctx context.Context, args []string, stdout, stderr io.Writer
 			network.Close()
 		}
 	}()
-	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks, ReferenceQuoteOverride: *referenceQuote})
+	conversionBook, err := livecompare.StartQuoteConversions(ctx, config, os.LookupEnv, nil, logger)
+	if err != nil {
+		fmt.Fprintf(stderr, "research compare-live: quote conversions: %v\n", err)
+		return 2
+	}
+	runner, err := livecompare.New(config, networks, livecompare.Options{LookupEnv: os.LookupEnv, Logger: logger, SolanaNetworks: solanaNetworks, ReferenceQuoteOverride: *referenceQuote, QuoteConversions: conversionBook})
 	if err != nil {
 		fmt.Fprintf(stderr, "research compare-live: invalid composition: %v\n", err)
 		return 2

@@ -2,6 +2,7 @@ package livecanary_test
 
 import (
 	"context"
+	"math"
 	"math/big"
 	"strconv"
 	"testing"
@@ -95,5 +96,23 @@ func TestCostEstimationCompactsOversizedSolanaArtifact(t *testing.T) {
 			estimator.calls,
 			validator.compactions,
 		)
+	}
+}
+
+func TestAcrossSolanaPayerDebitIncludesCalibratedAdditionalDebit(t *testing.T) {
+	total, err := livecanary.EstimateAcrossSolanaPayerDebit(10_000, 3_869_760)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3_879_760 {
+		t.Fatalf("payer debit=%d want=3879760", total)
+	}
+}
+
+func TestAcrossSolanaPayerDebitRejectsOverflow(t *testing.T) {
+	if _, err := livecanary.EstimateAcrossSolanaPayerDebit(
+		2, math.MaxUint64,
+	); err == nil {
+		t.Fatal("expected overflow error")
 	}
 }

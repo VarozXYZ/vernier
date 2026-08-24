@@ -17,12 +17,17 @@ import (
 // It intentionally has no retry loop: an uncertain broadcast is reconciled,
 // never resent.
 type SequentialExecutor struct {
-	journal  executionport.SequentialJournal
-	drivers  executionport.DriverSet
-	clock    func() time.Time
-	observer executionport.SequentialObserver
-	mu       sync.Mutex
-	running  bool
+	journal    executionport.SequentialJournal
+	drivers    executionport.DriverSet
+	clock      func() time.Time
+	observer   executionport.SequentialObserver
+	asyncQuote executionport.SequentialAsyncQuoteRestorer
+	mu         sync.Mutex
+	running    bool
+}
+
+func (e *SequentialExecutor) SetAsyncQuoteRestorer(restorer executionport.SequentialAsyncQuoteRestorer) {
+	e.asyncQuote = restorer
 }
 
 func NewSequentialExecutor(
@@ -161,7 +166,7 @@ func (e *SequentialExecutor) Execute(
 	e.observe(func(observer executionport.SequentialObserver) {
 		observer.OperationStarted(operation, plan)
 	})
-	if plan.EffectivePolicy() == domainexecution.PolicyPrefundedParallel {
+	if plan.IsPrefundedDualInventory() {
 		return e.executePrefundedParallel(ctx, operation, plan, result)
 	}
 

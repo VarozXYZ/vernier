@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VarozXYZ/vernier/internal/safeerr"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -30,6 +32,16 @@ type NTTCanaryOperation struct {
 	LastError      string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+}
+
+// NTTCanaryMessage is the durable Wormhole identity emitted by a confirmed
+// source transfer. It lets recovery continue without querying an old source
+// receipt again.
+type NTTCanaryMessage struct {
+	SourceTx       string
+	EmitterChain   uint16
+	EmitterAddress string
+	Sequence       uint64
 }
 
 type NTTCanaryTransaction struct {
@@ -179,6 +191,14 @@ func OpenNTTCanary(path string) (*NTTCanaryStore, error) {
 			return nil, fmt.Errorf("configure NTT canary SQLite: %w", err)
 		}
 	}
+	if err := sanitizeDurableDiagnostics(
+		db,
+		"ntt_canary_operations",
+		"last_error",
+	); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sanitize NTT canary diagnostics: %w", err)
+	}
 	return store, nil
 }
 
@@ -312,7 +332,9 @@ func (s *NTTCanaryStore) Create(
 
 // CreateOrReuseUnbroadcast creates an operation or reuses the same
 // deterministic identity only when no transaction has ever been prepared.
-// This makes readiness retries idempotent without weakening no-resend rules.
+// Pre-broadcast source reconstruction and attestation failures are reusable:
+// they cannot have emitted a destination transaction. This keeps recovery
+// idempotent without weakening no-resend rules.
 func (s *NTTCanaryStore) CreateOrReuseUnbroadcast(
 	ctx context.Context,
 	operation NTTCanaryOperation,
@@ -353,10 +375,13 @@ func (s *NTTCanaryStore) CreateOrReuseUnbroadcast(
 	if err != nil {
 		return err
 	}
+	reusableStage := stage == "created" || stage == "readiness_failed" ||
+		stage == "source_failed" || stage == "source_recovery_failed" ||
+		stage == "attestation_failed"
 	if direction != operation.Direction ||
 		amount != operation.AmountUnits ||
-		source != operation.SourceTx ||
-		(stage != "created" && stage != "readiness_failed") {
+		source != operation.SourceTx || !reusableStage ||
+		(stage == "source_failed" && source != "") {
 		return fmt.Errorf(
 			"NTT canary operation %s cannot be safely reused",
 			operation.ID,
@@ -478,6 +503,30 @@ func (s *NTTCanaryStore) UpdateMessage(
 	return nil
 }
 
+func (s *NTTCanaryStore) FindMessageBySourceTransaction(
+	ctx context.Context,
+	sourceTx string,
+) (NTTCanaryMessage, bool, error) {
+	var message NTTCanaryMessage
+	err := s.db.QueryRowContext(ctx, `SELECT source_tx, emitter_chain,
+		emitter_address, sequence FROM ntt_canary_operations
+		WHERE source_tx = ? AND emitter_chain > 0 AND emitter_address <> ''
+		ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(sourceTx),
+	).Scan(
+		&message.SourceTx,
+		&message.EmitterChain,
+		&message.EmitterAddress,
+		&message.Sequence,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return NTTCanaryMessage{}, false, nil
+	}
+	if err != nil {
+		return NTTCanaryMessage{}, false, err
+	}
+	return message, true, nil
+}
+
 func (s *NTTCanaryStore) Fail(
 	ctx context.Context,
 	operationID, stage string,
@@ -486,7 +535,7 @@ func (s *NTTCanaryStore) Fail(
 	now := time.Now().UTC()
 	message := ""
 	if cause != nil {
-		message = cause.Error()
+		message = safeerr.Message(cause)
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE ntt_canary_operations
 		SET stage = ?, last_error = ?, updated_at = ? WHERE operation_id = ?`,

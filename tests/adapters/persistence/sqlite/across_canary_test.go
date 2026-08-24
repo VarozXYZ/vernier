@@ -58,3 +58,35 @@ func TestAcrossCanaryPersistsIdentityBeforeBroadcast(t *testing.T) {
 		t.Fatalf("source lookup operation=%q, want %q", bySource.ID, operation.ID)
 	}
 }
+
+func TestAcrossCanaryPersistsSolanaSourceBlockhash(t *testing.T) {
+	store, err := sqlitepersistence.OpenAcrossCanary(filepath.Join(t.TempDir(), "across.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	operation := sqlitepersistence.AcrossCanaryOperation{
+		ID: "synthetic-solana-operation", Direction: "solana-to-evm",
+		AmountUnits: "1000000", ExpectedOutput: "999900",
+		Status: "created", CreatedAt: time.Now().UTC(),
+	}
+	if err := store.Create(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PreparedSolana(
+		ctx, operation.ID, "synthetic-signature", "synthetic-blockhash",
+		"synthetic-evm", "1000000",
+	); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.Get(ctx, operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.SourceChain != "solana" ||
+		stored.SourceIdentity != "synthetic-signature" ||
+		stored.SourceBlockhash != "synthetic-blockhash" {
+		t.Fatalf("unexpected stored Solana source: %+v", stored)
+	}
+}

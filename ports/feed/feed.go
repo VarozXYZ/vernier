@@ -13,6 +13,37 @@ type EventSink interface {
 	Publish(context.Context, market.MarketEvent) error
 }
 
+// TransactionBatchSink atomically publishes all normalized pool events from
+// one chain transaction. Mutable child mirrors may advance individually, but
+// a composed market must expose only the final post-transaction snapshot.
+type TransactionBatchSink interface {
+	PublishBatch(context.Context, []market.MarketEvent) error
+}
+
+// CausalTransactionBatchSink preserves the ordered transaction batch while
+// identifying the pool event that made the batch economically relevant.
+// Feeds fall back to TransactionBatchSink for consumers that do not need the
+// causal event separately.
+type CausalTransactionBatchSink interface {
+	PublishBatchTriggered(context.Context, []market.MarketEvent, market.MarketEvent) error
+}
+
+// StateOnlyBatchSink atomically applies a live transaction batch without
+// converting it into an economic trigger. Composite markets use it for
+// auxiliary pools whose state affects later quotes but whose isolated changes
+// cannot create the strategy's arbitrage signal.
+type StateOnlyBatchSink interface {
+	PublishBatchStateOnly(context.Context, []market.MarketEvent) error
+}
+
+// SynchronizationSink applies bootstrap/catch-up state without converting
+// historical synchronization into an economic trigger. Feeds use it while a
+// market is degraded and only restore health after reaching their watermark.
+type SynchronizationSink interface {
+	ResetSynchronized(context.Context, market.MarketEvent) error
+	PublishBatchSynchronized(context.Context, []market.MarketEvent) error
+}
+
 // ResetSink is an optional extension used by reconnecting feeds. A reset is
 // a complete current-state bootstrap and must replace the mirror state; it is
 // deliberately separate from normal event publication.

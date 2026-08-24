@@ -39,3 +39,7 @@ type TrackingStore interface {
 type SimulationStore interface {
 	RecordSimulationRound(context.Context, *arbitrage.SimulationRound) error
 }
+
+type ExecutableValidationStore interface {
+	RecordExecutableValidationRound(context.Context, *arbitrage.ExecutableValidationRound) error
+}

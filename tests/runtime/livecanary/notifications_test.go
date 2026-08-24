@@ -247,6 +247,98 @@ func TestPrefundedProgressDirectionUsesBuyAndSellChains(t *testing.T) {
 	}
 }
 
+func TestProgressObserverLinksEVMTransactionsAndCompletesAsyncReturn(t *testing.T) {
+	t.Parallel()
+
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	observer, err := livecanary.NewProgressObserver(
+		notifier,
+		map[market.TokenID]market.Token{
+			"quote-a": {ID: "quote-a", Asset: "quote", Symbol: "QUOTE", Decimals: 6},
+			"base-a":  {ID: "base-a", Asset: "base", Symbol: "BASE", Decimals: 9},
+			"quote-b": {ID: "quote-b", Asset: "quote", Symbol: "QUOTE", Decimals: 6},
+			"base-b":  {ID: "base-b", Asset: "base", Symbol: "BASE", Decimals: 18},
+		},
+		map[market.ChainID]configuration.ResolvedChain{
+			"chain-a": {ID: "chain-a", Label: "Chain A", Kind: "evm", ChainID: big.NewInt(8453)},
+			"chain-b": {ID: "chain-b", Label: "Chain B", Kind: "evm", ChainID: big.NewInt(56)},
+		},
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opportunity := liveCanaryOpportunity(t)
+	initial := opportunity.Candidates[0].BuyQuote.AmountIn
+	plan, err := execution.NewPrefundedSequentialPlan(
+		"async-plan", opportunity, initial, "chain-a", "chain-b", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := execution.SequentialOperation{
+		ID: "async-operation", Plan: plan.ID, State: execution.SequentialRunning,
+		CurrentAmount: initial, StartedAt: now, UpdatedAt: now,
+	}
+	observer.OperationStarted(operation, plan)
+	buy := execution.SequentialStageRequest{
+		Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[0], Input: initial,
+	}
+	observer.StageStarted(buy)
+	observer.StageSettled(execution.SequentialStageSettlement{
+		Request: buy, ActualInput: initial,
+		ActualOutput:   opportunity.Candidates[0].BuyQuote.AmountOut,
+		SourceIdentity: execution.TransactionIdentity{Chain: "chain-a", Hash: "0xbuy"},
+		ObservedAt:     now, Evidence: "durable_receipt",
+	})
+	quoteOutput := opportunity.Candidates[0].SellQuote.AmountOut
+	quoteReturn := execution.SequentialStageRequest{
+		Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[3], Input: quoteOutput,
+	}
+	observer.StageStarted(quoteReturn)
+	observer.OperationFinished(operation, execution.SequentialCompleted, executionport.SequentialResult{
+		Operation: operation.ID, FinalAmount: quoteOutput,
+	}, nil)
+	observer.StageSettled(execution.SequentialStageSettlement{
+		Request: quoteReturn, ActualInput: quoteOutput, ActualOutput: initial,
+		SourceIdentity:      execution.TransactionIdentity{Chain: "chain-b", Hash: "0xreturn"},
+		DestinationIdentity: &execution.TransactionIdentity{Chain: "chain-a", Hash: "0xreceipt"},
+		ObservedAt:          now, Evidence: "bridge_delivery",
+	})
+	notifier.Close()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	var buyEvent, returnEvent notificationport.LiveExecutionEvent
+	terminalIndex, returnIndex := -1, -1
+	for index, event := range sender.events {
+		switch {
+		case event.Kind == notificationport.LiveExecutionStageCompleted && event.Ordinal == 1:
+			buyEvent = event
+		case event.Kind == notificationport.LiveExecutionCompleted:
+			terminalIndex = index
+		case event.Kind == notificationport.LiveExecutionStageCompleted && event.Ordinal == 4:
+			returnEvent = event
+			returnIndex = index
+		}
+	}
+	if buyEvent.SourceURL != "https://basescan.org/tx/0xbuy" {
+		t.Fatalf("buy explorer URL=%q", buyEvent.SourceURL)
+	}
+	if returnEvent.SourceURL != "https://bscscan.com/tx/0xreturn" ||
+		returnEvent.DestinationURL != "https://basescan.org/tx/0xreceipt" {
+		t.Fatalf("return explorer URLs=%q -> %q", returnEvent.SourceURL, returnEvent.DestinationURL)
+	}
+	if terminalIndex < 0 || returnIndex <= terminalIndex {
+		t.Fatalf("async return was not emitted after completion: %+v", sender.events)
+	}
+}
+
 func TestProgressObserverSuppressesDefinitiveFailureBeforeBuySettlement(t *testing.T) {
 	t.Parallel()
 
@@ -385,6 +477,58 @@ func TestRecoveryReplaysDurableStagesAndEmitsFinalCompletion(t *testing.T) {
 	}
 	if !completed {
 		t.Fatalf("recovery never emitted final completion: %+v", sender.events)
+	}
+}
+
+func TestRecoveryWithoutEconomicEffectEmitsAbortedNotCompleted(t *testing.T) {
+	t.Parallel()
+
+	sender := &liveNotificationSender{}
+	notifier, err := livecanary.NewLiveNotifier(sender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	progress := newSyntheticProgressObserver(t, notifier, now)
+	recovery := livecanary.NewRecoveryObserver(notifier, progress, func() time.Time { return now })
+	opportunity := liveCanaryOpportunity(t)
+	initial := opportunity.Candidates[0].BuyQuote.AmountIn
+	plan, err := execution.NewPrefundedSequentialPlan(
+		"aborted-recovery-plan", opportunity, initial, "chain-a", "chain-b", now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := execution.SequentialOperation{
+		ID: "aborted-recovery-operation", Plan: plan.ID,
+		State: execution.SequentialRecovering, CurrentAmount: initial,
+		StartedAt: now.Add(-time.Second), UpdatedAt: now,
+	}
+	recovery.RecoveryStarted(executionport.SequentialRecoverySnapshot{
+		Operation: operation, Plan: plan,
+	})
+	cause := errors.New("initial purchase had no confirmed economic effect")
+	recovery.RecoveryAborted(operation, executionport.SequentialResult{
+		Operation: operation.ID, TerminalState: execution.SequentialAborted,
+		TerminalError: cause.Error(),
+	}, cause)
+	notifier.Close()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	var failed bool
+	for _, event := range sender.events {
+		if event.Kind == notificationport.LiveExecutionCompleted ||
+			event.Kind == notificationport.LiveExecutionRecoveryCompleted {
+			t.Fatalf("no-effect recovery emitted completion: %+v", sender.events)
+		}
+		if event.Kind == notificationport.LiveExecutionFailed &&
+			event.State == string(execution.SequentialAborted) {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatalf("no-effect recovery did not emit terminal aborted event: %+v", sender.events)
 	}
 }
 

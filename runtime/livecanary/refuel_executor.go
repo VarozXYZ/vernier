@@ -144,7 +144,7 @@ func (e *SwapRefuelExecutor) Execute(
 			err,
 		)
 	}
-	broadcast, err := e.config.Binding.TxManager.Broadcast(ctx, prepared)
+	broadcast, err := chainport.BroadcastPrimary(ctx, e.config.Binding.TxManager, prepared)
 	if err != nil || !broadcast.Accepted {
 		record.LastError = errorText(err, "refuel broadcaster did not accept")
 		if broadcast.Disposition == chainport.BroadcastRejected {

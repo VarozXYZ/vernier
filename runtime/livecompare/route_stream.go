@@ -12,7 +12,6 @@ import (
 	"github.com/VarozXYZ/vernier/domain/market"
 	feedport "github.com/VarozXYZ/vernier/ports/feed"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
-	"github.com/VarozXYZ/vernier/runtime/crosschain"
 )
 
 func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) error {
@@ -55,7 +54,7 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 			return err
 		}
 		routes[configured.ID] = route
-		source := quoteport.Source(route.route.Source)
+		source := route.source
 		if configured.ReferenceQuote != "" {
 			reference, err := r.externalSource(configured, source)
 			if err != nil {
@@ -95,6 +94,19 @@ func (r *Runner) runRouteStream(ctx context.Context, options StreamOptions) erro
 	failures := make(chan failure, len(routes)*2)
 	var feeds sync.WaitGroup
 	for routeID, route := range routes {
+		if route.batchFeed != nil {
+			routeID, route := routeID, route
+			feeds.Add(1)
+			go func() {
+				defer feeds.Done()
+				err := route.batchFeed.Run(runCtx, &routeStreamSink{route: route.route,
+					children: routeChildIDs(route), routeID: routeID, signals: signals})
+				if err != nil && !errors.Is(err, context.Canceled) {
+					failures <- failure{market: routeID, err: err}
+				}
+			}()
+			continue
+		}
 		for _, child := range route.children {
 			child := child
 			routeID := routeID
@@ -199,10 +211,34 @@ func routeSnapshotSummary(snapshots []market.MarketSnapshot) map[string]any {
 }
 
 type routeStreamSink struct {
-	route   *crosschain.Route
-	child   market.MarketID
-	routeID market.MarketID
-	signals chan<- streamSignal
+	route    composedRoute
+	child    market.MarketID
+	children []market.MarketID
+	routeID  market.MarketID
+	signals  chan<- streamSignal
+}
+
+func (s *routeStreamSink) PublishBatch(ctx context.Context, events []market.MarketEvent) error {
+	return s.PublishBatchTriggered(ctx, events, events[len(events)-1])
+}
+
+func (s *routeStreamSink) PublishBatchTriggered(ctx context.Context, events []market.MarketEvent, trigger market.MarketEvent) error {
+	result, err := s.route.ApplyBatch(ctx, events)
+	if err != nil || result.Disposition == feedport.ApplyDispositionIgnoredStale {
+		return err
+	}
+	return s.signal(ctx, trigger.ReceivedAt, &arbitrage.TriggerMetadata{Market: trigger.Market,
+		Source: trigger.Source, Position: trigger.Position, Reference: trigger.Reference, At: trigger.ReceivedAt.UTC()})
+}
+
+func (s *routeStreamSink) PublishBatchSynchronized(ctx context.Context, events []market.MarketEvent) error {
+	_, err := s.route.ApplyBatch(ctx, events)
+	return err
+}
+
+func (s *routeStreamSink) PublishBatchStateOnly(ctx context.Context, events []market.MarketEvent) error {
+	_, err := s.route.ApplyBatch(ctx, events)
+	return err
 }
 
 func (s *routeStreamSink) Publish(ctx context.Context, event market.MarketEvent) error {
@@ -221,9 +257,20 @@ func (s *routeStreamSink) Reset(ctx context.Context, event market.MarketEvent) e
 	return s.signal(ctx, event.ReceivedAt, &arbitrage.TriggerMetadata{Market: event.Market, Source: event.Source, Position: event.Position, Reference: event.Reference, At: event.ReceivedAt.UTC()})
 }
 
+func (s *routeStreamSink) ResetSynchronized(ctx context.Context, event market.MarketEvent) error {
+	_, err := s.route.Reset(ctx, event)
+	return err
+}
+
 func (s *routeStreamSink) SetHealth(ctx context.Context, update feedport.HealthUpdate) error {
-	if err := s.route.SetChildHealth(ctx, s.child, update); err != nil {
-		return err
+	children := s.children
+	if len(children) == 0 {
+		children = []market.MarketID{s.child}
+	}
+	for _, child := range children {
+		if err := s.route.SetChildHealth(ctx, child, update); err != nil {
+			return err
+		}
 	}
 	if update.Health != market.HealthDegraded {
 		return nil

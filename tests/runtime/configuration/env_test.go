@@ -61,3 +61,25 @@ func TestLoadEnvFileRejectsUnsetVariableReference(t *testing.T) {
 		t.Fatalf("unset reference error = %v", err)
 	}
 }
+
+func TestReadIsolatedEnvFileDoesNotInheritProcessValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "isolated.env")
+	if err := os.WriteFile(
+		path,
+		[]byte("LOCAL_KEY=setup-secret\nFANOUT=${LOCAL_KEY},secondary\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FOREIGN_PRIVATE_KEY", "must-not-leak")
+	lookup, err := configuration.ReadIsolatedEnvFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lookup("FOREIGN_PRIVATE_KEY"); ok {
+		t.Fatal("isolated environment inherited a process variable")
+	}
+	if value, ok := lookup("FANOUT"); !ok || value != "setup-secret,secondary" {
+		t.Fatalf("same-file expansion = %q, %t", value, ok)
+	}
+}

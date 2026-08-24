@@ -62,6 +62,44 @@ func (r *RouteMirror) Reset(ctx context.Context, event market.MarketEvent) (feed
 	return r.apply(ctx, event, true)
 }
 
+// ApplyBatch advances every affected child before rebuilding the composed
+// snapshot once. Events must belong to one source transaction and already be
+// ordered by the feed's log index.
+func (r *RouteMirror) ApplyBatch(ctx context.Context, events []market.MarketEvent) (feedport.ApplyResult, error) {
+	if len(events) == 0 {
+		return feedport.ApplyResult{}, fmt.Errorf("route event batch cannot be empty")
+	}
+	reference := events[0].Reference
+	var last feedport.ApplyResult
+	applied := false
+	for index, event := range events {
+		if reference.Known() && event.Reference != reference {
+			return feedport.ApplyResult{}, fmt.Errorf("route event batch mixes source references")
+		}
+		child, ok := r.Child(event.Market)
+		if !ok {
+			return feedport.ApplyResult{}, fmt.Errorf("event market %q is not a route child", event.Market)
+		}
+		result, err := child.Apply(ctx, event)
+		if err != nil {
+			return feedport.ApplyResult{}, fmt.Errorf("apply route batch event %d: %w", index, err)
+		}
+		last = result
+		if result.Disposition == feedport.ApplyDispositionApplied {
+			applied = true
+		}
+	}
+	if !applied {
+		return last, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.rebuildLocked(r.clock().UTC(), &last.Snapshot); err != nil {
+		return feedport.ApplyResult{}, err
+	}
+	return feedport.ApplyResult{Disposition: feedport.ApplyDispositionApplied, Snapshot: r.current}, nil
+}
+
 func (r *RouteMirror) apply(ctx context.Context, event market.MarketEvent, reset bool) (feedport.ApplyResult, error) {
 	child, ok := r.Child(event.Market)
 	if !ok {

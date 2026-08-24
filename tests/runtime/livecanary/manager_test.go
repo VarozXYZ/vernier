@@ -95,6 +95,47 @@ func liveCanaryOpportunity(t *testing.T) arbitrage.Opportunity {
 	}
 }
 
+func TestPlannerConvertsHumanExecutionAmountPerBuyTokenDecimals(t *testing.T) {
+	opportunity := liveCanaryOpportunity(t)
+	for _, test := range []struct {
+		decimals uint8
+		want     string
+	}{{6, "1000000"}, {18, "1000000000000000000"}} {
+		planner := livecanary.Planner{MarketChains: map[market.MarketID]market.ChainID{"market-a": "chain-a", "market-b": "chain-b"},
+			ExecutionAmount: big.NewRat(1, 1), TokenDecimals: map[market.TokenID]uint8{"quote-a": test.decimals}}
+		plan, err := planner.Plan(opportunity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := plan.InitialInput.Units().String(); got != test.want {
+			t.Fatalf("decimals=%d units=%s want=%s", test.decimals, got, test.want)
+		}
+	}
+}
+
+func TestPlannerPreservesSelectedDiscreteCandidateInput(t *testing.T) {
+	opportunity := liveCanaryOpportunity(t)
+	input, _ := market.NewAssetQuantity("quote", big.NewRat(750, 1))
+	opportunity.Candidates[0].Input = input
+	planner := livecanary.Planner{
+		MarketChains:            map[market.MarketID]market.ChainID{"market-a": "chain-a", "market-b": "chain-b"},
+		ExecutionAmount:         big.NewRat(1000, 1),
+		AllowedExecutionAmounts: []*big.Rat{big.NewRat(250, 1), big.NewRat(500, 1), big.NewRat(750, 1), big.NewRat(1000, 1)},
+	}
+	plan, err := planner.Plan(opportunity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.InitialInput.Units().String(); got != "750000000" {
+		t.Fatalf("initial input=%s want selected candidate units", got)
+	}
+
+	opportunity.Candidates[0].Input, _ = market.NewAssetQuantity("quote", big.NewRat(600, 1))
+	if _, err := planner.Plan(opportunity); err == nil {
+		t.Fatal("unconfigured execution size was accepted")
+	}
+}
+
 func TestManagerDoesNotBlockOrQueueWhileAnOperationIsActive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

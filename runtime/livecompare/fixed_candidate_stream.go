@@ -20,7 +20,7 @@ import (
 	notificationport "github.com/VarozXYZ/vernier/ports/notification"
 	persistenceport "github.com/VarozXYZ/vernier/ports/persistence"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
-	"github.com/VarozXYZ/vernier/runtime/crosschain"
+	"github.com/VarozXYZ/vernier/runtime/marketstream"
 	runtimeresearch "github.com/VarozXYZ/vernier/runtime/research"
 )
 
@@ -37,6 +37,8 @@ type fixedCandidateSignal struct {
 	snapshotCapturedAt time.Time
 	queuedAt           time.Time
 	degraded           bool
+	remoteTriggered    bool
+	localTriggered     bool
 }
 
 type fixedWindowState struct {
@@ -106,15 +108,25 @@ func (r *Runner) runFixedCandidateRouteStream(ctx context.Context, options Strea
 		return err
 	}
 	routes := make(map[market.MarketID]routeRuntime, len(r.config.Markets))
+	remote := make(map[market.MarketID]eventRefreshedRuntime)
 	sources := make(map[market.MarketID]quoteport.Source, len(r.config.Markets))
 	now := r.clock().UTC()
 	for _, configured := range r.config.Markets {
+		if configured.QuoteSource != "" {
+			candidate, buildErr := r.buildEventRefreshedMarket(configured, registry)
+			if buildErr != nil {
+				return buildErr
+			}
+			remote[configured.ID] = candidate
+			sources[configured.ID] = candidate.source
+			continue
+		}
 		route, buildErr := r.buildRoute(ctx, configured, registry, maximum, blocks, map[string]uint64{}, now, false)
 		if buildErr != nil {
 			return buildErr
 		}
 		routes[configured.ID] = route
-		sources[configured.ID] = route.route.Source
+		sources[configured.ID] = route.source
 	}
 	costEvidence, cost, err := r.cost(ctx, blocks, now)
 	if err != nil {
@@ -128,8 +140,18 @@ func (r *Runner) runFixedCandidateRouteStream(ctx context.Context, options Strea
 	if !ok {
 		return fmt.Errorf("configured strategy does not support fixed-candidate tracking")
 	}
+	validations, err := newPrefundedValidationCoordinator(r, candidate, registry, store, routes, remote)
+	if err != nil && r.config.ExecutableValidationEnabled {
+		return err
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
+	for _, runtime := range remote {
+		profile := r.config.QuoteSources[runtime.config.QuoteSource]
+		if runtime.kyberMarket != nil && profile.RefreshInterval > 0 {
+			runtime.kyberMarket.StartRefresh(runCtx, profile.RefreshInterval)
+		}
+	}
 	capacity := r.config.TrackingQueueCapacity
 	if capacity > maxTrackingSignalQueue {
 		capacity = maxTrackingSignalQueue
@@ -145,22 +167,42 @@ func (r *Runner) runFixedCandidateRouteStream(ctx context.Context, options Strea
 		market market.MarketID
 		err    error
 	}
-	failures := make(chan failure, len(routes)*2)
+	failures := make(chan failure, routeFeedCount(routes)+eventFeedCount(remote))
 	capture := func(trigger arbitrage.TriggerMetadata, degraded bool) {
-		captured := r.clock().UTC()
-		snapshots := make([]market.MarketSnapshot, 0, len(r.config.Markets))
-		for _, configured := range r.config.Markets {
-			snapshot, ready := routes[configured.ID].route.Snapshot()
-			if !ready {
-				return
+		if err := trigger.Validate(); err != nil {
+			r.logger.Error("discarding invalid fixed-candidate trigger", "error", err)
+			return
+		}
+		remoteTriggered := false
+		localTriggered := false
+		if runtime, ok := remote[trigger.Market]; ok {
+			remoteTriggered = true
+			if runtime.kyberMarket != nil {
+				runtime.kyberMarket.Invalidate()
 			}
-			snapshots = append(snapshots, snapshot)
+		}
+		if trigger.Reference.Kind != "synthetic" {
+			for routeID := range routes {
+				if triggerMatchesMarket(trigger.Market, routeID) {
+					localTriggered = true
+					break
+				}
+			}
+		}
+		captured := r.clock().UTC()
+		snapshots, ready := eventStreamSnapshots(r.config.Markets, routes, remote)
+		if !ready {
+			return
+		}
+		for _, snapshot := range snapshots {
 			if snapshot.Metadata().Health != market.HealthHealthy {
 				degraded = true
 			}
 		}
 		signal := fixedCandidateSignal{
 			trigger: trigger, snapshots: snapshots, degraded: degraded,
+			remoteTriggered:   remoteTriggered,
+			localTriggered:    localTriggered,
 			triggerReceivedAt: trigger.At.UTC(), snapshotCapturedAt: captured, queuedAt: r.clock().UTC(),
 		}
 		r.rememberSimulationSnapshots(snapshots)
@@ -227,6 +269,19 @@ func (r *Runner) runFixedCandidateRouteStream(ctx context.Context, options Strea
 
 	var feeds sync.WaitGroup
 	for routeID, route := range routes {
+		if route.batchFeed != nil {
+			routeID, route := routeID, route
+			feeds.Add(1)
+			go func() {
+				defer feeds.Done()
+				sink := &fixedRouteSink{route: route.route, routeID: routeID,
+					children: routeChildIDs(route), capture: capture}
+				if runErr := route.batchFeed.Run(runCtx, sink); runErr != nil && !errors.Is(runErr, context.Canceled) {
+					failures <- failure{market: routeID, err: runErr}
+				}
+			}()
+			continue
+		}
 		for _, child := range route.children {
 			child, routeID, route := child, routeID, route
 			feeds.Add(1)
@@ -239,6 +294,20 @@ func (r *Runner) runFixedCandidateRouteStream(ctx context.Context, options Strea
 			}()
 		}
 	}
+	deduper := newFixedTransactionDeduper(1024)
+	for marketID, runtime := range remote {
+		for _, configuredFeed := range runtime.feeds {
+			configuredFeed, marketID, runtime := configuredFeed, marketID, runtime
+			feeds.Add(1)
+			go func() {
+				defer feeds.Done()
+				sink := &fixedEventTriggerSink{market: marketID, feed: configuredFeed.id, store: runtime.store, capture: capture, deduper: deduper}
+				if runErr := configuredFeed.feed.Run(runCtx, sink); runErr != nil && !errors.Is(runErr, context.Canceled) {
+					failures <- failure{market: marketID, err: runErr}
+				}
+			}()
+		}
+	}
 	defer feeds.Wait()
 	defer notifier.stop()
 	defer cancel()
@@ -246,12 +315,22 @@ func (r *Runner) runFixedCandidateRouteStream(ctx context.Context, options Strea
 
 	var active *fixedWindowState
 	evaluations := 0
+	var idleC <-chan time.Time
+	var idleTicker *time.Ticker
+	if r.config.IdleEvaluationInterval > 0 {
+		idleTicker = time.NewTicker(r.config.IdleEvaluationInterval)
+		idleC = idleTicker.C
+		defer idleTicker.Stop()
+	}
 streamLoop:
 	for {
 		var signal fixedCandidateSignal
 		select {
 		case <-ctx.Done():
 			return nil
+		case at := <-idleC:
+			capture(syntheticTrackingTrigger(r.config.Markets[0].ID, "idle", at.UTC()), false)
+			continue
 		case failed := <-failures:
 			if active != nil {
 				_ = r.closeFixedWindow(runCtx, store, notifier, active, fixedCandidateSignal{trigger: syntheticTrackingTrigger(failed.market, "feed_failed", r.clock().UTC()), triggerReceivedAt: r.clock().UTC(), snapshotCapturedAt: r.clock().UTC(), queuedAt: r.clock().UTC()}, "feed_failed", true)
@@ -297,12 +376,15 @@ streamLoop:
 		}
 
 		if active == nil {
-			opened, report, openErr := r.discoverFixedWindow(runCtx, pinned, registry, store, notifier, simulations, cost, costEvidence, signal, evaluations+1)
+			opened, report, openErr := r.discoverFixedWindow(runCtx, pinned, setup, registry, store, notifier, simulations, validations, cost, costEvidence, signal, evaluations+1, options.ForcedDirection)
 			if openErr != nil {
 				return openErr
 			}
 			evaluations++
 			if err := options.OnReport(report); err != nil {
+				return err
+			}
+			if err := offerValidatedFixedOpportunity(options, report); err != nil {
 				return err
 			}
 			active = opened
@@ -340,12 +422,15 @@ streamLoop:
 			}
 		}
 
-		closed, pointReport, trackErr := r.trackFixedPoint(runCtx, pinned, registry, store, notifier, simulations, cost, signal, active, evaluations+1)
+		closed, pointReport, trackErr := r.trackFixedPoint(runCtx, pinned, registry, store, notifier, simulations, validations, remote, cost, signal, active, evaluations+1)
 		if trackErr != nil {
 			return trackErr
 		}
 		evaluations++
 		if err := options.OnReport(pointReport); err != nil {
+			return err
+		}
+		if err := offerValidatedFixedOpportunity(options, pointReport); err != nil {
 			return err
 		}
 		if closed {
@@ -360,29 +445,89 @@ streamLoop:
 	}
 }
 
+func offerValidatedFixedOpportunity(options StreamOptions, report Report) error {
+	if options.OnQualifiedOpportunity == nil {
+		return nil
+	}
+	executable := report.ImmediateCandidate
+	direction := report.ImmediateDirection
+	if executable == nil {
+		if report.Validation == nil || report.Validation.Status != arbitrage.ValidationConfirmed {
+			return nil
+		}
+		executable = report.ExecutableCandidate
+		direction = report.Validation.Direction
+	}
+	for _, opportunity := range report.Research.Opportunities {
+		if opportunity.Direction == direction &&
+			opportunity.Classification == arbitrage.ClassificationPolicyQualified &&
+			opportunity.SelectedIndex >= 0 {
+			if executable == nil {
+				return nil
+			}
+			opportunity.Candidates = append([]arbitrage.Candidate(nil), opportunity.Candidates...)
+			opportunity.Candidates[opportunity.SelectedIndex] = *executable
+			return options.OnQualifiedOpportunity(opportunity)
+		}
+	}
+	return nil
+}
+
 func (r *Runner) discoverFixedWindow(
 	ctx context.Context,
 	pinned pinnedStrategy,
+	setup arbitrage.ArbitrageSetup,
 	registry *market.Registry,
 	store persistenceport.TrackingStore,
 	notifier *trackingNotifier,
 	simulations *simulationCoordinator,
+	validations *prefundedValidationCoordinator,
 	cost arbitrage.CostSnapshot,
 	costEvidence CostEvidence,
 	signal fixedCandidateSignal,
 	evaluationNumber int,
+	forcedDirection *arbitrage.Direction,
 ) (*fixedWindowState, Report, error) {
 	started := r.clock().UTC()
-	research, err := r.evaluate(ctx, pinned, signal.snapshots, cost, fmt.Sprintf("route-tracking/%s/discovery/%d", r.config.ResearchID, evaluationNumber), signal.triggerReceivedAt, &signal.trigger)
+	dynamicEvidence, dynamicCost, directionalCosts, costsReady := r.remoteEvaluationCosts(setup.Directions(), costEvidence, cost)
+	if !costsReady {
+		var err error
+		dynamicEvidence, dynamicCost, directionalCosts, err = r.unavailableRemoteCosts(setup.Directions())
+		if err != nil {
+			return nil, Report{}, err
+		}
+	}
+	research, err := r.evaluateWithDirectionalCosts(ctx, pinned, signal.snapshots, dynamicCost, directionalCosts,
+		fmt.Sprintf("route-tracking/%s/discovery/%d", r.config.ResearchID, evaluationNumber), signal.triggerReceivedAt, &signal.trigger, signal.remoteTriggered)
 	if err != nil {
 		return nil, Report{}, err
 	}
+	if observer, ok := r.directionalCosts.(DirectionalCostObserver); ok {
+		observer.Observe(research.Opportunities)
+	}
+	if !costsReady {
+		for index := range research.Opportunities {
+			research.Opportunities[index].SelectedIndex = -1
+			research.Opportunities[index].Classification = arbitrage.ClassificationUnclassifiable
+			research.Opportunities[index].Reasons = []string{"cost_cache_stale"}
+		}
+	}
 	research.Evaluations = evaluationNumber
-	report := Report{Research: research, Cost: costEvidence}
+	report := Report{Research: research, Cost: dynamicEvidence}
 	var selected *arbitrage.Opportunity
 	for index := range research.Opportunities {
 		opportunity := &research.Opportunities[index]
-		if opportunity.Classification != arbitrage.ClassificationPolicyQualified || opportunity.SelectedIndex < 0 {
+		if forcedDirection != nil && opportunity.Direction != *forcedDirection {
+			continue
+		}
+		forced := forcedDirection != nil && opportunity.Direction == *forcedDirection
+		if forced && costsReady && opportunity.SelectedIndex < 0 && len(opportunity.Candidates) > 0 {
+			// Forced execution bypasses directional economic selection as well as
+			// the profit threshold, but still requires a complete fresh candidate
+			// that can proceed through executable validation.
+			opportunity.SelectedIndex = 0
+		}
+		if opportunity.SelectedIndex < 0 || (!forced && opportunity.Classification != arbitrage.ClassificationPolicyQualified) {
 			continue
 		}
 		if selected == nil || quantityGreater(opportunity.Candidates[opportunity.SelectedIndex].NetPnL, selected.Candidates[selected.SelectedIndex].NetPnL) {
@@ -430,6 +575,14 @@ func (r *Runner) discoverFixedWindow(
 			simulations.submit(request, update)
 		}
 	}
+	if signal.localTriggered {
+		copyOf := selectedCandidate
+		report.ImmediateCandidate = &copyOf
+		report.ImmediateDirection = selected.Direction
+	} else if validations != nil {
+		forced := forcedDirection != nil && selected.Direction == *forcedDirection
+		report.Validation, report.ExecutableCandidate = validations.validate(ctx, windowID, 1, selected.Direction, selectedCandidate, signal.snapshots, forced)
+	}
 	r.logger.Info("fixed opportunity opened", "window", windowID, "direction", selected.Direction, "input", selectedCandidate.Input, "net_pnl", selectedCandidate.NetPnL, "threshold", selectedCandidate.EffectiveThreshold, "discovery_duration", research.LocalTiming.Duration)
 	return state, report, nil
 }
@@ -441,14 +594,46 @@ func (r *Runner) trackFixedPoint(
 	store persistenceport.TrackingStore,
 	notifier *trackingNotifier,
 	simulations *simulationCoordinator,
+	validations *prefundedValidationCoordinator,
+	remote map[market.MarketID]eventRefreshedRuntime,
 	cost arbitrage.CostSnapshot,
 	signal fixedCandidateSignal,
 	state *fixedWindowState,
 	evaluationNumber int,
 ) (bool, Report, error) {
+	if signal.remoteTriggered {
+		if runtime, ok := remote[signal.trigger.Market]; ok && runtime.kyberMarket != nil {
+			if refreshErr := runtime.kyberMarket.Refresh(ctx); refreshErr != nil {
+				r.logger.Warn("remote quote cache refresh failed", "market", signal.trigger.Market, "error", refreshErr)
+			}
+		}
+	}
 	evaluationStarted := r.clock().UTC()
+	dynamicEvidence, dynamicCost, costsReady := CostEvidence{}, cost, true
+	if r.directionalCosts != nil {
+		fixedEvidence := CostEvidence{
+			FixedAmount: cost.Amount.Rat(), FixedAsset: cost.Amount.Asset(),
+			Cost: cost.Amount, Model: "configured_fixed", Available: true,
+		}
+		dynamicEvidence, dynamicCost, _, costsReady = r.remoteEvaluationCosts(
+			[]arbitrage.Direction{state.window.Direction}, fixedEvidence, cost,
+		)
+		if !costsReady {
+			var costErr error
+			dynamicEvidence, dynamicCost, _, costErr = r.unavailableRemoteCosts(
+				[]arbitrage.Direction{state.window.Direction},
+			)
+			if costErr != nil {
+				return false, Report{}, costErr
+			}
+		}
+	}
 	evaluationID := arbitrage.EvaluationID(fmt.Sprintf("route-tracking/%s/window/%s/%d", r.config.ResearchID, state.window.ID, state.sequence+1))
-	evaluation, err := arbitrage.NewEvaluation(evaluationID, arbitrage.ResearchRunID(r.config.RunID), pinned.ID(), r.config.Hash, signal.snapshots, cost, signal.triggerReceivedAt, evaluationStarted)
+	evaluation, err := arbitrage.NewEvaluation(evaluationID, arbitrage.ResearchRunID(r.config.RunID), pinned.ID(), r.config.Hash, signal.snapshots, dynamicCost, signal.triggerReceivedAt, evaluationStarted)
+	if err != nil {
+		return false, Report{}, err
+	}
+	evaluation, err = r.withQuoteConversions(evaluation)
 	if err != nil {
 		return false, Report{}, err
 	}
@@ -458,8 +643,16 @@ func (r *Runner) trackFixedPoint(
 		return false, Report{}, err
 	}
 	trace.EvaluationFinishedAt = r.clock().UTC()
+	if observer, ok := r.directionalCosts.(DirectionalCostObserver); ok {
+		observer.Observe([]arbitrage.Opportunity{opportunity})
+	}
+	if !costsReady {
+		opportunity.SelectedIndex = -1
+		opportunity.Classification = arbitrage.ClassificationUnclassifiable
+		opportunity.Reasons = []string{"cost_cache_stale"}
+	}
 	research := researchReportForPinned(r, opportunity, trace, evaluationNumber, signal.snapshots)
-	report := Report{Research: research}
+	report := Report{Research: research, Cost: dynamicEvidence}
 
 	state.sequence++
 	point := arbitrage.TrackingPoint{
@@ -561,6 +754,13 @@ func (r *Runner) trackFixedPoint(
 		if request, ok := r.simulationRequestForCandidate(state.window.ID, point.Sequence, candidate, signal.snapshots, opportunity.Classification == arbitrage.ClassificationPolicyQualified); ok {
 			simulations.submit(request, update)
 		}
+	}
+	if signal.localTriggered && hasCandidate && opportunity.Classification == arbitrage.ClassificationPolicyQualified {
+		copyOf := candidate
+		report.ImmediateCandidate = &copyOf
+		report.ImmediateDirection = state.window.Direction
+	} else if validations != nil && hasCandidate && opportunity.Classification == arbitrage.ClassificationPolicyQualified {
+		report.Validation, report.ExecutableCandidate = validations.validate(ctx, state.window.ID, point.Sequence, state.window.Direction, candidate, signal.snapshots, false)
 	}
 	point.Timestamps.NotificationEnqueuedAt = r.clock().UTC()
 	point.Timestamps.EvaluationFinishedAt = point.Timestamps.NotificationEnqueuedAt
@@ -702,9 +902,34 @@ func (r *Runner) fixedWindowUpdate(state *fixedWindowState, buyOutput market.Ass
 }
 
 type fixedRouteSink struct {
-	route   *crosschain.Route
-	child   market.MarketID
-	capture func(arbitrage.TriggerMetadata, bool)
+	route    composedRoute
+	routeID  market.MarketID
+	child    market.MarketID
+	children []market.MarketID
+	capture  func(arbitrage.TriggerMetadata, bool)
+}
+
+func (s *fixedRouteSink) PublishBatch(ctx context.Context, events []market.MarketEvent) error {
+	return s.PublishBatchTriggered(ctx, events, events[len(events)-1])
+}
+
+func (s *fixedRouteSink) PublishBatchTriggered(ctx context.Context, events []market.MarketEvent, trigger market.MarketEvent) error {
+	result, err := s.route.ApplyBatch(ctx, events)
+	if err != nil || result.Disposition == feedport.ApplyDispositionIgnoredStale {
+		return err
+	}
+	s.capture(triggerFromEvent(trigger), false)
+	return nil
+}
+
+func (s *fixedRouteSink) PublishBatchSynchronized(ctx context.Context, events []market.MarketEvent) error {
+	_, err := s.route.ApplyBatch(ctx, events)
+	return err
+}
+
+func (s *fixedRouteSink) PublishBatchStateOnly(ctx context.Context, events []market.MarketEvent) error {
+	_, err := s.route.ApplyBatch(ctx, events)
+	return err
 }
 
 func (s *fixedRouteSink) Publish(ctx context.Context, event market.MarketEvent) error {
@@ -725,14 +950,37 @@ func (s *fixedRouteSink) Reset(ctx context.Context, event market.MarketEvent) er
 	return nil
 }
 
+func (s *fixedRouteSink) ResetSynchronized(ctx context.Context, event market.MarketEvent) error {
+	_, err := s.route.Reset(ctx, event)
+	return err
+}
+
 func (s *fixedRouteSink) SetHealth(ctx context.Context, update feedport.HealthUpdate) error {
-	if err := s.route.SetChildHealth(ctx, s.child, update); err != nil {
-		return err
+	children := s.children
+	if len(children) == 0 {
+		children = []market.MarketID{s.child}
+	}
+	for _, child := range children {
+		if err := s.route.SetChildHealth(ctx, child, update); err != nil {
+			return err
+		}
 	}
 	if update.Health == market.HealthDegraded {
-		s.capture(syntheticTrackingTrigger(s.child, "market_degraded", update.ObservedAt), true)
+		triggerMarket := s.child
+		if triggerMarket == "" {
+			triggerMarket = s.routeID
+		}
+		s.capture(syntheticTrackingTrigger(triggerMarket, "market_degraded", update.ObservedAt), true)
 	}
 	return nil
+}
+
+func routeChildIDs(route routeRuntime) []market.MarketID {
+	result := make([]market.MarketID, 0, len(route.children))
+	for _, child := range route.children {
+		result = append(result, child.market.ID)
+	}
+	return result
 }
 
 func (s *fixedRouteSink) ApplyState(ctx context.Context, event market.MarketEvent) error {
@@ -750,6 +998,11 @@ func (s *fixedRouteSink) PublishTrigger(_ context.Context, event market.MarketEv
 
 func triggerFromEvent(event market.MarketEvent) arbitrage.TriggerMetadata {
 	return arbitrage.TriggerMetadata{Market: event.Market, Source: event.Source, Position: event.Position, Reference: event.Reference, At: event.ReceivedAt.UTC()}
+}
+
+func triggerMatchesMarket(trigger, configured market.MarketID) bool {
+	triggerText, configuredText := string(trigger), string(configured)
+	return trigger == configured || strings.HasPrefix(triggerText, configuredText+"/")
 }
 
 func syntheticTrackingTrigger(candidate market.MarketID, reason string, at time.Time) arbitrage.TriggerMetadata {
@@ -848,3 +1101,74 @@ func fixedTriggerDisplay(trigger arbitrage.TriggerMetadata) (string, string) {
 }
 
 var _ feedport.Sink = (*fixedRouteSink)(nil)
+
+type fixedTransactionDeduper struct {
+	mu    sync.Mutex
+	limit int
+	seen  map[string]struct{}
+	order []string
+}
+
+func newFixedTransactionDeduper(limit int) *fixedTransactionDeduper {
+	return &fixedTransactionDeduper{limit: limit, seen: make(map[string]struct{}), order: make([]string, 0, limit)}
+}
+
+func (d *fixedTransactionDeduper) accept(reference market.SourceReference) bool {
+	key := strings.ToLower(strings.TrimSpace(reference.Value))
+	if key == "" {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, exists := d.seen[key]; exists {
+		return false
+	}
+	d.seen[key] = struct{}{}
+	d.order = append(d.order, key)
+	for len(d.order) > d.limit {
+		delete(d.seen, d.order[0])
+		d.order = d.order[1:]
+	}
+	return true
+}
+
+type fixedEventTriggerSink struct {
+	market  market.MarketID
+	feed    string
+	store   *marketstream.EventSnapshotStore
+	capture func(arbitrage.TriggerMetadata, bool)
+	deduper *fixedTransactionDeduper
+}
+
+func (s *fixedEventTriggerSink) Publish(ctx context.Context, event market.MarketEvent) error {
+	changed, err := s.store.Publish(ctx, s.feed, event)
+	if err != nil || !changed {
+		return err
+	}
+	if s.deduper != nil && !s.deduper.accept(event.Reference) {
+		return nil
+	}
+	s.capture(arbitrage.TriggerMetadata{Market: s.market, Source: event.Source, Position: event.Position, Reference: event.Reference, At: event.ReceivedAt.UTC()}, false)
+	return nil
+}
+
+func (s *fixedEventTriggerSink) Reset(ctx context.Context, event market.MarketEvent) error {
+	_, err := s.store.Reset(ctx, s.feed, event)
+	return err
+}
+
+func (s *fixedEventTriggerSink) SetHealth(ctx context.Context, update feedport.HealthUpdate) error {
+	changed, err := s.store.SetHealth(ctx, s.feed, update)
+	if err != nil || !changed {
+		return err
+	}
+	snapshot, ok := s.store.Current()
+	if !ok {
+		return nil
+	}
+	metadata := snapshot.Metadata()
+	s.capture(arbitrage.TriggerMetadata{Market: s.market, Source: metadata.Source, Position: metadata.EventPosition, Reference: metadata.EventReference, At: update.ObservedAt.UTC()}, update.Health == market.HealthDegraded)
+	return nil
+}
+
+var _ feedport.Sink = (*fixedEventTriggerSink)(nil)

@@ -76,7 +76,8 @@ func NewManagerWithLimit(
 	if ctx == nil || executor == nil {
 		return nil, fmt.Errorf("live manager context and executor are required")
 	}
-	if planner.ExecutionUnits == nil || planner.ExecutionUnits.Sign() <= 0 {
+	if (planner.ExecutionUnits == nil || planner.ExecutionUnits.Sign() <= 0) &&
+		(planner.ExecutionAmount == nil || planner.ExecutionAmount.Sign() <= 0) && len(planner.AllowedExecutionAmounts) == 0 {
 		return nil, fmt.Errorf("live manager requires positive execution units")
 	}
 	if maxOperations < 0 {

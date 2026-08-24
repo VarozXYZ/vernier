@@ -26,10 +26,11 @@ type Client interface {
 }
 
 type Config struct {
-	BotToken string
-	ChatID   string
-	BaseURL  string
-	Client   Client
+	BotToken   string
+	ChatID     string
+	BaseURL    string
+	Client     Client
+	SetupLabel string
 }
 
 type Sender struct {
@@ -37,6 +38,7 @@ type Sender struct {
 	editEndpoint string
 	chatID       string
 	client       Client
+	setupLabel   string
 
 	liveMu       sync.Mutex
 	liveMessages map[string]*liveMessageState
@@ -57,10 +59,15 @@ func New(config Config) (*Sender, error) {
 	if config.Client == nil {
 		config.Client = &http.Client{Timeout: 5 * time.Second}
 	}
+	setupLabel := strings.ToUpper(strings.TrimSpace(config.SetupLabel))
+	if setupLabel == "" {
+		setupLabel = "LIVE"
+	}
 	return &Sender{
 		sendEndpoint: strings.TrimRight(base.String(), "/") + "/bot" + token + "/sendMessage",
 		editEndpoint: strings.TrimRight(base.String(), "/") + "/bot" + token + "/editMessageText",
 		chatID:       strings.TrimSpace(config.ChatID), client: config.Client,
+		setupLabel:   setupLabel,
 		liveMessages: make(map[string]*liveMessageState),
 	}, nil
 }
@@ -72,7 +79,7 @@ func (s *Sender) SendOpening(ctx context.Context, alert notificationport.Opportu
 		baseBought = `<a href="` + escape(alert.TriggerURL) + `">` + baseBought + `</a>`
 	}
 	lines := []string{
-		"🎯 <b>ARB · " + escape(signedAmount(alert.NetPnL)) + " net</b>",
+		"🎯 <b>" + escape(s.setupLabel) + " · ARB · " + escape(signedAmount(alert.NetPnL)) + " net</b>",
 		"📍 " + escape(strings.ReplaceAll(alert.Direction, "->", "→")),
 		"💱 <b>" + escape(compactAmount(alert.Input)) + "</b> → " +
 			baseBought + " → <b>" +
@@ -89,20 +96,20 @@ func (s *Sender) SendOpening(ctx context.Context, alert notificationport.Opportu
 }
 
 func (s *Sender) SendTrackingWindow(ctx context.Context, update notificationport.TrackingWindowUpdate) (int64, error) {
-	return s.send(ctx, trackingWindowText(update))
+	return s.send(ctx, trackingWindowText(s.setupLabel, update))
 }
 
 func (s *Sender) EditTrackingWindow(ctx context.Context, messageID int64, update notificationport.TrackingWindowUpdate) error {
 	if messageID <= 0 {
 		return fmt.Errorf("telegram tracking message ID is required")
 	}
-	return s.edit(ctx, messageID, trackingWindowText(update))
+	return s.edit(ctx, messageID, trackingWindowText(s.setupLabel, update))
 }
 
-func trackingWindowText(update notificationport.TrackingWindowUpdate) string {
+func trackingWindowText(setupLabel string, update notificationport.TrackingWindowUpdate) string {
 	history := append([]notificationport.TrackingHistoryPoint(nil), update.History...)
 	for {
-		text := strings.Join(trackingWindowLines(update, history), "\n")
+		text := strings.Join(trackingWindowLines(setupLabel, update, history), "\n")
 		if len([]rune(text)) <= 4000 || len(history) == 0 {
 			return text
 		}
@@ -110,7 +117,7 @@ func trackingWindowText(update notificationport.TrackingWindowUpdate) string {
 	}
 }
 
-func trackingWindowLines(update notificationport.TrackingWindowUpdate, history []notificationport.TrackingHistoryPoint) []string {
+func trackingWindowLines(setupLabel string, update notificationport.TrackingWindowUpdate, history []notificationport.TrackingHistoryPoint) []string {
 	icon, state := "\U0001f7e2", "OPEN"
 	switch strings.ToLower(strings.TrimSpace(update.State)) {
 	case "closed":
@@ -119,7 +126,7 @@ func trackingWindowLines(update notificationport.TrackingWindowUpdate, history [
 		icon, state = "\U0001f7e0", "UNCERTAIN"
 	}
 	lines := []string{
-		icon + " <b>" + state + " · " + escape(strings.ReplaceAll(update.Direction, "->", "→")) + "</b>",
+		icon + " <b>" + escape(setupLabel) + " · " + state + " · " + escape(strings.ReplaceAll(update.Direction, "->", "→")) + "</b>",
 		"\U0001f3af <b>" + escape(compactAmount(update.Input)) + "</b>",
 		"\U0001f4b1 " + escape(compactAmount(update.BuyOutput)) + " → <b>" + escape(compactAmount(update.SellOutput)) + "</b>",
 		"\U0001f4c8 Net <b>" + escape(signedAmount(update.NetPnL)) + "</b> · min " + escape(compactAmount(update.Threshold)),
@@ -168,7 +175,7 @@ func (s *Sender) SendConfigurationWarning(ctx context.Context, warning notificat
 		router = "not reported"
 	}
 	_, err := s.send(ctx, strings.Join([]string{
-		"⚠️ <b>CONFIG · JUPITER</b>",
+		"⚠️ <b>" + escape(s.setupLabel) + " · CONFIG · JUPITER</b>",
 		"📍 " + escape(warning.Market) + " · " + escape(warning.Provider),
 		"⚙️ " + escape(warning.Expected) + " → " + escape(warning.Observed) + " · " + escape(router),
 		"✅ Quote aceptado",
@@ -180,9 +187,43 @@ func (s *Sender) SendLiveRuntime(
 	ctx context.Context,
 	event notificationport.LiveRuntimeEvent,
 ) error {
+	if event.Kind == notificationport.LiveRuntimeCostCacheStale ||
+		event.Kind == notificationport.LiveRuntimeCostCacheRecovered {
+		title := "⚠️ <b>" + escape(s.setupLabel) + " · COST CACHE STALE</b>"
+		status := "New trades are blocked until fresh complete-flow costs are available"
+		if event.Kind == notificationport.LiveRuntimeCostCacheRecovered {
+			title = "✅ <b>" + escape(s.setupLabel) + " · COST CACHE RECOVERED</b>"
+			status = "Fresh complete-flow costs are available again"
+		}
+		reason := strings.TrimSpace(event.Reason)
+		if reason == "" {
+			reason = string(event.Kind)
+		}
+		_, err := s.send(ctx, strings.Join([]string{
+			title,
+			"🧭 " + escape(reason),
+			"🔒 " + escape(status),
+		}, "\n"))
+		return err
+	}
+	if event.Kind == notificationport.LiveRuntimeQuoteFXStale ||
+		event.Kind == notificationport.LiveRuntimeQuoteFXRecovered {
+		title := "⚠️ <b>" + escape(s.setupLabel) + " · QUOTE FX STALE</b>"
+		status := "New trades have been blocked for 30 seconds by unavailable quote-token FX"
+		if event.Kind == notificationport.LiveRuntimeQuoteFXRecovered {
+			title = "✅ <b>" + escape(s.setupLabel) + " · QUOTE FX RECOVERED</b>"
+			status = "Fresh quote-token FX is available again"
+		}
+		reason := strings.TrimSpace(event.Reason)
+		if reason == "" {
+			reason = string(event.Kind)
+		}
+		_, err := s.send(ctx, strings.Join([]string{title, "🧭 " + escape(reason), "🔒 " + escape(status)}, "\n"))
+		return err
+	}
 	if event.Kind == notificationport.LiveRuntimeValidationBlocked {
 		_, err := s.send(ctx, strings.Join([]string{
-			"\U0001f6d1 <b>LIVE · VALIDATION BLOCKED</b>",
+			"\U0001f6d1 <b>" + escape(s.setupLabel) + " · VALIDATION BLOCKED</b>",
 			"⚠️ " + escape(event.Reason),
 			"🔒 Broadcast disabled until manual acknowledgement",
 		}, "\n"))
@@ -190,9 +231,9 @@ func (s *Sender) SendLiveRuntime(
 	}
 	if event.Kind == notificationport.LiveRuntimeBalanceInsufficient ||
 		event.Kind == notificationport.LiveRuntimeBalanceRecovered {
-		title := "⚠️ <b>LIVE · INSUFFICIENT BALANCE</b>"
+		title := "⚠️ <b>" + escape(s.setupLabel) + " · INSUFFICIENT BALANCE</b>"
 		if event.Kind == notificationport.LiveRuntimeBalanceRecovered {
-			title = "✅ <b>LIVE · BALANCE RECOVERED</b>"
+			title = "✅ <b>" + escape(s.setupLabel) + " · BALANCE RECOVERED</b>"
 		}
 		lines := []string{
 			title,
@@ -213,7 +254,7 @@ func (s *Sender) SendLiveRuntime(
 		occurredAt = time.Now().UTC()
 	}
 	lines := []string{
-		"\U0001f7e2 <b>LIVE \u00b7 STARTED</b>",
+		"\U0001f7e2 <b>" + escape(s.setupLabel) + " \u00b7 STARTED</b>",
 		"\U0001f4cc Mode: <b>" + escape(mode) + "</b>",
 		"\u23f1\ufe0f " + escape(occurredAt.UTC().Format("2006-01-02 15:04:05 UTC")),
 	}
@@ -223,7 +264,7 @@ func (s *Sender) SendLiveRuntime(
 			reason = "stopped"
 		}
 		lines = []string{
-			"\U0001f6d1 <b>LIVE \u00b7 STOPPED</b>",
+			"\U0001f6d1 <b>" + escape(s.setupLabel) + " \u00b7 STOPPED</b>",
 			"\U0001f4cc Mode: <b>" + escape(mode) + "</b>",
 			"\U0001f9ed Reason: " + escape(reason),
 			"\u23f3 Uptime: " + escape(compactDuration(event.Uptime)),
@@ -249,7 +290,10 @@ func (s *Sender) SendLiveExecution(
 		s.liveMessages[event.Operation] = state
 	}
 	state.apply(event)
-	text := strings.Join(liveSummaryLines(state), "\n")
+	if !shouldPublishLiveExecution(state, event.Kind) {
+		return nil
+	}
+	text := strings.Join(liveSummaryLines(s.setupLabel, state), "\n")
 	if state.messageID == 0 {
 		messageID, err := s.send(ctx, text)
 		if err != nil {
@@ -259,6 +303,38 @@ func (s *Sender) SendLiveExecution(
 		return nil
 	}
 	return s.edit(ctx, state.messageID, text)
+}
+
+// Live execution progress is accumulated locally and sent only once the
+// operation reaches a terminal state. Recovery is the exception: it must be
+// visible even after a process restart, when the in-memory Telegram message ID
+// from the original execution is no longer available. In that case the first
+// recovery event creates a new message and later progress edits it.
+func shouldPublishLiveExecution(
+	state *liveMessageState,
+	kind notificationport.LiveExecutionEventKind,
+) bool {
+	switch kind {
+	case notificationport.LiveExecutionStageStarted,
+		notificationport.LiveExecutionStageCompleted:
+		// An asynchronous return may continue after the economic operation
+		// has published its first terminal summary. Update that existing
+		// message without making ordinary in-flight stages noisy.
+		return state.messageID != 0 && state.terminal != nil &&
+			state.terminal.Kind == notificationport.LiveExecutionCompleted
+	case notificationport.LiveExecutionCompleted,
+		notificationport.LiveExecutionFailed,
+		notificationport.LiveExecutionRecoveryBlocked,
+		notificationport.LiveExecutionRefuelCompleted,
+		notificationport.LiveExecutionRefuelFailed,
+		notificationport.LiveExecutionRefuelUncertain:
+		return true
+	case notificationport.LiveExecutionRecoveryStarted,
+		notificationport.LiveExecutionRecoveryProgress:
+		return true
+	default:
+		return false
+	}
 }
 
 type liveMessageState struct {
@@ -313,47 +389,55 @@ func (s *liveMessageState) apply(event notificationport.LiveExecutionEvent) {
 	}
 }
 
-func liveSummaryLines(state *liveMessageState) []string {
-	title := "\U0001f7e1 <b>LIVE · RUNNING</b>"
+func liveSummaryLines(setupLabel string, state *liveMessageState) []string {
+	label := escape(setupLabel)
+	title := "\U0001f7e1 <b>" + label + " · RUNNING</b>"
 	forcedCanary := state.started != nil &&
 		state.started.State == "forced_canary"
 	if forcedCanary {
-		title = "\U0001f9ea <b>CANARY · FORCED</b>"
+		title = "\U0001f9ea <b>" + label + " · CANARY FORCED</b>"
 	}
 	if state.terminal != nil {
 		switch state.terminal.Kind {
 		case notificationport.LiveExecutionCompleted:
-			title = "\U0001f3c1 <b>LIVE · COMPLETE</b>"
-			if forcedCanary {
-				title = "\U0001f3c1 <b>CANARY · COMPLETE</b>"
+			if len(state.starting) > 0 {
+				title = "\U0001f504 <b>" + label + " · RETURN PENDING</b>"
+				if forcedCanary {
+					title = "\U0001f504 <b>" + label + " · CANARY RETURN PENDING</b>"
+				}
+			} else {
+				title = "\U0001f3c1 <b>" + label + " · COMPLETE</b>"
+				if forcedCanary {
+					title = "\U0001f3c1 <b>" + label + " · CANARY COMPLETE</b>"
+				}
 			}
 		case notificationport.LiveExecutionFailed:
-			title = "\U0001f6a8 <b>LIVE · MANUAL ACTION</b>"
+			title = "\U0001f6a8 <b>" + label + " · MANUAL ACTION</b>"
 			if forcedCanary {
-				title = "\U0001f6a8 <b>CANARY · MANUAL ACTION</b>"
+				title = "\U0001f6a8 <b>" + label + " · CANARY MANUAL ACTION</b>"
 			}
 			if state.terminal.State == "aborted" ||
 				state.terminal.State == "aborted_retrying" {
-				title = "\u26d4 <b>LIVE · ABORTED</b>"
+				title = "\u26d4 <b>" + label + " · ABORTED</b>"
 				if forcedCanary {
-					title = "\u26d4 <b>CANARY · ABORTED</b>"
+					title = "\u26d4 <b>" + label + " · CANARY ABORTED</b>"
 				}
 			}
 		case notificationport.LiveExecutionRecoveryBlocked:
-			title = "\U0001f6d1 <b>LIVE · RECOVERY BLOCKED</b>"
+			title = "\U0001f6d1 <b>" + label + " · RECOVERY BLOCKED</b>"
 		case notificationport.LiveExecutionRefuelCompleted:
-			title = "\u26fd <b>GAS · REFUELED</b>"
+			title = "\u26fd <b>" + label + " · GAS REFUELED</b>"
 		case notificationport.LiveExecutionRefuelFailed:
-			title = "\u26a0\ufe0f <b>GAS · REFUEL FAILED</b>"
+			title = "\u26a0\ufe0f <b>" + label + " · GAS REFUEL FAILED</b>"
 		case notificationport.LiveExecutionRefuelUncertain:
-			title = "\U0001f6d1 <b>GAS · OUTCOME UNKNOWN</b>"
+			title = "\U0001f6d1 <b>" + label + " · GAS OUTCOME UNKNOWN</b>"
 		}
 	} else if state.recovery != nil {
 		switch state.recovery.Kind {
 		case notificationport.LiveExecutionRecoveryCompleted:
-			title = "\u2705 <b>LIVE · RECOVERED</b>"
+			title = "\u2705 <b>" + label + " · RECOVERED</b>"
 		default:
-			title = "\U0001f6e1\ufe0f <b>LIVE · RECOVERING</b>"
+			title = "\U0001f6e1\ufe0f <b>" + label + " · RECOVERING</b>"
 		}
 	}
 	lines := []string{title}

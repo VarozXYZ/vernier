@@ -15,6 +15,7 @@ import (
 
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
+	"github.com/VarozXYZ/vernier/internal/safeerr"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 
 	_ "modernc.org/sqlite"
@@ -213,6 +214,20 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			retry_at TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(operation_id, attempt_index)
 		)`,
+		`CREATE TABLE IF NOT EXISTS sequential_live_trigger_first_decisions (
+			operation_id TEXT NOT NULL REFERENCES sequential_live_operations(operation_id),
+			ordinal INTEGER NOT NULL,
+			decision_kind TEXT NOT NULL DEFAULT 'economic_75_25',
+			expected_net TEXT NOT NULL,
+			reserved_headroom TEXT NOT NULL,
+			consumable_budget TEXT NOT NULL,
+			minimum_output_token TEXT NOT NULL,
+			minimum_output_units TEXT NOT NULL,
+			equivalent_slippage_bps INTEGER NOT NULL,
+			allocation_hash TEXT NOT NULL,
+			decided_at TEXT NOT NULL,
+			PRIMARY KEY(operation_id, ordinal)
+		)`,
 		`CREATE TABLE IF NOT EXISTS live_refuel_operations (
 			refuel_id TEXT PRIMARY KEY,
 			chain_name TEXT NOT NULL,
@@ -237,6 +252,61 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 		`CREATE UNIQUE INDEX IF NOT EXISTS one_active_live_refuel
 			ON live_refuel_operations((1))
 			WHERE state IN ('prepared', 'broadcast', 'outcome_unknown')`,
+		`CREATE TABLE IF NOT EXISTS parallel_base_restoration (
+			singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+			operation_id TEXT NOT NULL DEFAULT '',
+			pending INTEGER NOT NULL CHECK(pending IN (0, 1)),
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS parallel_quote_restorations (
+			job_id TEXT PRIMARY KEY,
+			operation_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			source_chain TEXT NOT NULL DEFAULT '',
+			destination_chain TEXT NOT NULL DEFAULT '',
+			input_token TEXT NOT NULL DEFAULT '',
+			output_token TEXT NOT NULL DEFAULT '',
+			input_units TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS two_active_parallel_quote_restorations_guard
+			ON parallel_quote_restorations(job_id)
+			WHERE state IN ('pending', 'broadcast', 'outcome_unknown')`,
+		`CREATE TABLE IF NOT EXISTS parallel_reevaluation_coalescer (
+			singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+			market_id TEXT NOT NULL,
+			source_id TEXT NOT NULL,
+			position_kind TEXT NOT NULL,
+			position_value INTEGER NOT NULL,
+			reference_kind TEXT NOT NULL,
+			reference_value TEXT NOT NULL,
+			triggered_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS live_approvals (
+			id TEXT PRIMARY KEY,
+			chain_id TEXT NOT NULL,
+			token_id TEXT NOT NULL,
+			spender TEXT NOT NULL,
+			amount_units TEXT NOT NULL,
+			tx_hash TEXT NOT NULL,
+			tx_nonce INTEGER,
+			state TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(chain_id, tx_hash)
+		)`,
+		`CREATE TABLE IF NOT EXISTS live_notification_outbox (
+			id TEXT PRIMARY KEY,
+			payload_json BLOB NOT NULL,
+			state TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			_ = db.Close()
@@ -327,6 +397,13 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 			ADD COLUMN depends_on TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sequential_live_plan_stages
 			ADD COLUMN input_from_ordinal INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sequential_live_trigger_first_decisions
+			ADD COLUMN decision_kind TEXT NOT NULL DEFAULT 'economic_75_25'`,
+		`ALTER TABLE parallel_quote_restorations ADD COLUMN source_chain TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE parallel_quote_restorations ADD COLUMN destination_chain TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE parallel_quote_restorations ADD COLUMN input_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE parallel_quote_restorations ADD COLUMN output_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE parallel_quote_restorations ADD COLUMN input_units TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(migration); err != nil &&
 			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -350,11 +427,62 @@ func OpenSequentialLive(path string) (*SequentialLiveStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	for _, target := range []struct {
+		table  string
+		column string
+	}{
+		{table: "sequential_live_operations", column: "last_error"},
+		{table: "sequential_live_transactions", column: "last_error"},
+		{table: "sequential_live_recovery_attempts", column: "detail"},
+	} {
+		if err := sanitizeDurableDiagnostics(
+			db,
+			target.table,
+			target.column,
+		); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf(
+				"sanitize sequential Live diagnostics: %w",
+				err,
+			)
+		}
+	}
 	return &SequentialLiveStore{db: db}, nil
+}
+
+func (s *SequentialLiveStore) RecordTriggerFirstDecision(ctx context.Context,
+	decision executionport.TriggerFirstDecision) error {
+	if err := decision.Validate(); err != nil {
+		return err
+	}
+	if decision.Kind == "" {
+		decision.Kind = executionport.TriggerFirstDecisionEconomic75_25
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO sequential_live_trigger_first_decisions (
+		operation_id, ordinal, decision_kind, expected_net, reserved_headroom, consumable_budget,
+		minimum_output_token, minimum_output_units, equivalent_slippage_bps,
+		allocation_hash, decided_at
+	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (
+		SELECT 1 FROM sequential_live_operations WHERE operation_id=? AND state IN ('running','recovering')
+	)`, decision.Operation, decision.Ordinal, decision.Kind, decision.ExpectedNet, decision.ReservedHeadroom,
+		decision.ConsumableBudget, decision.MinimumOutputToken, decision.MinimumOutputUnits,
+		decision.EquivalentBPS, decision.AllocationHash, decision.DecidedAt.UTC().Format(time.RFC3339Nano),
+		decision.Operation)
+	if err != nil {
+		return fmt.Errorf("persist trigger-first execution decision: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return fmt.Errorf("running sequential operation was not found for trigger-first decision")
+	}
+	return nil
 }
 
 func sequentialMigrationRequired(db *sql.DB) (bool, error) {
 	for table, columns := range map[string][]string{
+		"sequential_live_trigger_first_decisions": {
+			"decision_kind",
+		},
 		"sequential_live_transactions": {
 			"simulation_input_token", "simulation_input_units",
 			"simulation_output_token", "simulation_output_units",
@@ -481,12 +609,15 @@ func (s *SequentialLiveStore) RecordSequentialResult(
 ) error {
 	if result.Operation == "" || result.FinalAmount.IsZero() ||
 		(len(result.Settlements) != 5 && len(result.Settlements) != 4 &&
-			len(result.Settlements) != 2) ||
+			len(result.Settlements) != 3 && len(result.Settlements) != 2) ||
 		result.ExecutionCost.Asset() == "" ||
 		result.ExternalCost.Asset() != result.ExecutionCost.Asset() ||
 		result.RealizedGross.Asset() != result.ExecutionCost.Asset() ||
 		result.RealizedNetPnL.Asset() != result.ExecutionCost.Asset() {
 		return fmt.Errorf("sequential Live result is incomplete")
+	}
+	if err := applyAsyncQuoteAdjustmentToResult(ctx, s.db, &result); err != nil {
+		return err
 	}
 	inserted, err := s.db.ExecContext(ctx, `INSERT INTO sequential_live_results (
 		operation_id, final_token, final_units, cost_asset, cost_value,
@@ -497,7 +628,7 @@ func (s *SequentialLiveStore) RecordSequentialResult(
 		WHERE EXISTS (
 			SELECT 1 FROM sequential_live_operations
 			WHERE operation_id=? AND state IN ('running', 'recovering')
-				AND current_stage IN (2, 4, 5)
+				AND current_stage IN (2, 3, 4, 5)
 			)`,
 		result.Operation, result.FinalAmount.Token(),
 		result.FinalAmount.Units().String(), result.ExecutionCost.Asset(),
@@ -566,16 +697,26 @@ func (s *SequentialLiveStore) RecordPreparedTransaction(
 		simulation_units_consumed, status, prepared_at, updated_at
 	) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?
 		WHERE EXISTS (
-			SELECT 1 FROM sequential_live_operations
-			WHERE operation_id=? AND state IN ('running', 'recovering')
-			)`,
+			SELECT 1 FROM sequential_live_operations o
+			WHERE o.operation_id=? AND (
+				o.state IN ('running', 'recovering') OR
+				(o.state='completed' AND ?=4 AND EXISTS (
+					SELECT 1 FROM sequential_live_plan_snapshots p
+					WHERE p.operation_id=o.operation_id AND p.execution_policy_kind IN (
+						'prefunded_parallel', 'prefunded_trigger_first'
+					)
+				) AND EXISTS (
+					SELECT 1 FROM parallel_quote_restorations r
+					WHERE r.operation_id=o.operation_id AND r.state IN ('pending', 'broadcast', 'outcome_unknown')
+				))
+			))`,
 		prepared.Operation, prepared.Ordinal, prepared.Phase,
 		prepared.Identity.Chain, prepared.Identity.Account,
 		prepared.Identity.Hash, nonce, prepared.Identity.Blockhash,
 		prepared.Identity.LastValidBlockHeight, simInToken, simInUnits,
 		simOutToken, simOutUnits, prepared.SimulationEvidence,
 		prepared.SimulationContextVersion, prepared.SimulationUnitsConsumed,
-		at, at, prepared.Operation,
+		at, at, prepared.Operation, prepared.Ordinal,
 	)
 	if err != nil {
 		return fmt.Errorf("persist prepared sequential transaction: %w", err)
@@ -780,7 +921,7 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 	if err := validateSettlementExtension(
 		ctx, tx, settlement, state, currentStage, currentToken, currentUnits,
 	); err != nil {
-		return fmt.Errorf("sequential settlement does not extend the durable operation state")
+		return fmt.Errorf("sequential settlement does not extend the durable operation state: %w", err)
 	}
 	destination := ""
 	if settlement.DestinationIdentity != nil {
@@ -845,7 +986,129 @@ func (s *SequentialLiveStore) RecordStageSettlement(
 	if err != nil {
 		return err
 	}
+	if settlement.Request.Stage.Ordinal == 4 && settlement.Request.Stage.Stage == domainexecution.StageBridgeQuoteReturn {
+		if err := applyAsyncQuoteAdjustmentToStoredResult(ctx, tx, settlement.Request.Operation); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+type sqliteCostQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func asyncQuoteAdjustments(ctx context.Context, query sqliteCostQueryer, operation domainexecution.OperationID,
+	asset market.AssetID) (total, external, included *big.Rat, active bool, err error) {
+	total, external, included = new(big.Rat), new(big.Rat), new(big.Rat)
+	var jobs int
+	if err = query.QueryRowContext(ctx, `SELECT COUNT(*) FROM parallel_quote_restorations WHERE operation_id=?`, operation).Scan(&jobs); err != nil || jobs == 0 {
+		return total, external, included, false, err
+	}
+	rows, err := query.QueryContext(ctx, `SELECT quote_asset, quote_value, included_in_output
+		FROM sequential_live_costs WHERE operation_id=? AND ordinal=4`, operation)
+	if err != nil {
+		return total, external, included, true, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var quoteAsset, valueText string
+		var isIncluded int
+		if err := rows.Scan(&quoteAsset, &valueText, &isIncluded); err != nil {
+			return total, external, included, true, err
+		}
+		if quoteAsset != string(asset) || strings.TrimSpace(valueText) == "" {
+			return total, external, included, true, fmt.Errorf("asynchronous quote restoration cost is not valued in %s", asset)
+		}
+		value, ok := new(big.Rat).SetString(valueText)
+		if !ok || value.Sign() < 0 {
+			return total, external, included, true, fmt.Errorf("asynchronous quote restoration cost is invalid")
+		}
+		total.Add(total, value)
+		if isIncluded != 0 {
+			included.Add(included, value)
+		} else {
+			external.Add(external, value)
+		}
+	}
+	return total, external, included, true, rows.Err()
+}
+
+func applyAsyncQuoteAdjustmentToResult(ctx context.Context, query sqliteCostQueryer, result *executionport.SequentialResult) error {
+	total, external, included, active, err := asyncQuoteAdjustments(ctx, query, result.Operation, result.ExecutionCost.Asset())
+	if err != nil || !active || total.Sign() == 0 {
+		return err
+	}
+	add := func(value market.AssetQuantity, delta *big.Rat) (market.AssetQuantity, error) {
+		quantity, quantityErr := market.NewAssetQuantity(value.Asset(), delta)
+		if quantityErr != nil {
+			return market.AssetQuantity{}, quantityErr
+		}
+		return value.Add(quantity)
+	}
+	subtract := func(value market.AssetQuantity, delta *big.Rat) (market.AssetQuantity, error) {
+		quantity, quantityErr := market.NewAssetQuantity(value.Asset(), delta)
+		if quantityErr != nil {
+			return market.AssetQuantity{}, quantityErr
+		}
+		return value.Sub(quantity)
+	}
+	if result.ExecutionCost, err = add(result.ExecutionCost, total); err != nil {
+		return err
+	}
+	if result.ExternalCost, err = add(result.ExternalCost, external); err != nil {
+		return err
+	}
+	if result.RealizedGross, err = subtract(result.RealizedGross, included); err != nil {
+		return err
+	}
+	result.RealizedNetPnL, err = subtract(result.RealizedNetPnL, total)
+	return err
+}
+
+func applyAsyncQuoteAdjustmentToStoredResult(ctx context.Context, tx *sql.Tx, operation domainexecution.OperationID) error {
+	var asset, costText, externalText, grossText, netText string
+	err := tx.QueryRowContext(ctx, `SELECT cost_asset, cost_value, external_cost_value, gross_value, net_value
+		FROM sequential_live_results WHERE operation_id=?`, operation).Scan(&asset, &costText, &externalText, &grossText, &netText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	total, external, included, active, err := asyncQuoteAdjustments(ctx, tx, operation, market.AssetID(asset))
+	if err != nil || !active || total.Sign() == 0 {
+		return err
+	}
+	parse := func(text string) (*big.Rat, error) {
+		value, ok := new(big.Rat).SetString(text)
+		if !ok {
+			return nil, fmt.Errorf("stored sequential result value is invalid")
+		}
+		return value, nil
+	}
+	cost, err := parse(costText)
+	if err != nil {
+		return err
+	}
+	externalCost, err := parse(externalText)
+	if err != nil {
+		return err
+	}
+	gross, err := parse(grossText)
+	if err != nil {
+		return err
+	}
+	net, err := parse(netText)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE sequential_live_results SET cost_value=?, external_cost_value=?, gross_value=?, net_value=?, recorded_at=? WHERE operation_id=?`,
+		new(big.Rat).Add(cost, total).RatString(), new(big.Rat).Add(externalCost, external).RatString(),
+		new(big.Rat).Sub(gross, included).RatString(), new(big.Rat).Sub(net, total).RatString(),
+		time.Now().UTC().Format(time.RFC3339Nano), operation)
+	return err
 }
 
 func validateSettlementExtension(
@@ -856,10 +1119,8 @@ func validateSettlementExtension(
 	currentStage int,
 	currentToken, currentUnits string,
 ) error {
-	if state != string(domainexecution.SequentialRunning) &&
-		state != string(domainexecution.SequentialRecovering) {
-		return fmt.Errorf("operation is not executable")
-	}
+	active := state == string(domainexecution.SequentialRunning) ||
+		state == string(domainexecution.SequentialRecovering)
 	var policy domainexecution.ExecutionPolicyKind
 	err := tx.QueryRowContext(ctx, `SELECT execution_policy_kind
 		FROM sequential_live_plan_snapshots WHERE operation_id=?`,
@@ -868,6 +1129,9 @@ func validateSettlementExtension(
 	if errors.Is(err, sql.ErrNoRows) ||
 		policy == "" ||
 		policy == domainexecution.PolicyTransportedSequential {
+		if !active {
+			return fmt.Errorf("operation is not executable")
+		}
 		if currentStage+1 != settlement.Request.Stage.Ordinal ||
 			currentToken != string(settlement.Request.Input.Token()) ||
 			currentUnits != settlement.Request.Input.Units().String() {
@@ -878,8 +1142,24 @@ func validateSettlementExtension(
 	if err != nil {
 		return err
 	}
-	if policy != domainexecution.PolicyPrefundedSequential &&
-		policy != domainexecution.PolicyPrefundedParallel {
+	parallelPolicy := policy == domainexecution.PolicyPrefundedParallel ||
+		policy == domainexecution.PolicyPrefundedTriggerFirst
+	lateQuoteReturn := state == string(domainexecution.SequentialCompleted) &&
+		parallelPolicy &&
+		settlement.Request.Stage.Ordinal == 4 &&
+		settlement.Request.Stage.Stage == domainexecution.StageBridgeQuoteReturn
+	if lateQuoteReturn {
+		var jobs int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM parallel_quote_restorations
+			WHERE operation_id=? AND state IN ('pending', 'broadcast', 'outcome_unknown')`,
+			settlement.Request.Operation).Scan(&jobs); err != nil || jobs != 1 {
+			return fmt.Errorf("completed operation has no active quote restoration")
+		}
+	}
+	if !active && !lateQuoteReturn {
+		return fmt.Errorf("operation is not executable")
+	}
+	if policy != domainexecution.PolicyPrefundedSequential && !parallelPolicy {
 		return fmt.Errorf("unsupported dependent execution policy")
 	}
 
@@ -901,7 +1181,7 @@ func validateSettlementExtension(
 	if stage != string(settlement.Request.Stage.Stage) {
 		return fmt.Errorf("settlement does not match its durable stage")
 	}
-	if policy == domainexecution.PolicyPrefundedParallel {
+	if parallelPolicy {
 		normal := inputToken == string(settlement.Request.Input.Token()) &&
 			outputToken == string(settlement.ActualOutput.Token()) &&
 			sourceChain == string(settlement.Request.Stage.SourceChain) &&
@@ -1020,7 +1300,7 @@ func (s *SequentialLiveStore) FinishSequentialOperation(
 	}
 	message := ""
 	if cause != nil {
-		message = cause.Error()
+		message = safeerr.Message(cause)
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE sequential_live_operations
 		SET state=?, last_error=?, updated_at=?

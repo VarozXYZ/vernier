@@ -88,7 +88,7 @@ func TestGridTwoStageSplitMatchesExhaustiveSearchAtUnitResolution(t *testing.T) 
 
 func TestSplitDoesNotDuplicateSharedSecondStageLiquidity(t *testing.T) {
 	result, err := sizing.OptimizeTwoStageSplit(context.Background(), sizing.TwoStageSplitRequest{
-		TotalInput: big.NewInt(100),
+		TotalInput: big.NewInt(109),
 		FirstStage: curves("first", []integerCurve{
 			constantProduct(100, 100),
 			constantProduct(100, 100),
@@ -197,6 +197,33 @@ func TestSplitTreatsRoundedZeroOutputAsZeroValuedAllocation(t *testing.T) {
 		if allocation.CurveID == "rounded-zero" && allocation.AmountIn.Sign() != 0 {
 			t.Fatalf("rounded-zero curve received input %s", allocation.AmountIn)
 		}
+	}
+}
+
+func TestSplitDropsDustIntermediateBranchThatCannotProduceOutput(t *testing.T) {
+	result, err := sizing.OptimizeTwoStageSplit(context.Background(), sizing.TwoStageSplitRequest{
+		TotalInput: big.NewInt(109),
+		Direct:     []sizing.SplitCurve{curve("direct", func(input int64) int64 { return input / 10 })},
+		FirstStage: []sizing.SplitCurve{curve("first", func(input int64) int64 {
+			if input < 10 {
+				return 0
+			}
+			return input / 20
+		})},
+		SecondStage: []sizing.SplitCurve{curve("second", func(input int64) int64 { return input })},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation, err := sizing.BuildRouteAllocation(result, "input", "middle", "output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allocation.Groups) != 1 || allocation.Groups[0].ID != "direct" {
+		t.Fatalf("dust intermediate branch was retained: %+v", allocation.Groups)
+	}
+	if allocation.Groups[0].Branches[0].PlannedInput.Cmp(big.NewInt(109)) != 0 {
+		t.Fatalf("direct route input = %s, want 109", allocation.Groups[0].Branches[0].PlannedInput)
 	}
 }
 
@@ -409,6 +436,31 @@ func BenchmarkGridTwoStageSplit(b *testing.B) {
 		}
 		b.ReportMetric(float64(result.Metrics.CurveEvaluations), "curve-evals/op")
 		b.ReportMetric(float64(result.Metrics.ObjectiveEvaluations), "objectives/op")
+	}
+}
+
+// BenchmarkOperationalOnePlusOne mirrors the production topology: one direct
+// branch and one two-hop branch. It is the latency guard used by local Live
+// composition; the wider benchmark above remains a stress profile.
+func BenchmarkOperationalOnePlusOne(b *testing.B) {
+	request := sizing.TwoStageSplitRequest{
+		TotalInput: big.NewInt(500_000_000),
+		Direct: []sizing.SplitCurve{
+			curve("direct", constantProduct(900_000_000, 700_000_000)),
+		},
+		FirstStage: []sizing.SplitCurve{
+			curve("first", constantProduct(1_200_000_000, 800_000_000)),
+		},
+		SecondStage: []sizing.SplitCurve{
+			curve("second", constantProduct(1_100_000_000, 900_000_000)),
+		},
+		MaxSweeps: 8, MaxStarts: 1, Neighborhood: 8,
+	}
+	b.ResetTimer()
+	for range b.N {
+		if _, err := sizing.OptimizeTwoStageSplit(context.Background(), request); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

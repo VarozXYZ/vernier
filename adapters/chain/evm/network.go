@@ -7,9 +7,19 @@ import (
 
 	geth "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 )
+
+var ErrBatchCallsUnsupported = fmt.Errorf("EVM batch contract calls are unsupported")
+
+type ContractCall struct{ Message geth.CallMsg }
+
+type BatchContractCaller interface {
+	BatchCallContracts(context.Context, BlockReference, []ContractCall) ([][]byte, error)
+}
 
 // Client is the JSON-RPC surface required by a read-only EVM network.
 type Client interface {
@@ -136,6 +146,34 @@ func (n *ReadOnlyNetwork) CallContract(ctx context.Context, block BlockReference
 	return result, nil
 }
 
+// BatchCallContracts evaluates independent eth_call requests at one immutable
+// block hash. It is a bootstrap optimization only; callers must preserve a
+// sequential fallback for clients that do not expose raw JSON-RPC batching.
+func (n *ReadOnlyNetwork) BatchCallContracts(ctx context.Context, block BlockReference, calls []ContractCall) ([][]byte, error) {
+	client, ok := n.http.(*ethclient.Client)
+	if !ok || len(calls) == 0 {
+		return nil, ErrBatchCallsUnsupported
+	}
+	results := make([]hexutil.Bytes, len(calls))
+	elements := make([]rpc.BatchElem, len(calls))
+	blockRef := map[string]any{"blockHash": block.Hash, "requireCanonical": true}
+	for index, call := range calls {
+		elements[index] = rpc.BatchElem{Method: "eth_call",
+			Args: []any{rpcArguments(call.Message), blockRef}, Result: &results[index]}
+	}
+	if err := client.Client().BatchCallContext(ctx, elements); err != nil {
+		return nil, fmt.Errorf("batch call %s contracts at block %d: %w", n.label, block.Number, err)
+	}
+	output := make([][]byte, len(elements))
+	for index, element := range elements {
+		if element.Error != nil {
+			return nil, fmt.Errorf("batch call %s contract %d at block %d: %w", n.label, index, block.Number, element.Error)
+		}
+		output[index] = append([]byte(nil), results[index]...)
+	}
+	return output, nil
+}
+
 func (n *ReadOnlyNetwork) CodeAt(ctx context.Context, block BlockReference, address common.Address) ([]byte, error) {
 	code, err := n.http.CodeAtHash(ctx, address, block.Hash)
 	if err != nil {
@@ -152,3 +190,4 @@ func (n *ReadOnlyNetwork) Close() {
 }
 
 var _ Network = (*ReadOnlyNetwork)(nil)
+var _ BatchContractCaller = (*ReadOnlyNetwork)(nil)

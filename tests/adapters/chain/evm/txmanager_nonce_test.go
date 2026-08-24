@@ -122,6 +122,72 @@ func TestBroadcastRejectedDoesNotConsumeNonce(t *testing.T) {
 	}
 }
 
+func TestAllFanoutNonceTooLowIsTypedAndCanResynchronize(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := &nonceTestClient{nonce: 12}
+	lowA := &nonceTestClient{nonce: 12, sendErr: errors.New("nonce too low")}
+	lowB := &nonceTestClient{nonce: 12, sendErr: errors.New("nonce too low: next nonce 13")}
+	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
+		Chain: "polygon", Account: "polygon-executor", ChainID: big.NewInt(137),
+		PrivateKey: key, Primary: primary,
+		Fanout: map[string]evmadapter.TxClient{"a": lowA, "b": lowB}, Clock: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Warm(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.Broadcast(context.Background(), nonceTestPreparedTransaction(t, 12))
+	var nonceLow *chainport.AllFanoutNonceTooLowError
+	if !errors.As(err, &nonceLow) {
+		t.Fatalf("error=%v; want AllFanoutNonceTooLowError", err)
+	}
+	if result.Disposition != chainport.BroadcastRejected || nonceLow.Nonce != 12 || nonceLow.Attempts != 2 {
+		t.Fatalf("result=%+v nonceLow=%+v", result, nonceLow)
+	}
+	primary.nonce = 15
+	refreshed, err := manager.ResyncNonce(context.Background(), 12)
+	if err != nil || refreshed != 15 {
+		t.Fatalf("ResyncNonce() = %d, %v; want 15, nil", refreshed, err)
+	}
+	manager.MarkNonceUsed(16)
+	primary.nonce = 14
+	if _, err := manager.ResyncNonce(context.Background(), 12); err != nil {
+		t.Fatal(err)
+	}
+	next, _ := manager.NextNonce()
+	if next != 17 {
+		t.Fatalf("lagging resync regressed nonce to %d; want 17", next)
+	}
+}
+
+func TestMixedFanoutNonceTooLowDoesNotClaimDeterministicNonceFailure(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := &nonceTestClient{nonce: 12}
+	manager, err := evmadapter.NewTxManager(evmadapter.TxManagerConfig{
+		Chain: "polygon", Account: "polygon-executor", ChainID: big.NewInt(137),
+		PrivateKey: key, Primary: primary,
+		Fanout: map[string]evmadapter.TxClient{
+			"low":      &nonceTestClient{sendErr: errors.New("nonce too low")},
+			"accepted": &nonceTestClient{},
+		}, Clock: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.Broadcast(context.Background(), nonceTestPreparedTransaction(t, 12))
+	if err != nil || !result.Accepted {
+		t.Fatalf("mixed fanout result=%+v err=%v; want accepted", result, err)
+	}
+}
+
 func nonceTestPreparedTransaction(
 	t *testing.T,
 	nonce uint64,

@@ -24,10 +24,12 @@ import (
 )
 
 type eventRefreshedRuntime struct {
-	config configuration.ResolvedMarket
-	store  *marketstream.EventSnapshotStore
-	source quoteport.Source
-	feeds  []eventTriggerFeed
+	config      configuration.ResolvedMarket
+	store       *marketstream.EventSnapshotStore
+	source      quoteport.Source
+	feeds       []eventTriggerFeed
+	kyberMarket *kyberswap.MarketSource
+	kyberClient *kyberswap.Source
 }
 
 type eventTriggerFeed struct {
@@ -97,7 +99,7 @@ func (r *Runner) runEventRefreshedStream(ctx context.Context, options StreamOpti
 		if buildErr != nil {
 			return buildErr
 		}
-		source := quoteport.Source(route.route.Source)
+		source := route.source
 		if configured.ReferenceQuote != "" {
 			reference, referenceErr := r.externalSource(configured, source)
 			if referenceErr != nil {
@@ -135,6 +137,14 @@ func (r *Runner) runEventRefreshedStream(ctx context.Context, options StreamOpti
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
+	for _, runtime := range remote {
+		profile := r.config.QuoteSources[runtime.config.QuoteSource]
+		if runtime.kyberMarket != nil && profile.RefreshInterval > 0 {
+			// Keep the latest remote routes warm off the event hot path. The
+			// timer is measured from quote receipt by MarketSource.
+			runtime.kyberMarket.StartRefresh(runCtx, profile.RefreshInterval)
+		}
+	}
 	signals := make(chan streamSignal, 256)
 	type feedFailure struct {
 		market market.MarketID
@@ -147,6 +157,19 @@ func (r *Runner) runEventRefreshedStream(ctx context.Context, options StreamOpti
 	defer feeds.Wait()
 	defer cancel()
 	for routeID, route := range local {
+		if route.batchFeed != nil {
+			routeID, route := routeID, route
+			feeds.Add(1)
+			go func() {
+				defer feeds.Done()
+				runErr := route.batchFeed.Run(runCtx, &routeStreamSink{route: route.route,
+					children: routeChildIDs(route), routeID: routeID, signals: signals})
+				if runErr != nil && !errors.Is(runErr, context.Canceled) {
+					failures <- feedFailure{market: routeID, err: runErr}
+				}
+			}()
+			continue
+		}
 		for _, child := range route.children {
 			child, routeID, route := child, routeID, route
 			feeds.Add(1)
@@ -185,6 +208,15 @@ func (r *Runner) runEventRefreshedStream(ctx context.Context, options StreamOpti
 			}
 			return failure.err
 		case signal := <-signals:
+			remoteTriggered := false
+			if _, ok := remote[signal.market]; ok {
+				remoteTriggered = true
+				for _, runtime := range remote {
+					if runtime.config.ID == signal.market && runtime.kyberMarket != nil {
+						runtime.kyberMarket.Invalidate()
+					}
+				}
+			}
 			snapshots, ready := eventStreamSnapshots(r.config.Markets, local, remote)
 			if !ready {
 				continue
@@ -195,11 +227,19 @@ func (r *Runner) runEventRefreshedStream(ctx context.Context, options StreamOpti
 				// Clear any marker left by a prior completed Evaluation before
 				// observing this attempt.
 				_ = takeEventRateLimitRetry(remote)
-				research, err = r.evaluate(
-					runCtx, candidate, snapshots, cost,
-					fmt.Sprintf("event-stream/%s/%d", r.config.ResearchID, evaluations+1),
-					signal.triggered, triggerPointer(signal),
-				)
+				if remoteTriggered {
+					research, err = r.evaluateFresh(
+						runCtx, candidate, snapshots, cost,
+						fmt.Sprintf("event-stream/%s/%d", r.config.ResearchID, evaluations+1),
+						signal.triggered, triggerPointer(signal),
+					)
+				} else {
+					research, err = r.evaluate(
+						runCtx, candidate, snapshots, cost,
+						fmt.Sprintf("event-stream/%s/%d", r.config.ResearchID, evaluations+1),
+						signal.triggered, triggerPointer(signal),
+					)
+				}
 				if err != nil {
 					return err
 				}
@@ -293,6 +333,7 @@ func (r *Runner) buildEventRefreshedMarket(configured configuration.ResolvedMark
 		return eventRefreshedRuntime{}, fmt.Errorf("registry is missing market %q", configured.ID)
 	}
 	var source quoteport.Source
+	var kyberDirect *kyberswap.Source
 	switch profile.Kind {
 	case "jupiter":
 		taker := ""
@@ -348,15 +389,18 @@ func (r *Runner) buildEventRefreshedMarket(configured configuration.ResolvedMark
 		if err != nil {
 			return eventRefreshedRuntime{}, err
 		}
-		source, err = kyberswap.NewMarketSource(kyberswap.MarketSourceConfig{
+		kyberDirect = direct
+		kyberMarket, sourceErr := kyberswap.NewMarketSource(kyberswap.MarketSourceConfig{
 			ID: market.SourceID(profile.ID), Market: domainMarket, Client: direct, Chain: profile.ChainSlug,
+			CacheEnabled: profile.RefreshInterval > 0,
 			TokenAddresses: map[market.TokenID]string{
 				configured.Base.Token.ID: configured.Base.AddressText, configured.Quote.Token.ID: configured.Quote.AddressText,
 			},
 		})
-		if err != nil {
-			return eventRefreshedRuntime{}, err
+		if sourceErr != nil {
+			return eventRefreshedRuntime{}, sourceErr
 		}
+		source = kyberMarket
 	default:
 		return eventRefreshedRuntime{}, fmt.Errorf("market %q has unsupported quote source %q", configured.ID, profile.Kind)
 	}
@@ -404,7 +448,12 @@ func (r *Runner) buildEventRefreshedMarket(configured configuration.ResolvedMark
 		}
 		feeds = append(feeds, eventTriggerFeed{id: pool.ID, feed: feed})
 	}
-	return eventRefreshedRuntime{config: configured, store: store, source: source, feeds: feeds}, nil
+	result := eventRefreshedRuntime{config: configured, store: store, source: source, feeds: feeds}
+	if typed, ok := source.(*kyberswap.MarketSource); ok {
+		result.kyberMarket = typed
+		result.kyberClient = kyberDirect
+	}
+	return result, nil
 }
 
 func takeEventRateLimitRetry(remote map[market.MarketID]eventRefreshedRuntime) bool {
@@ -516,6 +565,10 @@ func splitProviderKeys(value string) []string {
 func routeFeedCount(routes map[market.MarketID]routeRuntime) int {
 	count := 0
 	for _, route := range routes {
+		if route.batchFeed != nil {
+			count++
+			continue
+		}
 		count += len(route.children)
 	}
 	return count

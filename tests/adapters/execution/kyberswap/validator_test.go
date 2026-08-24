@@ -31,6 +31,66 @@ type routeBuilderStub struct {
 	lastBuild quoteadapter.BuildRequest
 }
 
+type retainedRouteStub struct{ route quoteadapter.RouteResult }
+
+func (s retainedRouteStub) DiscoveryRoute(market.Quote) (quoteadapter.RouteResult, bool) {
+	return s.route, true
+}
+
+func TestValidatorBuildsExactRetainedDiscoveryRouteWithoutNewRouteCall(t *testing.T) {
+	source := &routeBuilderStub{}
+	request := validationRequest(t)
+	retained := quoteadapter.RouteResult{Request: quoteadapter.RouteRequest{Chain: "polygon", TokenIn: validatorTokenIn, TokenOut: validatorTokenOut, AmountIn: request.Leg.Input.String()},
+		RouterAddress: validatorRouter, TokenIn: validatorTokenIn, TokenOut: validatorTokenOut, AmountIn: request.Leg.Input.String(), AmountOut: request.Discovery.AmountOut.String()}
+	validator, err := kyberswapadapter.New(kyberswapadapter.Config{ID: "kyberswap/live", ChainSlug: "polygon", Sender: common.HexToAddress(validatorSender),
+		TokenAddresses: map[market.TokenID]string{"base": validatorTokenIn, "quote": validatorTokenOut}, SlippageBPS: 10,
+		Source: source, DiscoveryRoutes: retainedRouteStub{route: retained}, Simulator: &simulatorStub{}, Clock: time.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validator.Validate(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if source.routes != 0 || source.builds != 1 {
+		t.Fatalf("route/build calls = %d/%d; want 0/1", source.routes, source.builds)
+	}
+	if source.lastBuild.Route.AmountOut != request.Discovery.AmountOut.String() {
+		t.Fatal("build did not reuse the exact discovery route")
+	}
+}
+
+func TestFreshRouteValidatorDoesNotReuseRetainedDiscoveryRoute(t *testing.T) {
+	source := &routeBuilderStub{}
+	request := validationRequest(t)
+	retained := quoteadapter.RouteResult{
+		Request: quoteadapter.RouteRequest{
+			Chain: "polygon", TokenIn: validatorTokenIn, TokenOut: validatorTokenOut,
+			AmountIn: request.Leg.Input.String(),
+		},
+		RouterAddress: validatorRouter, TokenIn: validatorTokenIn, TokenOut: validatorTokenOut,
+		AmountIn: request.Leg.Input.String(), AmountOut: request.Discovery.AmountOut.String(),
+	}
+	validator, err := kyberswapadapter.New(kyberswapadapter.Config{
+		ID: "kyberswap/live", ChainSlug: "polygon", Sender: common.HexToAddress(validatorSender),
+		TokenAddresses: map[market.TokenID]string{"base": validatorTokenIn, "quote": validatorTokenOut},
+		SlippageBPS:    10, Source: source, DiscoveryRoutes: retainedRouteStub{route: retained},
+		Simulator: &simulatorStub{}, Clock: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := validator.FreshRouteValidator()
+	if _, err = fresh.Validate(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if source.routes != 1 || source.builds != 1 {
+		t.Fatalf("route/build calls = %d/%d; want 1/1", source.routes, source.builds)
+	}
+	if source.lastBuild.Route.AmountOut != "2500000" {
+		t.Fatalf("fresh build route output = %s; want newly routed output", source.lastBuild.Route.AmountOut)
+	}
+}
+
 func (s *routeBuilderStub) Route(
 	_ context.Context,
 	request quoteadapter.RouteRequest,
@@ -100,6 +160,30 @@ func TestValidatorRefreshesRouteOnceAfterStaleBuild(t *testing.T) {
 			&quoteadapter.APIError{
 				Operation: "build", HTTPStatus: 422,
 				Code: "4227", Message: "estimate gas failed: return amount is not enough",
+			},
+			nil,
+		},
+	}
+	validator := newValidatorForTest(t, source)
+
+	artifact, err := validator.Validate(context.Background(), validationRequest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.routes != 2 || source.builds != 2 {
+		t.Fatalf("route/build calls = %d/%d; want 2/2", source.routes, source.builds)
+	}
+	if artifact.Metadata["build_attempts"] != "2" {
+		t.Fatalf("build_attempts = %q", artifact.Metadata["build_attempts"])
+	}
+}
+
+func TestValidatorRefreshesRouteOnceWhenBuildQuoteIsSmallerThanEstimate(t *testing.T) {
+	source := &routeBuilderStub{
+		buildErrs: []error{
+			&quoteadapter.APIError{
+				Operation: "build", HTTPStatus: 422,
+				Code: "4222", Message: "quoted amount is smaller than estimated",
 			},
 			nil,
 		},
@@ -257,6 +341,25 @@ func TestValidatorAcceptsExplicitZeroDynamicSlippage(t *testing.T) {
 			source.lastBuild,
 			artifact.Metadata,
 		)
+	}
+}
+
+func TestValidatorAcceptsFixedBPSWithoutExplicitMinimum(t *testing.T) {
+	source := &routeBuilderStub{}
+	validator := newValidatorForTest(t, source)
+	request := validationRequest(t)
+	request.Slippage = &executionport.SlippageConstraint{
+		BPS: 100, Reason: "fixed_conversion_slippage",
+	}
+	artifact, err := validator.Validate(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.lastBuild.SlippageBPS != 100 ||
+		artifact.Metadata["slippage_bps"] != "100" ||
+		artifact.Metadata["required_minimum_output_units"] != "" {
+		t.Fatalf("unexpected fixed-BPS artifact: build=%+v metadata=%+v",
+			source.lastBuild, artifact.Metadata)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,7 +49,23 @@ func NewCostValuator(
 }
 
 func (v *CostValuator) Warm(ctx context.Context) error {
-	prices, err := v.refresh(ctx)
+	var prices map[market.AssetID]CostAssetPrice
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		prices, err = v.refresh(ctx)
+		if err == nil || !strings.Contains(err.Error(), "CoinGecko returned HTTP 429") {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 5 * time.Second)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("warm native execution-cost prices: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("warm native execution-cost prices: %w", err)
 	}

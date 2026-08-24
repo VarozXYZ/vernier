@@ -57,6 +57,9 @@ func (r *Route) Apply(ctx context.Context, event market.MarketEvent) (feedport.A
 func (r *Route) Reset(ctx context.Context, event market.MarketEvent) (feedport.ApplyResult, error) {
 	return r.Mirror.Reset(ctx, event)
 }
+func (r *Route) ApplyBatch(ctx context.Context, events []market.MarketEvent) (feedport.ApplyResult, error) {
+	return r.Mirror.ApplyBatch(ctx, events)
+}
 func (r *Route) SetChildHealth(ctx context.Context, child market.MarketID, update feedport.HealthUpdate) error {
 	return r.Mirror.SetChildHealth(ctx, child, update)
 }
