@@ -217,7 +217,10 @@ func (e *fakeRefuelExecutor) Reconcile(
 	return record, nil
 }
 
-type fakeRefuelJournal struct{}
+type fakeRefuelJournal struct {
+	last  executionport.RefuelRecord
+	found bool
+}
 
 func (fakeRefuelJournal) CreateRefuel(context.Context, executionport.RefuelRecord) error {
 	return nil
@@ -240,6 +243,17 @@ func (fakeRefuelJournal) LastCompletedRefuel(
 	market.ChainID,
 ) (executionport.RefuelRecord, bool, error) {
 	return executionport.RefuelRecord{}, false, nil
+}
+
+type completedRefuelJournal struct {
+	fakeRefuelJournal
+}
+
+func (j completedRefuelJournal) LastCompletedRefuel(
+	context.Context,
+	market.ChainID,
+) (executionport.RefuelRecord, bool, error) {
+	return j.last, j.found, nil
 }
 
 func TestRefuelOnceIsDryRunUnlessArmed(t *testing.T) {
@@ -345,6 +359,67 @@ func TestPostOperationPreBroadcastRefuelFailureDoesNotStopLive(t *testing.T) {
 	}
 	if executors[0].executeCalls != 1 {
 		t.Fatalf("refuel executions = %d", executors[0].executeCalls)
+	}
+}
+
+func TestEmergencyRefuelDoesNotRepeatDuringDurableCooldown(t *testing.T) {
+	gate := livecanary.NewRuntimeGate()
+	_ = gate.Transition(livecanary.RuntimeGateStarting, livecanary.RuntimeGateRecovering)
+	executor := newFakeRefuelExecutor(t, "solana")
+	now := time.Now().UTC()
+	service, err := livecanary.NewRefuelService(
+		configuration.ResolvedGasRefuel{
+			Enabled: true, ThresholdUSD: big.NewRat(5, 1),
+			TargetUSD: big.NewRat(15, 1), MaxUSDC: big.NewRat(20, 1),
+			PollInterval: time.Minute, Cooldown: 15 * time.Minute,
+			SlippageBPS: 20,
+		},
+		gate,
+		completedRefuelJournal{fakeRefuelJournal: fakeRefuelJournal{
+			found: true,
+			last: executionport.RefuelRecord{
+				Chain: "solana", State: executionport.RefuelCompleted,
+				UpdatedAt: now.Add(-time.Minute),
+			},
+		}},
+		[]executionport.RefuelExecutor{
+			executor,
+			newFakeRefuelExecutor(t, "polygon"),
+		}, nil,
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.EmergencyRefuel(context.Background(), "solana"); err != nil {
+		t.Fatal(err)
+	}
+	if executor.executeCalls != 0 {
+		t.Fatalf("emergency refuel executions=%d", executor.executeCalls)
+	}
+	if gate.State() != livecanary.RuntimeGateRecovering {
+		t.Fatalf("gate state=%s", gate.State())
+	}
+}
+
+func TestEmergencyRefuelSkipsChainAlreadyAtTarget(t *testing.T) {
+	gate := livecanary.NewRuntimeGate()
+	_ = gate.Transition(livecanary.RuntimeGateStarting, livecanary.RuntimeGateRecovering)
+	executor := newFakeRefuelExecutor(t, "polygon")
+	atTarget, _ := market.NewAssetQuantity("usd", big.NewRat(15, 1))
+	executor.balance.QuoteValue = atTarget
+	service := newRefuelService(t, gate, []*fakeRefuelExecutor{
+		executor,
+		newFakeRefuelExecutor(t, "solana"),
+	})
+	if err := service.EmergencyRefuel(context.Background(), "polygon"); err != nil {
+		t.Fatal(err)
+	}
+	if executor.executeCalls != 0 {
+		t.Fatalf("emergency refuel executions=%d", executor.executeCalls)
+	}
+	if gate.State() != livecanary.RuntimeGateRecovering {
+		t.Fatalf("gate state=%s", gate.State())
 	}
 }
 
