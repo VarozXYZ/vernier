@@ -148,6 +148,51 @@ It processes versioned market events, evaluates both directions, and prints an
 auditable report. The fixture format is experimental and is separate from the
 modular configuration used for live market observation.
 
+## Compare aggregator quote and build latency
+
+The read-only `aggregator-latency-compare` experiment compares two unsigned
+EVM swap preparation flows:
+
+- `split`: concurrent KyberSwap `/routes` and Velora `/prices`, followed by
+  concurrent KyberSwap `/route/build` and Velora `/transactions/:chainId`;
+- `swap`: KyberSwap `/routes` then `/route/build`, concurrently with Velora's
+  all-in-one `/swap` endpoint.
+
+It alternates both exact-input token directions, uses a reproducible random
+whole-token amount for each sample, and reports stage/pipeline latency plus the
+KyberSwap-minus-Velora output delta in basis points. It never signs, approves,
+or broadcasts a transaction. Private token and account identifiers stay in an
+ignored environment file:
+
+```dotenv
+KYBERSWAP_CLIENT_ID=your-client-id
+AGGREGATOR_COMPARE_CHAIN_ID=56
+AGGREGATOR_COMPARE_KYBER_CHAIN=bsc
+AGGREGATOR_COMPARE_TOKEN_A=0x...
+AGGREGATOR_COMPARE_TOKEN_A_DECIMALS=18
+AGGREGATOR_COMPARE_TOKEN_B=0x...
+AGGREGATOR_COMPARE_TOKEN_B_DECIMALS=6
+AGGREGATOR_COMPARE_USER_ADDRESS=0x...
+AGGREGATOR_COMPARE_VELORA_PARTNER=your-partner-name
+AGGREGATOR_COMPARE_MIN_WHOLE=100
+AGGREGATOR_COMPARE_MAX_WHOLE=500
+AGGREGATOR_COMPARE_SLIPPAGE_BPS=50
+AGGREGATOR_COMPARE_GAS_ESTIMATION=false
+```
+
+Run each isolated experiment for 90 seconds at a five-second cadence (the
+default `both` mode runs them sequentially and therefore takes about three
+minutes):
+
+```console
+go run ./cmd/aggregator-latency-compare -env-file .env.private -mode both -duration 90s -interval 5s
+```
+
+Pass the printed seed back through `-seed` to replay the same amount sequence.
+Velora `/swap` excludes RFQ liquidity and has a lower provider rate limit by
+design, so its output and failure-rate results should be interpreted as the
+behavior of that endpoint rather than as a controlled RFQ comparison.
+
 ## Configure a private setup
 
 A local setup normally uses three YAML files and one environment file:
@@ -283,6 +328,41 @@ go run ./cmd/research compare-live --setup my_setup
 
 The command bootstraps both configured markets and evaluates accepted feed
 updates. It cannot sign or broadcast transactions.
+
+## Manual Wrapped Token Transfer canary
+
+`wtt-bridge-canary` validates one configured EVM-to-EVM Wormhole Wrapped Token
+Transfer. Without `-arm` it only checks configuration, signer identity,
+balances, allowance, WTT precision, native gas capacity, and the operational
+journal. Armed execution requires the decimal amount to be repeated exactly:
+
+```console
+go run ./cmd/wtt-bridge-canary \
+  -config /path/to/private/vernier.yaml \
+  -env-file /path/to/isolated.env \
+  -source chain_alpha \
+  -destination chain_beta \
+  -amount 1 \
+  -confirm-amount 1 \
+  -arm
+```
+
+The command derives the recipient from the isolated EVM signer and uses the
+primary RPC only; swap fanout endpoints are never used. It persists source and
+redeem transaction identities in a dedicated SQLite journal before broadcast.
+If execution stops with an uncertain result, rerun it using the exact operation
+ID printed by the first attempt:
+
+```console
+go run ./cmd/wtt-bridge-canary \
+  -config /path/to/private/vernier.yaml \
+  -env-file /path/to/isolated.env \
+  -resume-operation manual-wtt-0123456789abcdef0123456789abcdef \
+  -arm
+```
+
+Recovery reconciles the stored identities and never constructs a replacement
+for an effect that may already have been broadcast.
 
 ## Execution boundary
 
