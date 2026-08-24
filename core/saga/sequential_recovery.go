@@ -422,9 +422,13 @@ func (c *SequentialRecoveryCoordinator) resume(
 			}
 			if kind == executionport.RecoveryFailureInsufficientNative &&
 				c.emergencyRefuel != nil {
+				refuelChain := stage.SourceChain
+				if deficientChain, ok := executionport.RecoveryChain(stageErr); ok {
+					refuelChain = deficientChain
+				}
 				if refuelErr := c.emergencyRefuel(
 					ctx,
-					stage.SourceChain,
+					refuelChain,
 				); refuelErr != nil {
 					stageErr = fmt.Errorf(
 						"%w; emergency refuel: %v",
