@@ -39,6 +39,21 @@ type IntentBuilder interface {
 	) (Intent, error)
 }
 
+// SlippageIntentBuilder is an optional local capability. It lets a runtime
+// bind an economically-derived output floor without changing builders used by
+// existing fixed-slippage setups.
+type SlippageIntentBuilder interface {
+	IntentBuilder
+	BuildIntentWithSlippage(
+		context.Context,
+		execution.OperationID,
+		execution.Leg,
+		market.Quote,
+		execution.RouteAllocation,
+		*executionport.SlippageConstraint,
+	) (Intent, error)
+}
+
 type Config struct {
 	Source  ExecutableSource
 	Builder IntentBuilder
@@ -91,9 +106,16 @@ func (v *Validator) Validate(ctx context.Context, request executionport.Validati
 		executable.Allocation.ExpectedOutput.Units().Cmp(quote.AmountOut.Units()) != 0 {
 		return executionport.Artifact{}, fmt.Errorf("local executable allocation does not match quote")
 	}
-	intent, err := v.builder.BuildIntent(
-		ctx, request.Operation, request.Leg, quote, executable.Allocation,
-	)
+	var intent Intent
+	if builder, ok := v.builder.(SlippageIntentBuilder); ok {
+		intent, err = builder.BuildIntentWithSlippage(
+			ctx, request.Operation, request.Leg, quote, executable.Allocation, request.Slippage,
+		)
+	} else {
+		intent, err = v.builder.BuildIntent(
+			ctx, request.Operation, request.Leg, quote, executable.Allocation,
+		)
+	}
 	if err != nil {
 		return executionport.Artifact{}, err
 	}

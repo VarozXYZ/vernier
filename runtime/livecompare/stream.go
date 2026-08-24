@@ -43,6 +43,15 @@ type StreamOptions struct {
 	// maintenance. A newly opened gate is edge-triggered through
 	// EvaluationChanges.
 	EvaluationGate EvaluationGate
+	// Coalescer callbacks persist only the newest trigger metadata while Live
+	// capacity is closed. No quote, build, candidate, or transaction is queued.
+	OnCoalescedTrigger            func(arbitrage.TriggerMetadata) error
+	OnCoalescedEvaluationReleased func() error
+	// ForcedDirection asks the validation layer to build one complete fresh
+	// round trip for that direction even when it misses only the economic
+	// profit threshold. Health, data, build, simulation, and freshness checks
+	// remain unchanged.
+	ForcedDirection *arbitrage.Direction
 }
 
 type EvaluationGate interface {

@@ -27,6 +27,8 @@ import (
 	sqlitestore "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
+	"github.com/VarozXYZ/vernier/internal/rpcpolicy"
+	"github.com/VarozXYZ/vernier/internal/safeerr"
 	chainport "github.com/VarozXYZ/vernier/ports/chain"
 	crosschainport "github.com/VarozXYZ/vernier/ports/crosschain"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
@@ -237,6 +239,12 @@ func executeArmed(
 			CreatedAt: now,
 		},
 	); err != nil {
+		fmt.Fprintf(
+			output,
+			"ntt_recovery_error phase=journal_prepare operation=%s error=%q\n",
+			operationID,
+			safeerr.Message(err),
+		)
 		return err
 	}
 
@@ -254,15 +262,45 @@ func executeArmed(
 			return err
 		}
 	} else {
-		message, err = messageFromSourceTransaction(
-			ctx,
-			route,
-			config,
-			solanaAdapter,
-			evmAdapter,
-			sourceTransaction,
-		)
+		persisted, found, lookupErr :=
+			store.FindMessageBySourceTransaction(ctx, sourceTransaction)
+		if lookupErr != nil {
+			err = fmt.Errorf("load durable Wormhole message identity: %w", lookupErr)
+		} else if found {
+			address, decodeErr := hex.DecodeString(persisted.EmitterAddress)
+			if decodeErr != nil || len(address) != 32 {
+				err = fmt.Errorf("durable Wormhole emitter address is invalid")
+			} else {
+				message.EmitterChain = persisted.EmitterChain
+				copy(message.EmitterAddress[:], address)
+				message.Sequence = persisted.Sequence
+				fmt.Fprintf(
+					output,
+					"source_message=reused tx=%s emitter_chain=%d emitter_address=%s sequence=%d\n",
+					sourceTransaction,
+					message.EmitterChain,
+					persisted.EmitterAddress,
+					message.Sequence,
+				)
+			}
+		} else {
+			message, err = messageFromSourceTransaction(
+				ctx,
+				route,
+				config,
+				solanaAdapter,
+				evmAdapter,
+				sourceTransaction,
+			)
+		}
 		if err != nil {
+			fmt.Fprintf(
+				output,
+				"ntt_recovery_error phase=source_message operation=%s tx=%s error=%q\n",
+				operationID,
+				sourceTransaction,
+				safeerr.Message(err),
+			)
 			_ = store.Fail(ctx, operationID, "source_recovery_failed", err)
 			return err
 		}
@@ -1361,9 +1399,23 @@ func (r *armedRuntime) sendSolana(
 	additionalSigners []solanago.PrivateKey,
 ) (string, error) {
 	phaseStarted := time.Now()
-	latest, err := r.solanaRPC.GetLatestBlockhash(ctx, solanarpc.CommitmentConfirmed)
+	latest, err := rpcpolicy.Read(
+		ctx,
+		rpcpolicy.DefaultReadAttempts,
+		rpcpolicy.DefaultInitialDelay,
+		func(callCtx context.Context) (*solanarpc.GetLatestBlockhashResult, error) {
+			return r.solanaRPC.GetLatestBlockhash(
+				callCtx,
+				solanarpc.CommitmentConfirmed,
+			)
+		},
+	)
 	if err != nil || latest == nil || latest.Value == nil {
-		return "", fmt.Errorf("read latest Solana blockhash: %w", err)
+		return "", fmt.Errorf(
+			"read latest Solana blockhash after %d attempts: %s",
+			rpcpolicy.DefaultReadAttempts,
+			safeerr.Message(err),
+		)
 	}
 	limit, err := computebudget.NewSetComputeUnitLimitInstruction(
 		r.config.Solana.ComputeUnitLimit,
@@ -1854,9 +1906,23 @@ func simulateSolanaBatch(
 		return err
 	}
 	client := solanarpc.New(rpcURL)
-	latest, err := client.GetLatestBlockhash(ctx, solanarpc.CommitmentConfirmed)
+	latest, err := rpcpolicy.Read(
+		ctx,
+		rpcpolicy.DefaultReadAttempts,
+		rpcpolicy.DefaultInitialDelay,
+		func(callCtx context.Context) (*solanarpc.GetLatestBlockhashResult, error) {
+			return client.GetLatestBlockhash(
+				callCtx,
+				solanarpc.CommitmentConfirmed,
+			)
+		},
+	)
 	if err != nil || latest == nil || latest.Value == nil {
-		return fmt.Errorf("read latest solana blockhash for simulation: %w", err)
+		return fmt.Errorf(
+			"read latest solana blockhash for simulation after %d attempts: %s",
+			rpcpolicy.DefaultReadAttempts,
+			safeerr.Message(err),
+		)
 	}
 	limit, err := computebudget.NewSetComputeUnitLimitInstruction(
 		config.Solana.ComputeUnitLimit,

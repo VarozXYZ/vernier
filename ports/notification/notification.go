@@ -177,10 +177,15 @@ const (
 	LiveRuntimeBalanceInsufficient LiveRuntimeEventKind = "balance_insufficient"
 	LiveRuntimeBalanceRecovered    LiveRuntimeEventKind = "balance_recovered"
 	LiveRuntimeValidationBlocked   LiveRuntimeEventKind = "validation_blocked"
+	LiveRuntimeCostCacheStale      LiveRuntimeEventKind = "cost_cache_stale"
+	LiveRuntimeCostCacheRecovered  LiveRuntimeEventKind = "cost_cache_recovered"
+	LiveRuntimeQuoteFXStale        LiveRuntimeEventKind = "quote_fx_stale"
+	LiveRuntimeQuoteFXRecovered    LiveRuntimeEventKind = "quote_fx_recovered"
 )
 
-// LiveRuntimeEvent reports only process lifecycle state. It deliberately
-// excludes setup identifiers, account addresses, endpoints, and credentials.
+// LiveRuntimeEvent reports process lifecycle and admission-health state. It
+// deliberately excludes setup identifiers, account addresses, endpoints, and
+// credentials.
 type LiveRuntimeEvent struct {
 	Kind           LiveRuntimeEventKind
 	Mode           string

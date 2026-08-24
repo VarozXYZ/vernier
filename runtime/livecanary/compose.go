@@ -26,6 +26,7 @@ import (
 	solanaadapter "github.com/VarozXYZ/vernier/adapters/chain/solana"
 	"github.com/VarozXYZ/vernier/adapters/crosschain/across"
 	kyberexecution "github.com/VarozXYZ/vernier/adapters/execution/kyberswap"
+	localexecution "github.com/VarozXYZ/vernier/adapters/execution/local"
 	telegramnotification "github.com/VarozXYZ/vernier/adapters/notification/telegram"
 	sqlitestore "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	"github.com/VarozXYZ/vernier/adapters/quote/jupiter"
@@ -65,6 +66,27 @@ type ComposeConfig struct {
 	ForcedCanary     ForcedCanaryDirection
 }
 
+// DryRunRuntime is deliberately smaller than Runtime: it owns no signer,
+// nonce manager, journal, notifier, or broadcast capability.
+type DryRunRuntime struct {
+	run   func(context.Context) error
+	close func()
+}
+
+func (r *DryRunRuntime) Run(ctx context.Context) error {
+	if r == nil || r.run == nil {
+		return fmt.Errorf("live dry-run runtime is incomplete")
+	}
+	return r.run(ctx)
+}
+
+func (r *DryRunRuntime) Close() error {
+	if r != nil && r.close != nil {
+		r.close()
+	}
+	return nil
+}
+
 // ComposeArmed builds the signer-enabled sequential runtime. Normal execution
 // cannot broadcast until Run receives a qualified opportunity; the explicit
 // RefuelOnce path has its own arm barrier.
@@ -76,19 +98,20 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			config.Live.ExecutionPolicyKind !=
 				string(execution.PolicyPrefundedSequential) &&
 			config.Live.ExecutionPolicyKind !=
-				string(execution.PolicyPrefundedParallel)) {
+				string(execution.PolicyPrefundedParallel) &&
+			config.Live.ExecutionPolicyKind !=
+				string(execution.PolicyPrefundedTriggerFirst)) {
 		return nil, fmt.Errorf("sequential Live composition configuration is incomplete")
-	}
-	if config.ForcedCanary != "" &&
-		config.Live.RunTier != "canary" {
-		return nil, fmt.Errorf(
-			"forced canary execution requires sequential_bridge_canary",
-		)
 	}
 	config.Output = &synchronizedWriter{delegate: config.Output}
 	if config.Research.SetupID != config.Live.SetupID ||
 		config.Research.Hash != config.Live.Hash {
 		return nil, fmt.Errorf("research and Live configurations do not describe the same manifest")
+	}
+	if (config.Live.ExecutionPolicyKind == string(execution.PolicyPrefundedParallel) ||
+		config.Live.ExecutionPolicyKind == string(execution.PolicyPrefundedTriggerFirst)) &&
+		allEVMChains(config.Research) {
+		return composeEVMHybridArmed(ctx, config)
 	}
 	endpoints, err := config.Research.ResolveEndpoints(config.LookupEnv)
 	if err != nil {
@@ -144,7 +167,8 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 
 	runnerOptions := livecompare.Options{
 		LookupEnv: config.LookupEnv, Logger: config.Logger,
-		SolanaNetworks: solanaNetworks,
+		SolanaNetworks:                  solanaNetworks,
+		SuppressConfiguredNotifications: config.ObserveCostsOnly,
 	}
 	var liveNotifier *LiveNotifier
 	if config.Research.TelegramEnabled && !config.ObserveCostsOnly {
@@ -161,7 +185,10 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			return nil, chatErr
 		}
 		telegramSender, senderErr := telegramnotification.New(
-			telegramnotification.Config{BotToken: botToken, ChatID: chatID},
+			telegramnotification.Config{
+				BotToken: botToken, ChatID: chatID,
+				SetupLabel: config.Research.Markets[0].Base.Token.Symbol,
+			},
 		)
 		if senderErr != nil {
 			return nil, senderErr
@@ -363,6 +390,12 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		return nil, err
 	}
 	cleanup = append(cleanup, func() { _ = journal.Close() })
+	if liveNotifier != nil {
+		if err := liveNotifier.AttachOutbox(ctx, journal); err != nil {
+			return nil, err
+		}
+		cleanup = append(cleanup, liveNotifier.Close)
+	}
 
 	acrossClient, err := across.New(across.Config{
 		APIKey:       mustLookup(config.LookupEnv, "ACROSS_API_KEY"),
@@ -522,12 +555,13 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 			evmMarket.Base.Token.ID:     evmMarket.Base.Token.Decimals,
 			evmMarket.Quote.Token.ID:    evmMarket.Quote.Token.Decimals,
 		},
-		BridgePrecision: 8,
-		QuoteAsset:      solanaMarket.Quote.Token.Asset,
-		BaseAsset:       solanaMarket.Base.Token.Asset,
-		MinimumNet:      config.Live.MinimumNet,
-		ReturnMargin:    config.Live.ReturnBridgeSafetyMargin,
-		ExitCosts:       flowCosts,
+		BridgePrecision:       8,
+		QuoteAsset:            solanaMarket.Quote.Token.Asset,
+		BaseAsset:             solanaMarket.Base.Token.Asset,
+		MinimumNet:            config.Live.MinimumNet,
+		DirectionalMinimumNet: config.Live.DirectionalMinimumNet,
+		ReturnMargin:          config.Live.ReturnBridgeSafetyMargin,
+		ExitCosts:             flowCosts,
 		DynamicSlippage: DynamicSlippagePolicy{
 			Enabled: config.Live.DynamicSlippage.Enabled,
 			MaxBPS:  config.Live.DynamicSlippage.MaxBPS,
@@ -537,6 +571,7 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		FallbackAfter:            config.Live.ConfirmationTimeout,
 		ArtifactMaxAge:           config.Live.BuildToBroadcastTimeout,
 		Output:                   config.Output, Costs: costValuator,
+		RecoveryJournal: journal,
 	}
 	if solanaSellPreflight != nil {
 		swapDriver.SellPreflights[solanaMarket.ID] = solanaSellPreflight
@@ -646,8 +681,12 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 		}
 		recovery.SetEmergencyRefuel(refuelService.EmergencyRefuel)
 	}
+	executionInput := config.Live.ExecutionInput
+	if forcedDirection != nil {
+		executionInput = config.Live.CanaryInput
+	}
 	executionUnits, err := amountUnits(
-		config.Live.ExecutionInput,
+		executionInput,
 		solanaMarket.Quote.Token.Decimals,
 	)
 	if err != nil {
@@ -706,6 +745,18 @@ func ComposeArmed(ctx context.Context, config ComposeConfig) (_ *Runtime, err er
 	runtime.SetBalanceManager(balanceManager)
 	keep = true
 	return runtime, nil
+}
+
+func allEVMChains(config configuration.ParsedConfig) bool {
+	if len(config.Chains) != 2 {
+		return false
+	}
+	for _, chain := range config.Chains {
+		if chain.Kind != "evm" {
+			return false
+		}
+	}
+	return true
 }
 
 type discardOpeningSender struct{}
@@ -895,6 +946,8 @@ func composeSolanaSwap(
 	}
 	return SwapBinding{
 		Account: execution.AccountID(account.ID), Validator: validator,
+		RecoveryValidator:   validator,
+		ConversionValidator: validator, ConversionEstimator: estimator,
 		RefuelValidator: refuelValidator,
 		Estimator:       estimator, TxManager: manager,
 		Confirmation: confirmationSource,
@@ -1066,6 +1119,10 @@ func composeEVMSwap(
 	sender common.Address,
 	primaryURL string,
 ) (SwapBinding, []func(), error) {
+	nativeToken, err := evmNativeToken(configured.Chain, config.Research.Chains[configured.Chain].ChainID, config.Live.NativeAssets[configured.Chain])
+	if err != nil {
+		return SwapBinding{}, nil, err
+	}
 	source, ok := config.Research.QuoteSources[configured.QuoteSource]
 	if !ok || source.Kind != "kyberswap" {
 		return SwapBinding{}, nil, fmt.Errorf("EVM Live market requires KyberSwap")
@@ -1094,7 +1151,14 @@ func composeEVMSwap(
 	tokens := map[market.TokenID]string{
 		configured.Base.Token.ID:  configured.Base.AddressText,
 		configured.Quote.Token.ID: configured.Quote.AddressText,
-		evmNativeTokenID:          evmNativePseudoAddress,
+		nativeToken.ID:            evmNativePseudoAddress,
+	}
+	for _, conversion := range config.Live.QuoteConversions {
+		if conversion.Chain != configured.Chain {
+			continue
+		}
+		tokens[conversion.TokenA.Token.ID] = conversion.TokenA.AddressText
+		tokens[conversion.TokenB.Token.ID] = conversion.TokenB.AddressText
 	}
 	validator, err := kyberexecution.New(kyberexecution.Config{
 		ID: "kyberswap/live-build", ChainSlug: source.ChainSlug,
@@ -1108,6 +1172,7 @@ func composeEVMSwap(
 		Source:                     quoteSource,
 		Simulator:                  primary,
 		Clock:                      time.Now,
+		AllowedRouters:             approvalDestinations(config.Live, configured.Chain, "kyberswap"),
 	})
 	if err != nil {
 		return fail(err)
@@ -1162,7 +1227,7 @@ func composeEVMSwap(
 		return market.NewTokenAmount(output, units)
 	})
 	decoder, err := evmadapter.NewERC20TransferReceiptDecoder(
-		sender, tokens, time.Now, "pol",
+		sender, tokens, time.Now, nativeToken.Asset,
 	)
 	if err != nil {
 		return fail(err)
@@ -1279,6 +1344,8 @@ func composeEVMSwap(
 	}
 	return SwapBinding{
 		Account: execution.AccountID(account.ID), Validator: validator,
+		RecoveryValidator:   validator,
+		ConversionValidator: validator, ConversionEstimator: estimator,
 		RefuelValidator: refuelValidator,
 		Estimator:       estimator, TxManager: manager,
 		Confirmation:     confirmationSource,
@@ -1361,12 +1428,112 @@ func composeEVMSwap(
 			Client:  primary,
 			Address: sender,
 		},
-		NativeToken: market.Token{
-			ID: evmNativeTokenID, Asset: "pol",
-			Chain:    market.ChainID(configured.Chain),
-			Decimals: 18, Symbol: "POL",
-		},
+		NativeToken: nativeToken,
+		EVMClient:   primary, EVMAddress: sender,
 	}, closers, nil
+}
+
+func composeLocalEVMSwap(ctx context.Context, config ComposeConfig,
+	configured configuration.ResolvedMarket, account configuration.ResolvedLiveAccount,
+	privateKey *ecdsa.PrivateKey, sender common.Address, primaryURL string,
+) (SwapBinding, []func(), error) {
+	// Reuse the setup-neutral EVM transport/nonce/fanout composition. The
+	// temporary source is construction-only and its validator is replaced
+	// before the binding can escape this function.
+	shadow := configured
+	for id, source := range config.Research.QuoteSources {
+		if source.Kind == "kyberswap" {
+			shadow.QuoteSource = id
+			break
+		}
+	}
+	if shadow.QuoteSource == configured.QuoteSource {
+		return SwapBinding{}, nil, fmt.Errorf("hybrid local EVM transport requires the configured remote KyberSwap source")
+	}
+	binding, closers, err := composeEVMSwap(ctx, config, shadow, account, privateKey, sender, primaryURL)
+	if err != nil {
+		return SwapBinding{}, nil, err
+	}
+	fail := func(cause error) (SwapBinding, []func(), error) {
+		for index := len(closers) - 1; index >= 0; index-- {
+			closers[index]()
+		}
+		return SwapBinding{}, nil, cause
+	}
+	tokens := map[market.TokenID]common.Address{
+		configured.Base.Token.ID: configured.Base.Address, configured.Quote.Token.ID: configured.Quote.Address,
+	}
+	var builder localexecution.IntentBuilder
+	defaultSlippageBPS := config.Live.SlippageBPS
+	if config.Live.ExecutionPolicyKind == string(execution.PolicyPrefundedTriggerFirst) {
+		defaultSlippageBPS = config.Live.SecondLegSlippageBPS
+	}
+	if configured.SplitRoute != nil {
+		if config.Live.AtomicRoute.Chain != configured.Chain ||
+			config.Live.AtomicRoute.Executor == (common.Address{}) {
+			return fail(fmt.Errorf("local split market requires its deployed atomic executor"))
+		}
+		tokens[configured.SplitRoute.Intermediate.Token.ID] = configured.SplitRoute.Intermediate.Address
+		adapters := make(map[market.MarketID]uint16, len(config.Live.AtomicRoute.Adapters))
+		for pool, index := range config.Live.AtomicRoute.Adapters {
+			adapters[market.MarketID(fmt.Sprintf("%s/pool/%s", configured.ID, pool))] = index
+		}
+		builder, err = localexecution.NewAtomicRouteBuilder(localexecution.AtomicRouteConfig{
+			Executor: config.Live.AtomicRoute.Executor, TokenAddresses: tokens, Adapters: adapters,
+			SlippageBPS: config.Live.SecondLegSlippageBPS, Deadline: config.Live.EVMDeadline,
+			GasLimit: config.Live.AtomicRoute.GasLimit, Clock: time.Now,
+		})
+		if err != nil {
+			return fail(err)
+		}
+		binding.Validator = localexecution.ValidatedQuoteBuilder{Builder: builder, Clock: time.Now}
+		binding.RecoveryValidator = localexecution.DiscoveryQuoteBuilder{Builder: builder, Clock: time.Now}
+		binding.RefuelValidator, binding.Estimator, binding.TrustValidatedQuote = nil, nil, true
+		binding.LocalBuilder = builder
+		return binding, closers, nil
+	}
+	switch configured.Venue.Kind {
+	case "pancakeswap_v3":
+		builder, err = localexecution.NewPancakeV3Builder(localexecution.PancakeV3Config{
+			Router: config.Live.LocalSwapRouter, Recipient: sender, TokenAddresses: tokens,
+			Markets:     map[market.MarketID]uint32{configured.ID: config.Live.LocalSwapFee},
+			SlippageBPS: defaultSlippageBPS, Deadline: config.Live.EVMDeadline,
+			GasLimit: config.Live.LocalSwapGasLimit, Clock: time.Now,
+		})
+	case "aerodrome_slipstream":
+		builder, err = localexecution.NewSlipstreamBuilder(localexecution.SlipstreamConfig{
+			Router: config.Live.LocalSwapRouter, Recipient: sender, TokenAddresses: tokens,
+			Markets:     map[market.MarketID]int32{configured.ID: config.Live.LocalSwapTickSpacing},
+			SlippageBPS: defaultSlippageBPS, Deadline: config.Live.EVMDeadline,
+			GasLimit: config.Live.LocalSwapGasLimit, Clock: time.Now,
+		})
+	default:
+		err = fmt.Errorf("hybrid local EVM venue %q has no executable builder", configured.Venue.Kind)
+	}
+	if err != nil {
+		return fail(err)
+	}
+	binding.Validator = localexecution.ValidatedQuoteBuilder{Builder: builder, Clock: time.Now}
+	binding.RecoveryValidator = localexecution.DiscoveryQuoteBuilder{Builder: builder, Clock: time.Now}
+	binding.RefuelValidator = nil
+	binding.Estimator = nil
+	binding.TrustValidatedQuote = true
+	binding.LocalBuilder = builder
+	return binding, closers, nil
+}
+
+func evmNativeToken(chain string, chainID *big.Int, configured configuration.ResolvedNativeAsset) (market.Token, error) {
+	if chain == "" || chainID == nil || !chainID.IsUint64() {
+		return market.Token{}, fmt.Errorf("EVM native token configuration is unavailable")
+	}
+	if configured.Asset == "" && chainID.Uint64() == 137 {
+		configured = configuration.ResolvedNativeAsset{Asset: "pol", Symbol: "POL", CoinGeckoID: "matic-network"}
+	}
+	if configured.Asset == "" || configured.Symbol == "" {
+		return market.Token{}, fmt.Errorf("EVM native token metadata is unavailable for chain %s", chain)
+	}
+	return market.Token{ID: market.TokenID("live_native_" + chain), Asset: configured.Asset,
+		Chain: market.ChainID(chain), Decimals: 18, Symbol: configured.Symbol}, nil
 }
 
 func composeEVMSellPreflight(

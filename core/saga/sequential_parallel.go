@@ -37,7 +37,13 @@ func (e *SequentialExecutor) executePrefundedParallel(
 		}
 		e.observe(func(observer executionport.SequentialObserver) { observer.StageStarted(request) })
 	}
-	settlements, swapErr := parallel.ExecuteParallelSwaps(ctx, operation.ID, plan, e.journal)
+	var settlements []domainexecution.SequentialStageSettlement
+	var swapErr error
+	if triggered, ok := e.drivers.Buy.(executionport.SequentialTriggeredSwapDriver); ok && triggered.StagedFor(plan) {
+		settlements, swapErr = triggered.ExecuteTriggeredSwaps(ctx, operation.ID, plan, e.journal)
+	} else {
+		settlements, swapErr = parallel.ExecuteParallelSwaps(ctx, operation.ID, plan, e.journal)
+	}
 	for _, settlement := range settlements {
 		if err := e.recordParallelSettlement(ctx, &operation, &result, settlement); err != nil {
 			finishErr := e.finish(ctx, operation, domainexecution.SequentialManualIntervention, result, err)
@@ -84,6 +90,41 @@ func (e *SequentialExecutor) executePrefundedParallel(
 			},
 			driver: driver,
 		}
+	}
+	if e.asyncQuote != nil {
+		if err := e.asyncQuote.BeginBase(ctx, operation.ID); err != nil {
+			return result, fmt.Errorf("reserve asynchronous restoration capacity: %w", err)
+		}
+		if err := e.asyncQuote.Start(ctx, prepared[1].request, prepared[1].driver, e.journal); err != nil {
+			_ = e.asyncQuote.CompleteBase(context.WithoutCancel(ctx), operation.ID, err)
+			return result, fmt.Errorf("start asynchronous quote restoration: %w", err)
+		}
+		e.observe(func(observer executionport.SequentialObserver) { observer.StageStarted(prepared[0].request) })
+		baseSettlement, baseErr := prepared[0].driver.ExecuteStage(ctx, prepared[0].request, e.journal)
+		if completeErr := e.asyncQuote.CompleteBase(context.WithoutCancel(ctx), operation.ID, baseErr); completeErr != nil {
+			baseErr = errors.Join(baseErr, completeErr)
+		}
+		if baseErr != nil {
+			finishErr := e.finish(ctx, operation, domainexecution.SequentialManualIntervention, result, baseErr)
+			return result, errors.Join(baseErr, finishErr)
+		}
+		if err := e.recordParallelSettlement(ctx, &operation, &result, baseSettlement); err != nil {
+			finishErr := e.finish(ctx, operation, domainexecution.SequentialManualIntervention, result, err)
+			return result, errors.Join(err, finishErr)
+		}
+		if err := calculateParallelEconomics(plan, &result); err != nil {
+			finishErr := e.finish(ctx, operation, domainexecution.SequentialManualIntervention, result, err)
+			return result, errors.Join(err, finishErr)
+		}
+		if journal, ok := e.journal.(executionport.SequentialResultJournal); ok {
+			if err := journal.RecordSequentialResult(ctx, result); err != nil {
+				return result, err
+			}
+		}
+		if err := e.finish(ctx, operation, domainexecution.SequentialCompleted, result, nil); err != nil {
+			return result, err
+		}
+		return result, nil
 	}
 	type bridgeResult struct {
 		settlement domainexecution.SequentialStageSettlement

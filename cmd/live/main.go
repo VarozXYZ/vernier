@@ -17,6 +17,7 @@ import (
 	"github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
 	"github.com/VarozXYZ/vernier/internal/buildinfo"
+	"github.com/VarozXYZ/vernier/internal/safeerr"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 	"github.com/VarozXYZ/vernier/runtime/livecanary"
@@ -72,6 +73,7 @@ var executionFactories = map[string]compiledFactory{
 	string(execution.PolicyTransportedSequential): composeSequentialRuntime,
 	string(execution.PolicyPrefundedSequential):   composeSequentialRuntime,
 	string(execution.PolicyPrefundedParallel):     composeParallelRuntime,
+	string(execution.PolicyPrefundedTriggerFirst): composeParallelRuntime,
 }
 
 // An ignored setup-specific Go file assigns composePrivate from init. Keeping
@@ -114,7 +116,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	forceCanaryDirection := flags.String(
 		"force-canary-direction",
 		"",
-		"execute one forced canary cycle: solana-to-evm or evm-to-solana",
+		"execute one forced canary cycle: <buy-market>:<sell-market> (legacy aliases remain supported)",
 	)
 	acknowledgeReconciled := flags.String(
 		"acknowledge-reconciled-operation",
@@ -277,13 +279,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		)
 		return 2
 	}
-	if err := configuration.LoadEnvFile(*envPath, os.LookupEnv, os.Setenv); err != nil {
-		fmt.Fprintln(stderr, "live: cannot load local environment")
-		return 2
-	}
 	config, err := configuration.LoadLiveConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "live: %v\n", err)
+		return 2
+	}
+	lookup := configuration.LookupEnv(os.LookupEnv)
+	if config.EnvironmentSource == "isolated_file" {
+		lookup, err = configuration.ReadIsolatedEnvFile(*envPath)
+	} else {
+		err = configuration.LoadEnvFile(*envPath, os.LookupEnv, os.Setenv)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "live: cannot load local environment")
 		return 2
 	}
 	if operationID := strings.TrimSpace(*acknowledgeReconciled); operationID != "" {
@@ -381,7 +389,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if *arm && !*recoverOnly && refuelChain == "" &&
-		config.RunTier == "canary" {
+		(config.RunTier == "canary" || forcedDirection != "") {
 		expected := ""
 		if config.CanaryInput != nil {
 			expected = config.CanaryInput.RatString()
@@ -396,8 +404,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if *arm && !*recoverOnly && refuelChain == "" &&
-		config.RunTier == "live" &&
-		(config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) ||
+		config.RunTier == "live" && forcedDirection == "" &&
+		(config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) &&
+			config.ExecutionPolicyKind != string(execution.PolicyPrefundedTriggerFirst) ||
 			config.ExecutionPolicyID != "") {
 		expected := ""
 		if config.ExecutionInput != nil {
@@ -412,14 +421,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if forcedDirection != "" &&
-		config.RunTier != "canary" {
-		fmt.Fprintln(
-			stderr,
-			"live: -force-canary-direction is only available for sequential_bridge_canary",
-		)
-		return 2
-	}
 	mode := runMode("")
 	if *arm {
 		mode = modeArmed
@@ -432,7 +433,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	} else if *dryRun {
 		mode = modeDryRun
 	}
-	if err := validateEnvironment(config, os.LookupEnv, mode); err != nil {
+	if err := validateEnvironment(config, lookup, mode); err != nil {
 		fmt.Fprintf(stderr, "live: %v\n", err)
 		return 2
 	}
@@ -448,11 +449,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		)
 		return 2
 	}
-	if config.ExecutionPolicyKind == string(execution.PolicyPrefundedParallel) &&
-		config.ExecutionPolicyID != "" {
+	if (config.ExecutionPolicyKind == string(execution.PolicyPrefundedParallel) ||
+		config.ExecutionPolicyKind == string(execution.PolicyPrefundedTriggerFirst)) &&
+		config.ExecutionPolicyID != "" && !allLiveChainsEVM(config) {
 		factory = composeSequentialRuntime
 	}
-	if config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) {
+	if config.ExecutionPolicyKind != string(execution.PolicyPrefundedParallel) &&
+		config.ExecutionPolicyKind != string(execution.PolicyPrefundedTriggerFirst) {
 		if mode == modeDryRun {
 			fmt.Fprintln(
 				stdout,
@@ -462,7 +465,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	runtime, err := factory(
-		ctx, *configPath, config, os.LookupEnv, mode, forcedDirection,
+		ctx, *configPath, config, lookup, mode, forcedDirection,
 		refuelChain != "",
 		stdout, stderr,
 	)
@@ -517,7 +520,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if err := runtime.Run(ctx); err != nil {
-		fmt.Fprintf(stderr, "live: runtime failed: %v\n", err)
+		fmt.Fprintf(stderr, "live: runtime failed: %s\n", safeerr.Message(err))
 		return 1
 	}
 	return 0
@@ -552,19 +555,48 @@ func composeSequentialRuntime(
 
 func composeParallelRuntime(
 	ctx context.Context,
-	_ string,
+	manifestPath string,
 	config configuration.ParsedLiveConfig,
 	lookup configuration.LookupEnv,
 	mode runMode,
-	_ livecanary.ForcedCanaryDirection,
-	_ bool,
-	_ io.Writer,
-	_ io.Writer,
+	forced livecanary.ForcedCanaryDirection,
+	refuelOnly bool,
+	stdout io.Writer,
+	stderr io.Writer,
 ) (armedRuntime, error) {
-	if composePrivate == nil {
-		return nil, fmt.Errorf("private setup composition is not installed")
+	researchConfig, err := configuration.LoadConfig(manifestPath)
+	if err != nil {
+		return nil, err
 	}
-	return composePrivate(ctx, config, lookup, mode)
+	logger, err := observability.NewLogger(stderr, "info")
+	if err != nil {
+		return nil, fmt.Errorf("create logger: %w", err)
+	}
+	composeConfig := livecanary.ComposeConfig{
+		ManifestPath: manifestPath, Research: researchConfig, Live: config,
+		LookupEnv: lookup, Logger: logger, Output: stdout,
+		ObserveCostsOnly: mode == modeCostObserve,
+		RefuelOnly:       refuelOnly, ForcedCanary: forced,
+	}
+	if mode == modeDryRun {
+		return livecanary.ComposeEVMHybridDryRun(composeConfig)
+	}
+	if composePrivate != nil {
+		return composePrivate(ctx, config, lookup, mode)
+	}
+	return livecanary.ComposeArmed(ctx, composeConfig)
+}
+
+func allLiveChainsEVM(config configuration.ParsedLiveConfig) bool {
+	if len(config.Chains) != 2 {
+		return false
+	}
+	for _, chain := range config.Chains {
+		if chain.Kind != "evm" {
+			return false
+		}
+	}
+	return true
 }
 
 func validateEnvironment(config configuration.ParsedLiveConfig, lookup configuration.LookupEnv, mode runMode) error {

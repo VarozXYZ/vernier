@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VarozXYZ/vernier/internal/safeerr"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -21,6 +23,7 @@ type AcrossCanaryOperation struct {
 	Status              string
 	SourceChain         string
 	SourceIdentity      string
+	SourceBlockhash     string
 	DestinationChain    string
 	DestinationIdentity string
 	BalanceBefore       string
@@ -60,8 +63,9 @@ func OpenAcrossCanary(path string) (*AcrossCanaryStore, error) {
 			amount_units TEXT NOT NULL,
 			expected_output_units TEXT NOT NULL,
 			status TEXT NOT NULL,
-			source_chain TEXT NOT NULL DEFAULT '',
-			source_identity TEXT NOT NULL DEFAULT '',
+			 source_chain TEXT NOT NULL DEFAULT '',
+			 source_identity TEXT NOT NULL DEFAULT '',
+			 source_blockhash TEXT NOT NULL DEFAULT '',
 			destination_chain TEXT NOT NULL DEFAULT '',
 			destination_identity TEXT NOT NULL DEFAULT '',
 			balance_before TEXT NOT NULL DEFAULT '',
@@ -76,6 +80,20 @@ func OpenAcrossCanary(path string) (*AcrossCanaryStore, error) {
 			_ = db.Close()
 			return nil, err
 		}
+	}
+	if _, err := db.Exec(`ALTER TABLE across_canary_operations
+		ADD COLUMN source_blockhash TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate Across canary SQLite: %w", err)
+	}
+	if err := sanitizeDurableDiagnostics(
+		db,
+		"across_canary_operations",
+		"last_error",
+	); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sanitize Across canary diagnostics: %w", err)
 	}
 	return &AcrossCanaryStore{db: db}, nil
 }
@@ -137,15 +155,40 @@ func (s *AcrossCanaryStore) Prepared(
 	return nil
 }
 
+func (s *AcrossCanaryStore) PreparedSolana(
+	ctx context.Context,
+	operationID, sourceIdentity, sourceBlockhash, destinationChain,
+	balanceBefore string,
+) error {
+	if strings.TrimSpace(sourceBlockhash) == "" {
+		return fmt.Errorf("across Solana source blockhash is required")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE across_canary_operations
+		SET source_chain='solana', source_identity=?, source_blockhash=?,
+		    destination_chain=?, balance_before=?, status='prepared', updated_at=?
+		WHERE operation_id=? AND status='created'`,
+		sourceIdentity, sourceBlockhash, destinationChain, balanceBefore,
+		time.Now().UTC().Format(time.RFC3339Nano), operationID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return fmt.Errorf("across canary operation cannot become prepared")
+	}
+	return nil
+}
+
 func (s *AcrossCanaryStore) Mark(ctx context.Context, operationID, status string, cause error) error {
 	switch status {
-	case "broadcast", "source_confirmed", "destination_confirmed", "completed", "failed", "outcome_unknown":
+	case "broadcast", "source_confirmed", "destination_confirmed", "completed", "failed", "rejected", "outcome_unknown":
 	default:
 		return fmt.Errorf("invalid Across canary status")
 	}
 	message := ""
 	if cause != nil {
-		message = cause.Error()
+		message = safeerr.Message(cause)
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE across_canary_operations
 		SET status=?, last_error=?, updated_at=? WHERE operation_id=?`,
@@ -204,12 +247,13 @@ func (s *AcrossCanaryStore) get(
 	var createdAt string
 	err := s.db.QueryRowContext(ctx, `SELECT
 		operation_id, direction, amount_units, expected_output_units, status,
-		source_chain, source_identity, destination_chain, destination_identity,
+		source_chain, source_identity, source_blockhash, destination_chain, destination_identity,
 		balance_before, balance_after, last_error, created_at
 		FROM across_canary_operations WHERE `+clause, argument,
 	).Scan(
 		&operation.ID, &operation.Direction, &operation.AmountUnits, &operation.ExpectedOutput,
 		&operation.Status, &operation.SourceChain, &operation.SourceIdentity,
+		&operation.SourceBlockhash,
 		&operation.DestinationChain, &operation.DestinationIdentity,
 		&operation.BalanceBefore, &operation.BalanceAfter, &operation.LastError, &createdAt,
 	)

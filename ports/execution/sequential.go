@@ -130,8 +130,74 @@ type SequentialPreparedBatchJournal interface {
 	RecordPreparedTransactions(context.Context, []PreparedTransaction) error
 }
 
+type TriggerFirstDecisionKind string
+
+const (
+	TriggerFirstDecisionEconomic75_25 TriggerFirstDecisionKind = "economic_75_25"
+	TriggerFirstDecisionForcedFixed   TriggerFirstDecisionKind = "forced_canary_fixed"
+)
+
+// TriggerFirstDecision is normalized pre-broadcast evidence for the first-leg
+// floor. Normal execution records the dynamic economic 75/25 budget; a forced
+// canary records that it deliberately used the configured fixed floor. It
+// intentionally contains neither calldata nor a signed transaction.
+type TriggerFirstDecision struct {
+	Operation          domainexecution.OperationID
+	Ordinal            int
+	Kind               TriggerFirstDecisionKind
+	ExpectedNet        string
+	ReservedHeadroom   string
+	ConsumableBudget   string
+	MinimumOutputToken market.TokenID
+	MinimumOutputUnits string
+	EquivalentBPS      uint16
+	AllocationHash     string
+	DecidedAt          time.Time
+}
+
+func (d TriggerFirstDecision) Validate() error {
+	kind := d.Kind
+	if kind == "" {
+		kind = TriggerFirstDecisionEconomic75_25
+	}
+	if d.Operation == "" || d.Ordinal < 1 || d.MinimumOutputToken == "" || d.MinimumOutputUnits == "" ||
+		d.EquivalentBPS > 10_000 || d.AllocationHash == "" || d.DecidedAt.IsZero() {
+		return fmt.Errorf("trigger-first decision evidence is incomplete")
+	}
+	switch kind {
+	case TriggerFirstDecisionEconomic75_25:
+		if d.ExpectedNet == "" || d.ReservedHeadroom == "" || d.ConsumableBudget == "" {
+			return fmt.Errorf("trigger-first decision evidence is incomplete")
+		}
+	case TriggerFirstDecisionForcedFixed:
+		if d.ReservedHeadroom != "" || d.ConsumableBudget != "" {
+			return fmt.Errorf("forced canary decision must not claim an economic slippage budget")
+		}
+	default:
+		return fmt.Errorf("trigger-first decision kind %q is unsupported", kind)
+	}
+	return nil
+}
+
+type SequentialTriggerFirstDecisionJournal interface {
+	RecordTriggerFirstDecision(context.Context, TriggerFirstDecision) error
+}
+
 type SequentialParallelSwapDriver interface {
 	ExecuteParallelSwaps(
+		context.Context,
+		domainexecution.OperationID,
+		domainexecution.SequentialPlan,
+		SequentialJournal,
+	) ([]domainexecution.SequentialStageSettlement, error)
+}
+
+// SequentialTriggeredSwapDriver specializes prefunded parallel execution for
+// a locally triggered opportunity. The first (local) swap is confirmed before
+// the freshly quoted and simulated remote swap may be broadcast.
+type SequentialTriggeredSwapDriver interface {
+	StagedFor(domainexecution.SequentialPlan) bool
+	ExecuteTriggeredSwaps(
 		context.Context,
 		domainexecution.OperationID,
 		domainexecution.SequentialPlan,
@@ -424,6 +490,8 @@ type SequentialResult struct {
 	BaseDelta      market.AssetQuantity
 	MarkedBase     market.AssetQuantity
 	MarkPrice      *big.Rat
+	TerminalState  domainexecution.SequentialOperationState
+	TerminalError  string
 }
 
 // SequentialObserver receives lifecycle evidence after durable state changes.
@@ -442,6 +510,20 @@ type SequentialObserver interface {
 		SequentialResult,
 		error,
 	)
+}
+
+// SequentialAsyncQuoteRestorer owns the independently durable quote-token
+// return after prefunded parallel swaps. Start must persist capacity and job
+// intent before launching work; it never retains an economic candidate.
+type SequentialAsyncQuoteRestorer interface {
+	Start(
+		context.Context,
+		domainexecution.SequentialStageRequest,
+		SequentialStageDriver,
+		SequentialJournal,
+	) error
+	BeginBase(context.Context, domainexecution.OperationID) error
+	CompleteBase(context.Context, domainexecution.OperationID, error) error
 }
 
 type SequentialExitObserver interface {

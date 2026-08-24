@@ -54,6 +54,50 @@ func TestSenderPostsReadableInsufficientBalanceRuntimeAlert(t *testing.T) {
 	}
 }
 
+func TestSenderPostsSetupLabeledCostCacheStateChanges(t *testing.T) {
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat", SetupLabel: "TOKEN",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, payload.Text)
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+				`{"ok":true,"result":{"message_id":1}}`,
+			))}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []notificationport.LiveRuntimeEvent{
+		{Kind: notificationport.LiveRuntimeCostCacheStale, Reason: "provider unavailable"},
+		{Kind: notificationport.LiveRuntimeCostCacheRecovered, Reason: "cache refreshed"},
+	} {
+		if err := sender.SendLiveRuntime(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(messages) != 2 {
+		t.Fatalf("messages=%d, want 2", len(messages))
+	}
+	for _, expected := range []string{"TOKEN · COST CACHE STALE", "provider unavailable", "New trades are blocked"} {
+		if !strings.Contains(messages[0], expected) {
+			t.Fatalf("stale message does not contain %q: %s", expected, messages[0])
+		}
+	}
+	for _, expected := range []string{"TOKEN · COST CACHE RECOVERED", "cache refreshed", "available again"} {
+		if !strings.Contains(messages[1], expected) {
+			t.Fatalf("recovery message does not contain %q: %s", expected, messages[1])
+		}
+	}
+}
+
 func TestSenderPostsOneCompleteOpeningMessage(t *testing.T) {
 	requests := 0
 	sender, err := telegram.New(telegram.Config{
@@ -79,7 +123,7 @@ func TestSenderPostsOneCompleteOpeningMessage(t *testing.T) {
 				t.Fatalf("unexpected Telegram rendering options: %+v", payload)
 			}
 			for _, expected := range []string{
-				"🎯 <b>ARB · +1 QUOTE net</b>",
+				"🎯 <b>LIVE · ARB · +1 QUOTE net</b>",
 				"📍 market-a → market-b",
 				`💱 <b>750 QUOTE</b> → <a href="https://explorer.test/tx/tx-synthetic"><b>14,550 BASE</b></a> → <b>752 QUOTE</b>`,
 				"🔌 provider-a → provider-b",
@@ -223,8 +267,8 @@ func TestSenderTreatsUnchangedTelegramEditAsSuccess(t *testing.T) {
 	}
 	operation := "synthetic-operation"
 	for _, event := range []notificationport.LiveExecutionEvent{
-		{Kind: notificationport.LiveExecutionStarted, Operation: operation},
-		{Kind: notificationport.LiveExecutionStageStarted, Operation: operation, Stage: "sell", Ordinal: 2},
+		{Kind: notificationport.LiveExecutionFailed, Operation: operation},
+		{Kind: notificationport.LiveExecutionRecoveryStarted, Operation: operation},
 	} {
 		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
 			t.Fatal(err)
@@ -245,7 +289,7 @@ func TestSenderPostsConfigurationWarningForAcceptedModeMismatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, expected := range []string{
-				"⚠️ <b>CONFIG · JUPITER</b>",
+				"⚠️ <b>LIVE · CONFIG · JUPITER</b>",
 				"📍 Solana · Jupiter",
 				"⚙️ manual → ultra · metis",
 				"✅ Quote aceptado",
@@ -280,7 +324,8 @@ func TestSenderPostsConciseLiveRuntimeLifecycle(t *testing.T) {
 	var messages []string
 	sender, err := telegram.New(telegram.Config{
 		BotToken: "synthetic-token", ChatID: "synthetic-chat",
-		BaseURL: "https://telegram.test",
+		SetupLabel: "BASE",
+		BaseURL:    "https://telegram.test",
 		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
 			var payload struct {
 				Text string `json:"text"`
@@ -325,7 +370,7 @@ func TestSenderPostsConciseLiveRuntimeLifecycle(t *testing.T) {
 		t.Fatalf("messages=%d, want 2", len(messages))
 	}
 	for _, expected := range []string{
-		"\U0001f7e2 <b>LIVE \u00b7 STARTED</b>",
+		"\U0001f7e2 <b>BASE \u00b7 STARTED</b>",
 		"\U0001f4cc Mode: <b>live</b>",
 		"2026-07-30 08:00:00 UTC",
 	} {
@@ -334,7 +379,7 @@ func TestSenderPostsConciseLiveRuntimeLifecycle(t *testing.T) {
 		}
 	}
 	for _, expected := range []string{
-		"\U0001f6d1 <b>LIVE \u00b7 STOPPED</b>",
+		"\U0001f6d1 <b>BASE \u00b7 STOPPED</b>",
 		"\U0001f9ed Reason: operator/system stop",
 		"\u23f3 Uptime: 90.000 s",
 	} {
@@ -394,9 +439,61 @@ func TestSenderPostsRecoveryAndRefuelStates(t *testing.T) {
 	if len(messages) != 2 ||
 		!strings.Contains(messages[0], "LIVE · RECOVERING") ||
 		!strings.Contains(messages[0], "attempt 4") ||
-		!strings.Contains(messages[1], "GAS · REFUELED") ||
+		!strings.Contains(messages[1], "LIVE · GAS REFUELED") ||
 		!strings.Contains(messages[1], "Polygon") {
 		t.Fatalf("messages=%q", messages)
+	}
+}
+
+func TestSenderCreatesRecoveryMessageAfterRestartAndEditsProgress(t *testing.T) {
+	var paths []string
+	var messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			paths = append(paths, request.URL.Path)
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":81}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := "recovery-after-restart"
+	for _, event := range []notificationport.LiveExecutionEvent{
+		{
+			Kind: notificationport.LiveExecutionRecoveryStarted, Operation: operation,
+			Direction: "chain-a -> chain-b", Detail: "stage 2/4",
+		},
+		{
+			Kind: notificationport.LiveExecutionRecoveryProgress, Operation: operation,
+			Direction: "chain-a -> chain-b", Detail: "attempt 5 · next retry 30s",
+		},
+	} {
+		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(paths) != 2 ||
+		!strings.HasSuffix(paths[0], "/sendMessage") ||
+		!strings.HasSuffix(paths[1], "/editMessageText") {
+		t.Fatalf("unexpected recovery delivery sequence: %v", paths)
+	}
+	if !strings.Contains(messages[0], "LIVE · RECOVERING") ||
+		!strings.Contains(messages[1], "attempt 5") {
+		t.Fatalf("unexpected recovery messages: %q", messages)
 	}
 }
 
@@ -456,8 +553,8 @@ func TestSenderPostsConciseLiveProgressAndFailureMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 2 {
-		t.Fatalf("messages=%d, want 2", len(messages))
+	if len(messages) != 1 {
+		t.Fatalf("messages=%d, want 1", len(messages))
 	}
 	for _, expected := range []string{
 		"✅ <b>2/4 · BRIDGE BASE</b> · Solana → Polygon · 8.000 s",
@@ -465,7 +562,7 @@ func TestSenderPostsConciseLiveProgressAndFailureMessages(t *testing.T) {
 		`<a href="https://explorer.test/tx/destination">Receipt on Polygon</a>`,
 	} {
 		if !strings.Contains(messages[0], expected) {
-			t.Fatalf("progress message does not contain %q: %s", expected, messages[0])
+			t.Fatalf("terminal message does not contain %q: %s", expected, messages[0])
 		}
 	}
 	for _, forbidden := range []string{
@@ -474,7 +571,7 @@ func TestSenderPostsConciseLiveProgressAndFailureMessages(t *testing.T) {
 		"Costs",
 	} {
 		if strings.Contains(messages[0], forbidden) {
-			t.Fatalf("progress message contains %q: %s", forbidden, messages[0])
+			t.Fatalf("terminal message contains %q: %s", forbidden, messages[0])
 		}
 	}
 	for _, expected := range []string{
@@ -482,19 +579,20 @@ func TestSenderPostsConciseLiveProgressAndFailureMessages(t *testing.T) {
 		"3/4 · SELL · Polygon",
 		"⚠️ receipt outcome is unknown",
 	} {
-		if !strings.Contains(messages[1], expected) {
-			t.Fatalf("failure message does not contain %q: %s", expected, messages[1])
+		if !strings.Contains(messages[0], expected) {
+			t.Fatalf("failure message does not contain %q: %s", expected, messages[0])
 		}
 	}
 }
 
-func TestSenderCreatesOneLiveMessageAndEditsItForEveryUpdate(t *testing.T) {
+func TestSenderPostsOneLiveMessageOnlyAtTerminalState(t *testing.T) {
 	var paths []string
 	var messageIDs []int64
 	var messages []string
 	sender, err := telegram.New(telegram.Config{
 		BotToken: "synthetic-token", ChatID: "synthetic-chat",
-		BaseURL: "https://telegram.test",
+		SetupLabel: "BASE",
+		BaseURL:    "https://telegram.test",
 		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
 			var payload struct {
 				MessageID int64  `json:"message_id"`
@@ -546,24 +644,15 @@ func TestSenderCreatesOneLiveMessageAndEditsItForEveryUpdate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(paths) != 3 {
-		t.Fatalf("requests=%d, want 3", len(paths))
+	if len(paths) != 1 {
+		t.Fatalf("requests=%d, want 1", len(paths))
 	}
 	if paths[0] != "/botsynthetic-token/sendMessage" || messageIDs[0] != 0 {
-		t.Fatalf("initial request=%q message_id=%d", paths[0], messageIDs[0])
-	}
-	for index := 1; index < len(paths); index++ {
-		if paths[index] != "/botsynthetic-token/editMessageText" ||
-			messageIDs[index] != 37 {
-			t.Fatalf(
-				"update %d path=%q message_id=%d",
-				index, paths[index], messageIDs[index],
-			)
-		}
+		t.Fatalf("terminal request=%q message_id=%d", paths[0], messageIDs[0])
 	}
 	final := messages[len(messages)-1]
 	for _, expected := range []string{
-		"LIVE · COMPLETE",
+		"BASE · COMPLETE",
 		"Solana → Polygon",
 		"750 QUOTE → 3,250 BASE → 755 QUOTE",
 		"Jupiter → KyberSwap · expected <b>+4 QUOTE</b>",
@@ -579,14 +668,75 @@ func TestSenderCreatesOneLiveMessageAndEditsItForEveryUpdate(t *testing.T) {
 	}
 }
 
+func TestSenderUpdatesCompletedOperationWhenAsyncReturnSettles(t *testing.T) {
+	t.Parallel()
+
+	var paths, messages []string
+	sender, err := telegram.New(telegram.Config{
+		BotToken: "synthetic-token", ChatID: "synthetic-chat", SetupLabel: "ASSET",
+		BaseURL: "https://telegram.test",
+		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			paths = append(paths, request.URL.Path)
+			messages = append(messages, payload.Text)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"ok":true,"result":{"message_id":91}}`,
+				)),
+			}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := "async-return-operation"
+	for _, event := range []notificationport.LiveExecutionEvent{
+		{Kind: notificationport.LiveExecutionStarted, Operation: operation, Direction: "Chain A -> Chain B", Input: "250 QUOTE"},
+		{Kind: notificationport.LiveExecutionStageCompleted, Operation: operation, Stage: "buy", Ordinal: 1, TotalStages: 4, SourceChain: "Chain A", Input: "250 QUOTE", Output: "240 BASE", SourceTransaction: "0xbuy", SourceURL: "https://explorer-a.test/tx/0xbuy"},
+		{Kind: notificationport.LiveExecutionStageStarted, Operation: operation, Stage: "bridge_quote_return", Ordinal: 4, TotalStages: 4, SourceChain: "Chain B", DestinationChain: "Chain A", Input: "249 QUOTE"},
+		{Kind: notificationport.LiveExecutionCompleted, Operation: operation, Input: "250 QUOTE", Output: "249 QUOTE", NetPnL: "-1 QUOTE"},
+		{Kind: notificationport.LiveExecutionStageCompleted, Operation: operation, Stage: "bridge_quote_return", Ordinal: 4, TotalStages: 4, SourceChain: "Chain B", DestinationChain: "Chain A", Input: "249 QUOTE", Output: "249 QUOTE", SourceTransaction: "0xdeparture", SourceURL: "https://explorer-b.test/tx/0xdeparture", DestinationTx: "0xreceipt", DestinationURL: "https://explorer-a.test/tx/0xreceipt"},
+	} {
+		if err := sender.SendLiveExecution(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(paths) != 2 || !strings.HasSuffix(paths[0], "/sendMessage") ||
+		!strings.HasSuffix(paths[1], "/editMessageText") {
+		t.Fatalf("unexpected notification delivery sequence: %v", paths)
+	}
+	if !strings.Contains(messages[0], "ASSET · RETURN PENDING") ||
+		!strings.Contains(messages[0], "⏳ <b>4/4 · RETURN") {
+		t.Fatalf("pending summary is misleading:\n%s", messages[0])
+	}
+	final := messages[1]
+	for _, expected := range []string{
+		"ASSET · COMPLETE",
+		`<a href="https://explorer-b.test/tx/0xdeparture">Departure from Chain B</a>`,
+		`<a href="https://explorer-a.test/tx/0xreceipt">Receipt on Chain A</a>`,
+	} {
+		if !strings.Contains(final, expected) {
+			t.Fatalf("final summary does not contain %q:\n%s", expected, final)
+		}
+	}
+}
+
 func TestRecoveredExecutionFinishesAsCompleteWithoutPendingStages(t *testing.T) {
 	t.Parallel()
 
 	var messages []string
+	var paths []string
 	sender, err := telegram.New(telegram.Config{
 		BotToken: "synthetic-token", ChatID: "synthetic-chat",
 		BaseURL: "https://telegram.test",
 		Client: clientFunc(func(request *http.Request) (*http.Response, error) {
+			paths = append(paths, request.URL.Path)
 			var payload struct {
 				Text string `json:"text"`
 			}
@@ -652,6 +802,12 @@ func TestRecoveredExecutionFinishesAsCompleteWithoutPendingStages(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
+	if len(paths) != 3 ||
+		!strings.HasSuffix(paths[0], "/sendMessage") ||
+		!strings.HasSuffix(paths[1], "/editMessageText") ||
+		!strings.HasSuffix(paths[2], "/editMessageText") {
+		t.Fatalf("unexpected recovery delivery sequence: %v", paths)
+	}
 	final := messages[len(messages)-1]
 	if !strings.Contains(final, "LIVE") ||
 		!strings.Contains(final, "COMPLETE") ||
@@ -705,10 +861,9 @@ func TestSenderLabelsForcedCanaryWithoutDiscoverySizedOutputs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(messages) != 2 ||
-		!strings.Contains(messages[0], "CANARY · FORCED") ||
-		!strings.Contains(messages[0], "1 QUOTE") ||
-		!strings.Contains(messages[1], "CANARY · COMPLETE") {
+	if len(messages) != 1 ||
+		!strings.Contains(messages[0], "LIVE · CANARY COMPLETE") ||
+		!strings.Contains(messages[0], "1 QUOTE") {
 		t.Fatalf("unexpected forced canary messages: %v", messages)
 	}
 	for _, forbidden := range []string{"750 QUOTE", "expected"} {
@@ -808,7 +963,7 @@ func TestSenderRendersCompactCompletedCanarySummary(t *testing.T) {
 	}
 	final := messages[len(messages)-1]
 	for _, expected := range []string{
-		"🏁 <b>CANARY · COMPLETE</b>",
+		"🏁 <b>LIVE · CANARY COMPLETE</b>",
 		"✅ <b>1/4 · BUY</b> · Solana",
 		"1 QUOTE → <b>4.983 BASE</b> · 754 ms",
 		`>Swap on Solana</a>`,

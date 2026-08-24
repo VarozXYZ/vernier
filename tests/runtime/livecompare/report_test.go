@@ -276,6 +276,28 @@ func TestSummaryOutputMarksTheSelectedRoundTripRatherThanTheLargestBuy(t *testin
 	}
 }
 
+func TestSummaryOutputDoesNotMarkUnprofitableComparisonWinnerAsSelected(t *testing.T) {
+	gross, _ := market.ParseAssetQuantity("quote", "-1")
+	net, _ := market.ParseAssetQuantity("quote", "-2")
+	direction := marketDirection("market-a", "market-b")
+	report := livecompare.Report{Research: runtimeresearch.Report{
+		LocalTiming: strategy.EvaluationTiming{Directions: []strategy.DirectionTiming{{Direction: direction}}},
+		Opportunities: []arbitrage.Opportunity{{
+			Direction: direction, SelectedIndex: 0, Classification: arbitrage.ClassificationNoSpread,
+			Candidates: []arbitrage.Candidate{{GrossPnL: gross, NetPnL: net}},
+		}},
+	}}
+	var output bytes.Buffer
+	if err := livecompare.WriteTextWithOptions(&output, report, livecompare.OutputOptions{
+		Calculations: livecompare.CalculationSummary, OmitCost: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "[SELECTED]") {
+		t.Fatalf("unprofitable comparison winner was marked selected: %s", output.String())
+	}
+}
+
 func TestFullOutputIncludesQuoteErrors(t *testing.T) {
 	probeSize, err := market.ParseAssetQuantity("quote", "10")
 	if err != nil {

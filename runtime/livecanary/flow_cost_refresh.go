@@ -46,14 +46,17 @@ type routeGasEstimator interface {
 	) (uint64, error)
 }
 
-type cachedEVMFeeSource interface {
+type EVMFeeCostSource interface {
 	FeeSnapshot() (evmadapter.FeeSnapshot, bool)
 	ConfirmedGasUsed(context.Context, string) (uint64, error)
 }
 
+type cachedEVMFeeSource = EVMFeeCostSource
+
 type solanaMessageFeeSource interface {
 	FeeForMessage(context.Context, string) (uint64, error)
 	ConfirmedPayerDebit(context.Context, string) (uint64, error)
+	ConfirmedPayerDebits(context.Context, string) (uint64, uint64, error)
 }
 
 type nttCostCalibrationSource interface {
@@ -70,8 +73,9 @@ type acrossCostCalibrationSource interface {
 }
 
 type observedFlowCostState struct {
-	mu          sync.Mutex
-	calibration map[string]sqlitestore.NTTCostCalibration
+	mu                    sync.Mutex
+	calibration           map[string]sqlitestore.NTTCostCalibration
+	acrossAdditionalDebit map[string]uint64
 }
 
 type ObservedFlowCostRefreshConfig struct {
@@ -108,7 +112,8 @@ func NewObservedFlowCostRefresh(
 		config.Clock = time.Now
 	}
 	state := &observedFlowCostState{
-		calibration: make(map[string]sqlitestore.NTTCostCalibration, 2),
+		calibration:           make(map[string]sqlitestore.NTTCostCalibration, 2),
+		acrossAdditionalDebit: make(map[string]uint64, 1),
 	}
 	return func(
 		ctx context.Context,
@@ -185,7 +190,7 @@ func estimateObservedDirection(
 	}()
 	go func() {
 		components, err := estimateObservedAcross(
-			ctx, config, opportunity.Direction, candidate.SellQuote.AmountOut,
+			ctx, config, state, opportunity.Direction, candidate.SellQuote.AmountOut,
 		)
 		results <- componentResult{components: components, err: err}
 	}()
@@ -492,6 +497,7 @@ func loadNTTCostCalibration(
 func estimateObservedAcross(
 	ctx context.Context,
 	config ObservedFlowCostRefreshConfig,
+	state *observedFlowCostState,
 	direction arbitrage.Direction,
 	input market.TokenAmount,
 ) ([]FlowCostComponent, error) {
@@ -573,9 +579,19 @@ func estimateObservedAcross(
 		if err != nil {
 			return nil, fmt.Errorf("estimate Across Solana message fee: %w", err)
 		}
+		additionalDebit, err := loadAcrossSolanaAdditionalDebit(ctx, config, state)
+		if err != nil {
+			return nil, fmt.Errorf("read Across Solana payer-debit calibration: %w", err)
+		}
+		payerDebit, err := EstimateAcrossSolanaPayerDebit(fee, additionalDebit)
+		if err != nil {
+			return nil, err
+		}
 		component, err := valueNativeFlowCost(
-			config, sourceChain, new(big.Int).SetUint64(fee),
-			"quote_bridge_source", "across_message_fee", config.Clock().UTC(),
+			config, sourceChain, new(big.Int).SetUint64(payerDebit),
+			"quote_bridge_source",
+			"across_message_fee+real_additional_payer_debit",
+			config.Clock().UTC(),
 		)
 		if err != nil {
 			return nil, err
@@ -585,6 +601,46 @@ func estimateObservedAcross(
 		return nil, fmt.Errorf("across source chain kind is unsupported")
 	}
 	return components, nil
+}
+
+func loadAcrossSolanaAdditionalDebit(
+	ctx context.Context,
+	config ObservedFlowCostRefreshConfig,
+	state *observedFlowCostState,
+) (uint64, error) {
+	const direction = "solana-to-evm"
+	state.mu.Lock()
+	debit, ok := state.acrossAdditionalDebit[direction]
+	state.mu.Unlock()
+	if ok {
+		return debit, nil
+	}
+	identity, _, err := config.AcrossCalibration.LatestCompletedSource(ctx, direction)
+	if err != nil {
+		return 0, err
+	}
+	_, debit, err = config.SolanaFees.ConfirmedPayerDebits(ctx, identity)
+	if err != nil {
+		return 0, err
+	}
+	if debit == 0 {
+		return 0, fmt.Errorf("completed Across source has no additional payer debit")
+	}
+	state.mu.Lock()
+	state.acrossAdditionalDebit[direction] = debit
+	state.mu.Unlock()
+	return debit, nil
+}
+
+// EstimateAcrossSolanaPayerDebit combines the current message fee with the
+// calibrated non-fee lamport debit paid by a completed Across source transfer.
+func EstimateAcrossSolanaPayerDebit(
+	networkFee, additionalDebit uint64,
+) (uint64, error) {
+	if additionalDebit > ^uint64(0)-networkFee {
+		return 0, fmt.Errorf("across Solana payer debit overflows uint64")
+	}
+	return networkFee + additionalDebit, nil
 }
 
 func valueNativeFlowCost(

@@ -14,11 +14,18 @@ import (
 )
 
 type parallelRecoveryJournal struct {
-	mu          sync.Mutex
-	operation   domainexecution.SequentialOperation
-	snapshot    executionport.SequentialRecoverySnapshot
-	settlements []domainexecution.SequentialStageSettlement
-	finished    domainexecution.SequentialOperationState
+	mu           sync.Mutex
+	operation    domainexecution.SequentialOperation
+	snapshot     executionport.SequentialRecoverySnapshot
+	settlements  []domainexecution.SequentialStageSettlement
+	finished     domainexecution.SequentialOperationState
+	exitDecision *domainexecution.SequentialExitDecision
+}
+
+func (j *parallelRecoveryJournal) RecordSequentialExitDecision(_ context.Context,
+	decision domainexecution.SequentialExitDecision) error {
+	j.exitDecision = &decision
+	return nil
 }
 
 func (j *parallelRecoveryJournal) CreateSequentialOperation(
@@ -102,6 +109,26 @@ type parallelRecoveryDriver struct {
 	mu      sync.Mutex
 	inputs  []market.TokenAmount
 	outputs map[int]market.TokenAmount
+	err     error
+}
+
+type recoveryOutcomeObserver struct {
+	completed int
+	aborted   int
+}
+
+func (*recoveryOutcomeObserver) RecoveryStarted(executionport.SequentialRecoverySnapshot) {}
+func (*recoveryOutcomeObserver) RecoveryAttempt(executionport.SequentialRecoveryAttempt)  {}
+func (o *recoveryOutcomeObserver) RecoveryCompleted(executionport.SequentialResult) {
+	o.completed++
+}
+func (*recoveryOutcomeObserver) RecoveryBlocked(domainexecution.SequentialOperation, error) {}
+func (o *recoveryOutcomeObserver) RecoveryAborted(
+	domainexecution.SequentialOperation,
+	executionport.SequentialResult,
+	error,
+) {
+	o.aborted++
 }
 
 func (*parallelRecoveryDriver) ExecuteStage(
@@ -113,11 +140,17 @@ func (*parallelRecoveryDriver) ExecuteStage(
 }
 
 func (d *parallelRecoveryDriver) RecoverStage(
-	_ context.Context,
+	ctx context.Context,
 	request domainexecution.SequentialStageRequest,
 	_ []executionport.SequentialTransactionRecord,
 	_ executionport.SequentialJournal,
 ) (domainexecution.SequentialStageSettlement, error) {
+	if d.err != nil {
+		return domainexecution.SequentialStageSettlement{}, d.err
+	}
+	if err := ctx.Err(); err != nil {
+		return domainexecution.SequentialStageSettlement{}, err
+	}
 	d.mu.Lock()
 	d.inputs = append(d.inputs, request.Input)
 	d.mu.Unlock()
@@ -133,6 +166,74 @@ func (d *parallelRecoveryDriver) RecoverStage(
 		output,
 		time.Now().UTC(),
 	), nil
+}
+
+func TestCanceledRecoveryRemainsRecoverable(t *testing.T) {
+	base := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedParallelPlan(
+		"shutdown-recovery-plan", base.Opportunity, base.InitialInput,
+		"chain-a", "chain-b", time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.BaseAsset, plan.QuoteAsset = "base", "usdc"
+	plan.TokenDecimals = map[market.TokenID]uint8{
+		"quote-a": 6, "quote-b": 6, "base-a": 9, "base-b": 18,
+	}
+	now := time.Now().UTC()
+	buyOutput := sequentialAmount(t, "base-a", 3_950_000_000)
+	operation := domainexecution.SequentialOperation{
+		ID: "shutdown-recovery-operation", Plan: plan.ID,
+		OpportunityID: string(plan.Opportunity.Evaluation),
+		ConfigHash:    plan.Opportunity.ConfigHash,
+		State:         domainexecution.SequentialRecovering,
+		CurrentStage:  1, CurrentAmount: buyOutput,
+		StartedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+	}
+	journal := &parallelRecoveryJournal{operation: operation}
+	journal.snapshot = executionport.SequentialRecoverySnapshot{
+		Operation: operation,
+		Plan:      plan,
+		Transactions: []executionport.SequentialTransactionRecord{{
+			Operation: operation.ID, Ordinal: 2, Phase: "swap",
+			Identity: domainexecution.TransactionIdentity{
+				Chain: "chain-b", Account: "test", Hash: "pending-sale",
+			},
+			Status: "outcome_unknown", PreparedAt: now, UpdatedAt: now,
+		}},
+		Settlements: []domainexecution.SequentialStageSettlement{
+			parallelSettlement(
+				operation.ID, plan.ID, plan.Stages[0],
+				plan.InitialInput, buyOutput, now,
+			),
+		},
+	}
+	driver := &parallelRecoveryDriver{err: context.Canceled}
+	coordinator, err := saga.NewSequentialRecoveryCoordinator(
+		saga.SequentialRecoveryConfig{
+			Journal: journal, RecoveryJournal: journal,
+			Drivers: executionport.DriverSet{
+				Buy: driver, Sell: driver,
+				BridgeBase: driver, BridgeQuoteReturn: driver,
+			},
+			Clock: time.Now,
+			Sleep: func(context.Context, time.Duration) error {
+				return context.Canceled
+			},
+			UncertainTimeout: time.Second,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, found, err := coordinator.RecoverActive(context.Background())
+	if !found || !errors.Is(err, context.Canceled) {
+		t.Fatalf("found=%t error=%v", found, err)
+	}
+	if journal.operation.State != domainexecution.SequentialRecovering {
+		t.Fatalf("shutdown persisted state=%s", journal.operation.State)
+	}
 }
 
 func TestParallelRecoveryKeepsSellInputIndependentAfterBuySettlement(t *testing.T) {
@@ -245,5 +346,155 @@ func TestParallelRecoveryKeepsSellInputIndependentAfterBuySettlement(t *testing.
 	}
 	if result.RealizedNetPnL.Asset() != "usdc" {
 		t.Fatalf("unexpected recovered economics: %s", result.RealizedNetPnL)
+	}
+}
+
+func TestRecoveryWithNoConfirmedEconomicEffectIsAbortedNotCompleted(t *testing.T) {
+	base := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedParallelPlan(
+		"no-effect-plan", base.Opportunity, base.InitialInput,
+		"chain-a", "chain-b", time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.BaseAsset, plan.QuoteAsset = "base", "usdc"
+	plan.TokenDecimals = map[market.TokenID]uint8{
+		"quote-a": 6, "quote-b": 6, "base-a": 9, "base-b": 18,
+	}
+	operation := domainexecution.SequentialOperation{
+		ID: "no-effect-operation", Plan: plan.ID,
+		OpportunityID: string(plan.Opportunity.Evaluation), ConfigHash: plan.Opportunity.ConfigHash,
+		State: domainexecution.SequentialRecovering, CurrentAmount: plan.InitialInput,
+		StartedAt: time.Now().UTC().Add(-time.Second), UpdatedAt: time.Now().UTC(),
+	}
+	journal := &parallelRecoveryJournal{operation: operation}
+	journal.snapshot = executionport.SequentialRecoverySnapshot{Operation: operation, Plan: plan}
+	driver := &parallelRecoveryDriver{outputs: map[int]market.TokenAmount{}}
+	observer := &recoveryOutcomeObserver{}
+	coordinator, err := saga.NewSequentialRecoveryCoordinator(saga.SequentialRecoveryConfig{
+		Journal: journal, RecoveryJournal: journal,
+		Drivers:  executionport.DriverSet{Buy: driver, Sell: driver, BridgeBase: driver, BridgeQuoteReturn: driver},
+		Observer: observer, Clock: time.Now,
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, found, err := coordinator.RecoverActive(context.Background())
+	if err != nil || !found {
+		t.Fatalf("recover no-effect operation: found=%t err=%v", found, err)
+	}
+	if journal.finished != domainexecution.SequentialAborted ||
+		result.TerminalState != domainexecution.SequentialAborted ||
+		observer.aborted != 1 || observer.completed != 0 {
+		t.Fatalf("unexpected no-effect recovery: state=%s terminal=%s aborted=%d completed=%d",
+			journal.finished, result.TerminalState, observer.aborted, observer.completed)
+	}
+}
+
+func TestTriggerFirstRecoverySelectsFreshExitBeforeSingleRetry(t *testing.T) {
+	base := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedParallelPlan("trigger-first-recovery", base.Opportunity,
+		base.InitialInput, "chain-a", "chain-b", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Policy = domainexecution.PolicyPrefundedTriggerFirst
+	plan.BaseAsset, plan.QuoteAsset = "base", "usdc"
+	plan.TokenDecimals = map[market.TokenID]uint8{"quote-a": 6, "quote-b": 6, "base-a": 9, "base-b": 18}
+	if err := plan.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	buyOutput := sequentialAmount(t, "base-a", 3_950_000_000)
+	operation := domainexecution.SequentialOperation{ID: "trigger-first-operation", Plan: plan.ID,
+		OpportunityID: string(plan.Opportunity.Evaluation), ConfigHash: plan.Opportunity.ConfigHash,
+		State: domainexecution.SequentialRecovering, CurrentStage: 1, CurrentAmount: buyOutput,
+		StartedAt: now.Add(-time.Minute), UpdatedAt: now}
+	journal := &parallelRecoveryJournal{operation: operation}
+	journal.snapshot = executionport.SequentialRecoverySnapshot{Operation: operation, Plan: plan,
+		Transactions: []executionport.SequentialTransactionRecord{{Operation: operation.ID, Ordinal: 2,
+			Phase: "swap", Identity: domainexecution.TransactionIdentity{Chain: "chain-b", Account: "test", Hash: "reverted-sale"},
+			Status: "confirmed_revert", PreparedAt: now, UpdatedAt: now}},
+		Settlements: []domainexecution.SequentialStageSettlement{parallelSettlement(operation.ID, plan.ID,
+			plan.Stages[0], plan.InitialInput, buyOutput, now)}}
+	driver := &parallelRecoveryDriver{outputs: map[int]market.TokenAmount{
+		2: sequentialAmount(t, "quote-b", 1_001_000), 3: sequentialAmount(t, "base-b", 3_950_000_000_000_000_000),
+		4: sequentialAmount(t, "quote-a", 1_000_900)}}
+	selector := prefundedExitSelector{recoveryRoute: domainexecution.ExitSellAtDestination}
+	coordinator, err := saga.NewSequentialRecoveryCoordinator(saga.SequentialRecoveryConfig{Journal: journal,
+		RecoveryJournal: journal, Drivers: executionport.DriverSet{Buy: driver, Sell: driver,
+			BridgeBase: driver, BridgeQuoteReturn: driver, ExitSelector: selector},
+		Clock: time.Now, Sleep: func(context.Context, time.Duration) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := coordinator.RecoverActive(context.Background()); err != nil || !found {
+		t.Fatalf("trigger-first recovery: found=%t err=%v", found, err)
+	}
+	if journal.exitDecision == nil || journal.exitDecision.Route != domainexecution.ExitSellAtDestination {
+		t.Fatalf("fresh recovery exit was not persisted: %#v", journal.exitDecision)
+	}
+	if len(driver.inputs) == 0 || driver.inputs[0].Token() != plan.Stages[1].InputToken {
+		t.Fatalf("selected recovery leg input=%v", driver.inputs)
+	}
+}
+
+func TestTriggerFirstRecoveryDoesNotReselectExitAfterBothSwapsSettled(t *testing.T) {
+	base := sequentialPlan(t)
+	plan, err := domainexecution.NewPrefundedParallelPlan(
+		"trigger-first-settled-plan", base.Opportunity, base.InitialInput,
+		"chain-a", "chain-b", time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Policy = domainexecution.PolicyPrefundedTriggerFirst
+	plan.BaseAsset, plan.QuoteAsset = "base", "usdc"
+	plan.TokenDecimals = map[market.TokenID]uint8{
+		"quote-a": 6, "quote-b": 6, "base-a": 9, "base-b": 18,
+	}
+	now := time.Now().UTC()
+	buyOutput := sequentialAmount(t, "base-a", 3_950_000_000)
+	sellInput, err := plan.ParallelSellInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sellOutput := sequentialAmount(t, "quote-b", 1_001_000)
+	operation := domainexecution.SequentialOperation{
+		ID: "trigger-first-settled-operation", Plan: plan.ID,
+		OpportunityID: string(plan.Opportunity.Evaluation), ConfigHash: plan.Opportunity.ConfigHash,
+		State: domainexecution.SequentialRecovering, CurrentStage: 2, CurrentAmount: sellOutput,
+		StartedAt: now.Add(-time.Minute), UpdatedAt: now,
+	}
+	journal := &parallelRecoveryJournal{operation: operation}
+	journal.snapshot = executionport.SequentialRecoverySnapshot{
+		Operation: operation, Plan: plan,
+		Settlements: []domainexecution.SequentialStageSettlement{
+			parallelSettlement(operation.ID, plan.ID, plan.Stages[0], plan.InitialInput, buyOutput, now),
+			parallelSettlement(operation.ID, plan.ID, plan.Stages[1], sellInput, sellOutput, now),
+		},
+	}
+	driver := &parallelRecoveryDriver{outputs: map[int]market.TokenAmount{
+		3: sequentialAmount(t, "base-b", 3_950_000_000_000_000_000),
+		4: sequentialAmount(t, "quote-a", 1_000_900),
+	}}
+	coordinator, err := saga.NewSequentialRecoveryCoordinator(saga.SequentialRecoveryConfig{
+		Journal: journal, RecoveryJournal: journal,
+		Drivers: executionport.DriverSet{Buy: driver, Sell: driver, BridgeBase: driver, BridgeQuoteReturn: driver},
+		Clock:   time.Now, Sleep: func(context.Context, time.Duration) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, found, err := coordinator.RecoverActive(context.Background())
+	if err != nil || !found {
+		t.Fatalf("recover settled trigger-first operation: found=%t err=%v", found, err)
+	}
+	if journal.exitDecision != nil || len(driver.inputs) != 2 || len(result.Settlements) != 4 ||
+		journal.finished != domainexecution.SequentialCompleted {
+		t.Fatalf("settled trigger-first recovery reselected an exit: decision=%+v inputs=%d settlements=%d state=%s",
+			journal.exitDecision, len(driver.inputs), len(result.Settlements), journal.finished)
 	}
 }

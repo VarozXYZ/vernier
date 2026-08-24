@@ -295,12 +295,13 @@ func (c *GuardianClient) fetch(
 	message crosschainport.MessageID,
 ) ([]byte, bool, error) {
 	requestURL := *base
-	requestURL.Path = strings.TrimRight(base.Path, "/") + fmt.Sprintf(
-		"/v1/signed_vaa/%d/%s/%d",
-		message.EmitterChain,
-		hex.EncodeToString(message.EmitterAddress[:]),
-		message.Sequence,
-	)
+	wormholeScan := strings.HasSuffix(strings.TrimRight(base.Path, "/"), "/api/v1/vaas")
+	path := "/v1/signed_vaa"
+	if wormholeScan {
+		path = ""
+	}
+	requestURL.Path = strings.TrimRight(base.Path, "/") + path + fmt.Sprintf("/%d/%s/%d",
+		message.EmitterChain, hex.EncodeToString(message.EmitterAddress[:]), message.Sequence)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 	if err != nil {
 		return nil, false, err
@@ -321,12 +322,25 @@ func (c *GuardianClient) fetch(
 		return nil, false, fmt.Errorf("guardian RPC %s returned HTTP %s", base.Host, response.Status)
 	}
 	var envelope struct {
-		VAABytes string `json:"vaaBytes"`
+		VAABytes string          `json:"vaaBytes"`
+		Data     json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, false, fmt.Errorf("decode Guardian RPC %s response: %w", base.Host, err)
 	}
-	raw, err := base64.StdEncoding.DecodeString(envelope.VAABytes)
+	encoded := envelope.VAABytes
+	if wormholeScan {
+		var item struct {
+			VAA string `json:"vaa"`
+		}
+		if err := json.Unmarshal(envelope.Data, &item); err != nil {
+			return nil, false, fmt.Errorf(
+				"decode WormholeScan %s VAA payload: %w", base.Host, err,
+			)
+		}
+		encoded = item.VAA
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil || len(raw) == 0 {
 		return nil, false, fmt.Errorf("guardian RPC %s returned invalid VAA bytes", base.Host)
 	}

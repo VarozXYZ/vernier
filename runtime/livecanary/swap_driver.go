@@ -10,6 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+
+	localexecution "github.com/VarozXYZ/vernier/adapters/execution/local"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
@@ -18,18 +22,36 @@ import (
 )
 
 type SwapBinding struct {
-	Account          execution.AccountID
-	Validator        executionport.Validator
-	RefuelValidator  executionport.Validator
-	Estimator        SwapQuoteEstimator
-	TxManager        chainport.TxManager
-	Confirmation     chainport.ConfirmationSource
-	NonceCoordinator chainport.EVMNonceCoordinator
-	SpendableBalance SpendableBalanceReader
-	BalanceSnapshot  func(market.TokenID) (*big.Int, uint64, error)
-	Allowance        AllowanceReader
-	RefuelNetwork    RefuelNetwork
-	NativeToken      market.Token
+	Account   execution.AccountID
+	Validator executionport.Validator
+	// ConversionValidator and ConversionEstimator are retained for stable-token
+	// restoration when the market swap itself is fully local. They are never
+	// consulted by opportunity evaluation or the swap hot path.
+	ConversionValidator executionport.Validator
+	ConversionEstimator SwapQuoteEstimator
+	// RecoveryValidator builds a fresh executable artifact after a partial
+	// parallel fill. It must not consume the single-use discovery hand-off.
+	RecoveryValidator executionport.Validator
+	RefuelValidator   executionport.Validator
+	Estimator         SwapQuoteEstimator
+	TxManager         chainport.TxManager
+	Confirmation      chainport.ConfirmationSource
+	NonceCoordinator  chainport.EVMNonceCoordinator
+	SpendableBalance  SpendableBalanceReader
+	BalanceSnapshot   func(market.TokenID) (*big.Int, uint64, error)
+	Allowance         AllowanceReader
+	RefuelNetwork     RefuelNetwork
+	NativeToken       market.Token
+	// TrustValidatedQuote is used only by deterministic locally mirrored
+	// markets. Their final quote is the admission gate and the exact router
+	// payload is intentionally not simulated before simultaneous broadcast.
+	TrustValidatedQuote        bool
+	SnapshotForQuote           func(market.Quote) (market.MarketSnapshot, bool)
+	LatestSnapshot             func() (market.MarketSnapshot, bool)
+	EVMClient                  *ethclient.Client
+	EVMAddress                 common.Address
+	StartupAllowanceGuaranteed bool
+	LocalBuilder               localexecution.IntentBuilder
 }
 
 type AllowanceReader interface {
@@ -158,6 +180,8 @@ type SwapDriver struct {
 	QuoteAsset               market.AssetID
 	BaseAsset                market.AssetID
 	MinimumNet               *big.Rat
+	DirectionalMinimumNet    map[arbitrage.Direction]*big.Rat
+	MaximumCost              *big.Rat
 	ReturnMargin             *big.Rat
 	ExitCosts                ExitCostSource
 	DynamicSlippage          DynamicSlippagePolicy
@@ -168,12 +192,20 @@ type SwapDriver struct {
 	ArtifactMaxAge           time.Duration
 	Output                   io.Writer
 	Costs                    executionport.CostValuator
+	RecoveryJournal          executionport.SequentialRecoveryJournal
 
 	preflightMu   sync.Mutex
 	outputMu      sync.Mutex
 	preflightBuys map[execution.OperationID]preparedSwap
 	exitSells     map[execution.OperationID]preparedSwap
 	swapAttempts  map[execution.OperationID]map[int]int
+}
+
+func (d *SwapDriver) minimumNetFor(direction arbitrage.Direction) *big.Rat {
+	if value, ok := d.DirectionalMinimumNet[direction]; ok {
+		return cloneRatOrZero(value)
+	}
+	return cloneRatOrZero(d.MinimumNet)
 }
 
 type preparedSwap struct {
@@ -268,6 +300,20 @@ func (d *SwapDriver) ExecuteStage(
 	}
 	broadcastStarted := clock()
 	broadcast, err := binding.TxManager.Broadcast(ctx, prepared)
+	if err != nil && broadcast.Disposition == chainport.BroadcastRejected {
+		var nonceLow *chainport.AllFanoutNonceTooLowError
+		if errors.As(err, &nonceLow) {
+			_ = journal.MarkTransaction(
+				context.WithoutCancel(ctx), request.Operation,
+				request.Stage.Ordinal, transactionPhase, "rejected",
+			)
+			bundle, transactionPhase, broadcast, err = d.rebuildAfterNonceTooLow(
+				ctx, request, binding, journal, transactionPhase, nonceLow,
+			)
+			artifact, prepared = bundle.artifact, bundle.prepared
+			broadcastStarted = clock()
+		}
+	}
 	if err != nil {
 		disposition := executionport.DispositionPossible
 		if broadcast.Disposition == chainport.BroadcastRejected {
@@ -342,6 +388,9 @@ func (d *SwapDriver) ExecuteStage(
 						fmt.Errorf("value confirmed revert costs: %w", err),
 					)
 			}
+		} else if settlement.Technical == execution.StateBroadcastRejected {
+			disposition = executionport.DispositionRejected
+			status = "rejected"
 		}
 		_ = journal.MarkTransaction(
 			context.WithoutCancel(ctx), request.Operation,
@@ -377,6 +426,56 @@ func (d *SwapDriver) ExecuteStage(
 		SourceIdentity: prepared.Identity,
 		ObservedAt:     settlement.ObservedAt, Evidence: settlement.Evidence,
 	}, nil
+}
+
+func (d *SwapDriver) rebuildAfterNonceTooLow(
+	ctx context.Context,
+	request execution.SequentialStageRequest,
+	binding SwapBinding,
+	journal executionport.SequentialJournal,
+	previousPhase string,
+	nonceFailure *chainport.AllFanoutNonceTooLowError,
+) (preparedSwap, string, chainport.BroadcastResult, error) {
+	resync, ok := binding.NonceCoordinator.(chainport.EVMNonceResynchronizer)
+	if !ok || resync == nil {
+		return preparedSwap{}, previousPhase, chainport.BroadcastResult{
+			Disposition: chainport.BroadcastRejected,
+		}, fmt.Errorf("all fanout endpoints rejected nonce but nonce resynchronization is unavailable: %w", nonceFailure)
+	}
+	refreshed, err := resync.ResyncNonce(ctx, nonceFailure.Nonce)
+	if err != nil {
+		return preparedSwap{}, previousPhase, chainport.BroadcastResult{
+			Disposition: chainport.BroadcastRejected,
+		}, fmt.Errorf("resynchronize rejected EVM nonce: %w", err)
+	}
+	d.write(
+		"live_nonce_resync operation=%s stage=%d/%s rejected_nonce=%d refreshed_nonce=%d action=fresh_quote_build_simulation\n",
+		request.Operation, request.Stage.Ordinal, request.Stage.Stage,
+		nonceFailure.Nonce, refreshed,
+	)
+	var bundle preparedSwap
+	if binding.RecoveryValidator != nil && binding.Estimator != nil {
+		binding.Validator = binding.RecoveryValidator
+		bundle, _, err = d.prepareHybridRecoveryOnce(ctx, request, binding)
+	} else {
+		bundle, err = d.prepareAndSimulate(ctx, request, binding, nil)
+	}
+	if err != nil {
+		return preparedSwap{}, previousPhase, chainport.BroadcastResult{
+			Disposition: chainport.BroadcastRejected,
+		}, fmt.Errorf("fresh swap preparation after nonce resync: %w", err)
+	}
+	phase := d.nextSwapTransactionPhase(request.Operation, request.Stage.Ordinal)
+	if err := d.recordPreparedSwap(ctx, journal, request, phase, bundle); err != nil {
+		return preparedSwap{}, phase, chainport.BroadcastResult{
+			Disposition: chainport.BroadcastRejected,
+		}, fmt.Errorf("persist rebuilt swap after nonce resync: %w", err)
+	}
+	broadcast, err := binding.TxManager.Broadcast(ctx, bundle.prepared)
+	if err != nil {
+		return bundle, phase, broadcast, fmt.Errorf("rebroadcast rebuilt swap after nonce resync: %w", err)
+	}
+	return bundle, phase, broadcast, nil
 }
 
 func (d *SwapDriver) RecoverStage(
@@ -605,7 +704,7 @@ func classifyRecoverySwapError(
 	err error,
 ) error {
 	var allowanceFailure *executionport.AllowanceRequiredError
-	if errors.As(err, &allowanceFailure) &&
+	if errors.As(err, &allowanceFailure) && !binding.StartupAllowanceGuaranteed &&
 		binding.Allowance != nil &&
 		binding.SpendableBalance != nil {
 		balance, balanceErr := binding.SpendableBalance.SpendableBalance(
@@ -714,7 +813,7 @@ func (d *SwapDriver) Preflight(
 	operation execution.OperationID,
 	plan execution.SequentialPlan,
 ) error {
-	if plan.EffectivePolicy() == execution.PolicyPrefundedParallel {
+	if plan.IsPrefundedDualInventory() {
 		return d.preflightParallel(ctx, operation, plan)
 	}
 	sellIndex := 2
@@ -989,7 +1088,8 @@ func (d *SwapDriver) SelectPrefundedExit(
 	incurred []execution.CostComponent,
 ) (execution.SequentialExitDecision, error) {
 	if (plan.EffectivePolicy() != execution.PolicyPrefundedSequential &&
-		plan.EffectivePolicy() != execution.PolicyPrefundedParallel) ||
+		plan.EffectivePolicy() != execution.PolicyPrefundedParallel &&
+		plan.EffectivePolicy() != execution.PolicyPrefundedTriggerFirst) ||
 		len(plan.Stages) != 4 || len(plan.CircuitBreaker) != 1 ||
 		bought.IsZero() {
 		return execution.SequentialExitDecision{},
@@ -1054,7 +1154,8 @@ func (d *SwapDriver) SelectPrefundedRecoveryExit(
 	cause error,
 ) (execution.SequentialExitDecision, error) {
 	if (plan.EffectivePolicy() != execution.PolicyPrefundedSequential &&
-		plan.EffectivePolicy() != execution.PolicyPrefundedParallel) ||
+		plan.EffectivePolicy() != execution.PolicyPrefundedParallel &&
+		plan.EffectivePolicy() != execution.PolicyPrefundedTriggerFirst) ||
 		len(plan.Stages) != 4 || len(plan.CircuitBreaker) != 1 || bought.IsZero() {
 		return execution.SequentialExitDecision{},
 			fmt.Errorf("prefunded recovery input is incomplete")
@@ -1172,8 +1273,40 @@ func (d *SwapDriver) preparePrefundedRecoveryCandidate(
 		result.err = err
 		return result
 	}
-	result.bundle, result.attempts, result.err = d.prepareSwapWithRetry(
-		ctx, operation, request, binding, nil, logEvent,
+	// Recovery is a new economic decision.  Never reuse the discovery
+	// artifact that belonged to the failed operation: refresh the quote and
+	// select the dedicated recovery validator (KyberSwap therefore performs a
+	// fresh route/build, while local markets rebuild from a current mirror).
+	if binding.RecoveryValidator == nil || binding.Estimator == nil {
+		// Legacy non-hybrid bindings have no separate recovery path. Preserve
+		// their established retry behavior; hybrid bindings always configure
+		// both capabilities and therefore take the fresh branch below.
+		result.bundle, result.attempts, result.err = d.prepareSwapWithRetry(
+			ctx, operation, request, binding, nil, logEvent,
+		)
+		if result.err != nil {
+			return result
+		}
+		result.output = result.bundle.artifact.ValidatedQuote.AmountOut
+		result.recovery, result.err = d.recoveryValue(result.output, stage.OutputToken, quoteAsset)
+		if result.err == nil && d.ExitCosts != nil {
+			var cost market.AssetQuantity
+			var ok bool
+			if source, prefunded := d.ExitCosts.(PrefundedExitCostSource); prefunded {
+				cost, ok = source.PrefundedExitCost(plan.Opportunity.Direction, route, d.now())
+			} else {
+				cost, ok = d.ExitCosts.ExitCost(plan.Opportunity.Direction, route, d.now())
+			}
+			if ok {
+				result.recovery, result.err = result.recovery.Sub(cost)
+				result.costOK = result.err == nil
+			}
+		}
+		return result
+	}
+	binding.Validator = binding.RecoveryValidator
+	result.bundle, result.attempts, result.err = d.prepareHybridRecoveryWithRetry(
+		ctx, operation, request, binding, route, logEvent,
 	)
 	if result.err != nil {
 		return result
@@ -1205,6 +1338,119 @@ func (d *SwapDriver) preparePrefundedRecoveryCandidate(
 		}
 	}
 	return result
+}
+
+func (d *SwapDriver) prepareHybridRecoveryWithRetry(
+	ctx context.Context,
+	operation execution.OperationID,
+	request execution.SequentialStageRequest,
+	binding SwapBinding,
+	route execution.SequentialExitRoute,
+	logEvent string,
+) (preparedSwap, int, error) {
+	attempts := d.ExitValidationAttempts
+	if attempts <= 0 {
+		attempts = 15
+	}
+	retryDelay := d.ExitValidationRetryDelay
+	if retryDelay <= 0 {
+		retryDelay = 100 * time.Millisecond
+	}
+	failures := make([]error, 0, attempts)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		bundle, phase, err := d.prepareHybridRecoveryOnce(ctx, request, binding)
+		if err == nil {
+			if attempt > 1 {
+				d.write("%s operation=%s route=%s status=ready attempt=%d/%d\n",
+					logEvent, operation, route, attempt, attempts)
+			}
+			return bundle, attempt, nil
+		}
+		attemptErr := fmt.Errorf("attempt %d/%d %s: %w", attempt, attempts, phase, err)
+		failures = append(failures, attemptErr)
+		d.write("%s operation=%s route=%s phase=%s status=failed attempt=%d/%d error=%q\n",
+			logEvent, operation, route, phase, attempt, attempts, err)
+		if persistErr := d.recordRecoveryValidationFailure(
+			ctx, operation, request.Stage.Ordinal, route, phase, attempt,
+			attempts, retryDelay, err,
+		); persistErr != nil {
+			return preparedSwap{}, attempt, errors.Join(errors.Join(failures...), persistErr)
+		}
+		if attempt < attempts {
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return preparedSwap{}, attempt, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return preparedSwap{}, attempts, errors.Join(failures...)
+}
+
+func (d *SwapDriver) prepareHybridRecoveryOnce(
+	ctx context.Context,
+	request execution.SequentialStageRequest,
+	binding SwapBinding,
+) (preparedSwap, string, error) {
+	output, err := binding.Estimator.QuoteExactInput(
+		ctx, request.Input, request.Stage.OutputToken,
+	)
+	if err != nil {
+		return preparedSwap{}, "quote", err
+	}
+	discovery, err := market.NewQuote(market.Quote{
+		Source: "live/recovery", Market: request.Stage.Market,
+		SnapshotVersion: 1, Purpose: market.QuotePurposeLiveValidation,
+		Mode: market.QuoteModeExactInput, Quality: market.QuoteQualityExact,
+		AmountIn: request.Input, AmountOut: output, QuotedAt: d.now(),
+	})
+	if err != nil {
+		return preparedSwap{}, "quote_normalization", err
+	}
+	bundle, err := d.prepareSwap(ctx, request, binding, nil, discovery)
+	if err != nil {
+		return preparedSwap{}, "build", err
+	}
+	bundle.simulation, err = d.simulateEconomic(ctx, binding, bundle.prepared)
+	if err != nil {
+		return preparedSwap{}, "simulation", err
+	}
+	return bundle, "ready", nil
+}
+
+func (d *SwapDriver) recordRecoveryValidationFailure(
+	ctx context.Context,
+	operation execution.OperationID,
+	ordinal int,
+	route execution.SequentialExitRoute,
+	phase string,
+	attempt int,
+	total int,
+	retryDelay time.Duration,
+	cause error,
+) error {
+	if d.RecoveryJournal == nil {
+		return nil
+	}
+	now := d.now()
+	retryAt := time.Time{}
+	if attempt < total {
+		retryAt = now.Add(retryDelay)
+	}
+	return d.RecoveryJournal.RecordSequentialRecoveryAttempt(
+		context.WithoutCancel(ctx),
+		executionport.SequentialRecoveryAttempt{
+			Operation: operation, Ordinal: ordinal,
+			Action: "validate_prefunded_exit_" + string(route) + "_" + phase,
+			Reason: string(executionport.RecoveryFailureTemporary),
+			Detail: cause.Error(), Attempt: attempt,
+			CreatedAt: now, RetryAt: retryAt,
+		},
+	)
 }
 
 func (d *SwapDriver) planQuoteAsset(plan execution.SequentialPlan) market.AssetID {
@@ -1609,7 +1855,7 @@ func (d *SwapDriver) exitStillQualified(
 			return false, err
 		}
 	}
-	return net.Rat().Cmp(cloneRatOrZero(d.MinimumNet)) >= 0, nil
+	return net.Rat().Cmp(d.minimumNetFor(plan.Opportunity.Direction)) >= 0, nil
 }
 
 func cloneRatOrZero(value *big.Rat) *big.Rat {
@@ -1789,6 +2035,7 @@ func (d *SwapDriver) prepareSwap(
 	request execution.SequentialStageRequest,
 	binding SwapBinding,
 	slippage *executionport.SlippageConstraint,
+	discovery ...market.Quote,
 ) (preparedSwap, error) {
 	clock := d.Clock
 	if clock == nil {
@@ -1804,6 +2051,20 @@ func (d *SwapDriver) prepareSwap(
 		return preparedSwap{}, err
 	}
 	validationRequest.Slippage = slippage
+	if len(discovery) > 0 {
+		candidate := discovery[0]
+		if candidate.Market != request.Stage.Market ||
+			candidate.AmountIn.Token() != request.Input.Token() ||
+			candidate.AmountIn.Units().Cmp(request.Input.Units()) != 0 {
+			return preparedSwap{}, fmt.Errorf("discovery quote does not match the fixed Live input")
+		}
+		validationRequest.Discovery = candidate
+		if binding.SnapshotForQuote != nil {
+			if snapshot, ok := binding.SnapshotForQuote(candidate); ok {
+				validationRequest.Snapshot = snapshot
+			}
+		}
+	}
 	started := clock()
 	artifact, err := binding.Validator.Validate(ctx, validationRequest)
 	if err != nil {
@@ -2153,7 +2414,8 @@ func pollSwapSettlement(
 		if err == nil {
 			switch settlement.Technical {
 			case execution.StateConfirmedSuccess,
-				execution.StateConfirmedRevert:
+				execution.StateConfirmedRevert,
+				execution.StateBroadcastRejected:
 				return settlement, nil
 			}
 		}

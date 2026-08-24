@@ -137,6 +137,75 @@ func TestBalancePollingSkipsEveryTickWhileGateIsBusy(t *testing.T) {
 	}
 }
 
+func TestBalanceBootstrapTimesOutHungRPCRead(t *testing.T) {
+	key := inventory.Key{Chain: "chain-a", Account: "account-a", Token: "quote-a"}
+	token := market.Token{ID: "quote-a", Asset: "quote", Chain: "chain-a", Decimals: 6, Symbol: "QUOTE"}
+	manager, err := livecanary.NewBalanceManager(livecanary.BalanceManagerConfig{
+		Balances: []configuration.ResolvedInventoryBalance{{
+			Chain: "chain-a", Account: "account-a", Token: token,
+			AllocationCap: big.NewRat(10, 1), Target: big.NewRat(10, 1), Buffer: new(big.Rat),
+		}},
+		Readers: map[inventory.Key]livecanary.PhysicalBalanceReader{
+			key: func(ctx context.Context) (*big.Int, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+		},
+		Accounts: map[market.ChainID]execution.AccountID{"chain-a": "account-a"},
+		Gate:     livecanary.NewRuntimeGate(), Output: io.Discard, ReadTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = manager.Warm(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("warm error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("hung balance read took %s", elapsed)
+	}
+}
+
+func TestBalanceManagerConfirmedCapacityUsesWalletNotAllocationTarget(t *testing.T) {
+	quote := market.Token{ID: "quote-a", Asset: "quote", Chain: "chain-a", Decimals: 6, Symbol: "QUOTE"}
+	base := market.Token{ID: "base-b", Asset: "base", Chain: "chain-b", Decimals: 18, Symbol: "BASE"}
+	quoteKey := inventory.Key{Chain: "chain-a", Account: "account-a", Token: quote.ID}
+	baseKey := inventory.Key{Chain: "chain-b", Account: "account-b", Token: base.ID}
+	manager, err := livecanary.NewBalanceManager(livecanary.BalanceManagerConfig{
+		Balances: []configuration.ResolvedInventoryBalance{
+			{Chain: "chain-a", Account: "account-a", Token: quote, AllocationCap: big.NewRat(500, 1), Target: big.NewRat(500, 1), Buffer: new(big.Rat)},
+			{Chain: "chain-b", Account: "account-b", Token: base, AllocationCap: big.NewRat(500, 1), Target: big.NewRat(500, 1), Buffer: new(big.Rat)},
+		},
+		Readers: map[inventory.Key]livecanary.PhysicalBalanceReader{
+			quoteKey: func(context.Context) (*big.Int, error) { return big.NewInt(1_000_000_000), nil },
+			baseKey: func(context.Context) (*big.Int, error) {
+				return new(big.Int).Mul(big.NewInt(750), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)), nil
+			},
+		},
+		Accounts:                    map[market.ChainID]execution.AccountID{"chain-a": "account-a", "chain-b": "account-b"},
+		MarketChains:                map[market.MarketID]market.ChainID{"market-a": "chain-a", "market-b": "chain-b"},
+		UseConfirmedBalanceCapacity: true, Gate: livecanary.NewRuntimeGate(), Output: io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Warm(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	quoteInput, _ := market.NewTokenAmount(quote.ID, big.NewInt(750_000_000))
+	baseInput, _ := market.NewTokenAmount(base.ID, new(big.Int).Mul(big.NewInt(700), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)))
+	candidate := arbitrage.Candidate{BuyQuote: market.Quote{AmountIn: quoteInput}, SellQuote: market.Quote{AmountIn: baseInput}}
+	if !manager.CandidateEligible(arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"}, candidate) {
+		t.Fatal("confirmed wallet balance above the legacy allocation target was not spendable")
+	}
+	tooLarge, _ := market.NewTokenAmount(quote.ID, big.NewInt(1_001_000_000))
+	candidate.BuyQuote.AmountIn = tooLarge
+	if manager.CandidateEligible(arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"}, candidate) {
+		t.Fatal("candidate above confirmed wallet balance was accepted")
+	}
+}
+
 func newTestBalanceManager(
 	t *testing.T,
 	prefunded *big.Int,

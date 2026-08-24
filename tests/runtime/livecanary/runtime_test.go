@@ -52,6 +52,36 @@ func (successfulExecutor) Execute(
 	}, nil
 }
 
+type capturingExecutor struct {
+	plans chan execution.SequentialPlan
+}
+
+func (e capturingExecutor) Execute(
+	_ context.Context,
+	operation execution.OperationID,
+	plan execution.SequentialPlan,
+) (executionport.SequentialResult, error) {
+	e.plans <- plan
+	return executionport.SequentialResult{
+		Operation: operation, FinalAmount: plan.InitialInput,
+	}, nil
+}
+
+type immediateReportStream struct {
+	report livecompare.Report
+}
+
+func (s immediateReportStream) RunStream(
+	ctx context.Context,
+	options livecompare.StreamOptions,
+) error {
+	if err := options.OnReport(s.report); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return nil
+}
+
 type failedAfterSettlementExecutor struct{}
 
 func (failedAfterSettlementExecutor) Execute(
@@ -68,6 +98,23 @@ func (failedAfterSettlementExecutor) Execute(
 type successfulRecovery struct {
 	calls      int
 	foundAfter int
+}
+
+type shutdownRecovery struct {
+	calls   int
+	started chan struct{}
+}
+
+func (r *shutdownRecovery) RecoverActive(
+	ctx context.Context,
+) (executionport.SequentialResult, bool, error) {
+	r.calls++
+	if r.calls == 1 {
+		return executionport.SequentialResult{}, false, nil
+	}
+	close(r.started)
+	<-ctx.Done()
+	return executionport.SequentialResult{}, true, ctx.Err()
 }
 
 func (r *successfulRecovery) RecoverActive(
@@ -89,6 +136,48 @@ func (s failingStream) RunStream(
 	livecompare.StreamOptions,
 ) error {
 	return s.err
+}
+
+type countingRestorationResumer struct{ calls int }
+
+func (r *countingRestorationResumer) ResumePending(context.Context) error {
+	r.calls++
+	return nil
+}
+
+func TestRecoverOnlyResumesAsynchronousRestorations(t *testing.T) {
+	ctx := context.Background()
+	manager, err := livecanary.NewManagerWithLimit(
+		ctx,
+		livecanary.Planner{MarketChains: map[market.MarketID]market.ChainID{
+			"market-a": "chain-a", "market-b": "chain-b",
+		}, ExecutionUnits: big.NewInt(1_000_000)},
+		successfulExecutor{}, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "opportunities.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime, err := livecanary.NewRuntime(
+		failingStream{err: errors.New("stream must not start")}, manager, store,
+		nil, io.Discard, nil, nil, true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetRecovery(&successfulRecovery{foundAfter: 2})
+	resumer := &countingRestorationResumer{}
+	runtime.SetRestorationResumer(resumer)
+	if err := runtime.RecoverOnly(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if resumer.calls != 1 {
+		t.Fatalf("restoration resume calls = %d, want 1", resumer.calls)
+	}
 }
 
 func TestRuntimeReportsStartupAndFailureShutdown(t *testing.T) {
@@ -344,6 +433,67 @@ func TestOneOperationRuntimeExitsAfterCompletedRecovery(t *testing.T) {
 	}
 }
 
+func TestRuntimeShutdownDoesNotReportRecoveryBlocked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	manager, err := livecanary.NewManagerWithLimit(
+		ctx,
+		livecanary.Planner{
+			MarketChains: map[market.MarketID]market.ChainID{
+				"market-a": "chain-a", "market-b": "chain-b",
+			},
+			ExecutionUnits: big.NewInt(1_000_000),
+		},
+		failedAfterSettlementExecutor{},
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "opportunities.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &continuingStream{
+		started: make(chan struct{}), reevaluate: make(chan struct{}),
+	}
+	recovery := &shutdownRecovery{started: make(chan struct{})}
+	runtime, err := livecanary.NewRuntime(
+		stream, manager, store, nil, io.Discard, nil,
+		make(chan time.Time, 1), true, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetRecovery(recovery)
+	runResult := make(chan error, 1)
+	go func() { runResult <- runtime.Run(ctx) }()
+	<-stream.started
+	accepted, err := manager.Offer(runtimeOpportunity(t))
+	if err != nil || !accepted {
+		t.Fatalf("offer: accepted=%t err=%v", accepted, err)
+	}
+	select {
+	case <-recovery.started:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not enter recovery")
+	}
+	cancel()
+	select {
+	case runErr := <-runResult:
+		if !errors.Is(runErr, context.Canceled) {
+			t.Fatalf("shutdown error=%v", runErr)
+		}
+		if strings.Contains(runErr.Error(), "recovery blocked") {
+			t.Fatalf("shutdown falsely blocked recovery: %v", runErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not stop after cancellation")
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOneOperationRuntimeCountsStartupRecoveryAsItsSingleOperation(t *testing.T) {
 	ctx := context.Background()
 	manager, err := livecanary.NewManagerWithLimit(
@@ -384,6 +534,67 @@ func TestOneOperationRuntimeCountsStartupRecoveryAsItsSingleOperation(t *testing
 	case <-stream.started:
 		t.Fatal("one-operation runtime started discovery after recovering an active operation")
 	default:
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForcedCanaryAcceptsImmediateLocalExecutableCandidate(t *testing.T) {
+	ctx := context.Background()
+	plans := make(chan execution.SequentialPlan, 1)
+	manager, err := livecanary.NewManagerWithLimit(
+		ctx,
+		livecanary.Planner{
+			MarketChains: map[market.MarketID]market.ChainID{
+				"market-a": "chain-a", "market-b": "chain-b",
+			},
+			ExecutionUnits: big.NewInt(1_000_000),
+		},
+		capturingExecutor{plans: plans}, 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "opportunities.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	opportunity := runtimeOpportunity(t)
+	opportunity.Classification = arbitrage.ClassificationNoSpread
+	opportunity.SelectedIndex = -1
+	executable := opportunity.Candidates[0]
+	executable.BuyQuote.Market = opportunity.Direction.BuyMarket
+	executable.SellQuote.Market = opportunity.Direction.SellMarket
+	report := livecompare.Report{ImmediateCandidate: &executable, ImmediateDirection: opportunity.Direction}
+	report.Research.Opportunities = []arbitrage.Opportunity{opportunity}
+	direction := opportunity.Direction
+	runtime, err := livecanary.NewRuntime(
+		immediateReportStream{report: report}, manager, store, nil,
+		io.Discard, nil, nil, true, &direction,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.SetExitAfterOperation(true)
+	if err := runtime.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case plan := <-plans:
+		if len(plan.Opportunity.Reasons) != 1 ||
+			plan.Opportunity.Reasons[0] != "forced_canary_direction" {
+			t.Fatalf("forced plan reasons=%v", plan.Opportunity.Reasons)
+		}
+		selected := plan.Opportunity.Candidates[plan.Opportunity.SelectedIndex]
+		if selected.BuyQuote.Market != direction.BuyMarket ||
+			selected.SellQuote.Market != direction.SellMarket {
+			t.Fatalf("forced plan did not preserve immediate candidate: %+v", selected)
+		}
+	default:
+		t.Fatal("forced immediate candidate was not executed")
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)

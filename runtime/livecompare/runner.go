@@ -16,6 +16,7 @@ import (
 
 	"github.com/VarozXYZ/vernier/adapters/chain/evm"
 	"github.com/VarozXYZ/vernier/adapters/chain/solana"
+	localexecution "github.com/VarozXYZ/vernier/adapters/execution/local"
 	"github.com/VarozXYZ/vernier/adapters/feed/evmlogs"
 	"github.com/VarozXYZ/vernier/adapters/feed/sourceorder"
 	"github.com/VarozXYZ/vernier/adapters/market/aerodrome"
@@ -33,6 +34,7 @@ import (
 	"github.com/VarozXYZ/vernier/core/strategy"
 	"github.com/VarozXYZ/vernier/domain/arbitrage"
 	"github.com/VarozXYZ/vernier/domain/market"
+	executionport "github.com/VarozXYZ/vernier/ports/execution"
 	notificationport "github.com/VarozXYZ/vernier/ports/notification"
 	priceport "github.com/VarozXYZ/vernier/ports/price"
 	quoteport "github.com/VarozXYZ/vernier/ports/quote"
@@ -64,6 +66,23 @@ type Options struct {
 	// DirectionalCosts is a background-refreshed, memory-only source. Runner
 	// never asks it to perform I/O in an evaluation.
 	DirectionalCosts DirectionalCostSource
+	// QuoteConversions exposes already-refreshed FX observations. Runner only
+	// reads this cache; provider I/O belongs to background workers.
+	QuoteConversions QuoteConversionSource
+	// QuoteConversionBlocked reports whether the just-completed evaluation
+	// was prevented from admission by missing/stale FX evidence.
+	QuoteConversionBlocked func(bool)
+	// ExecutableAllowedRouters is supplied only by armed composition. Research
+	// may observe builds without it, but Live validation must reject a provider
+	// destination outside this immutable private allowlist.
+	ExecutableAllowedRouters []common.Address
+	// SuppressConfiguredNotifications prevents a runtime mode such as cost
+	// observation from constructing provider clients declared by the Research
+	// profile. It does not alter the profile or any armed Live composition.
+	SuppressConfiguredNotifications bool
+	// CandidateEligible is an optional memory-only capacity predicate. It must
+	// never perform network I/O because it runs in the decision hot path.
+	CandidateEligible func(arbitrage.Direction, arbitrage.Candidate) bool
 }
 
 // DirectionalCostSource exposes a previously refreshed complete-flow cost.
@@ -73,29 +92,68 @@ type DirectionalCostSource interface {
 	Snapshot(arbitrage.Direction, time.Time) (arbitrage.CostSnapshot, bool)
 }
 
+type SizedDirectionalCostSource interface {
+	SnapshotFor(arbitrage.Direction, market.AssetQuantity, time.Time) (arbitrage.CostSnapshot, bool)
+}
+
+type QuoteConversionSource interface {
+	Snapshot(market.TokenID, market.TokenID, time.Time) (market.QuoteConversionSnapshot, bool)
+}
+
 type DirectionalCostObserver interface {
 	Observe([]arbitrage.Opportunity)
 }
 
+// DirectionalCostWarmer performs an explicit refresh after the first remote
+// quotes have supplied the route-dependent inputs required by the cost model.
+// The initial quote round is calibration-only and must not be published as a
+// stale economic evaluation.
+type DirectionalCostWarmer interface {
+	Warm(context.Context) error
+}
+
 type Runner struct {
-	config                 configuration.ParsedConfig
-	networks               Networks
-	clock                  func() time.Time
-	lookup                 configuration.LookupEnv
-	client                 coingecko.Client
-	solanaNetworks         SolanaNetworks
-	referenceQuoteOverride string
-	referenceSources       map[market.MarketID]quoteport.ExternalReferenceSource
-	logger                 *slog.Logger
-	openingAlerts          notificationport.OpeningSender
-	configurationAlerts    notificationport.ConfigurationWarningSender
-	directionalCosts       DirectionalCostSource
-	alertFailures          atomic.Uint64
-	warningMu              sync.Mutex
-	deliveredWarnings      map[string]struct{}
-	simulationMu           sync.RWMutex
-	simulationSnapshots    map[string]market.MarketSnapshot
-	simulationSnapshotKeys []string
+	config                   configuration.ParsedConfig
+	networks                 Networks
+	clock                    func() time.Time
+	lookup                   configuration.LookupEnv
+	client                   coingecko.Client
+	solanaNetworks           SolanaNetworks
+	referenceQuoteOverride   string
+	referenceSources         map[market.MarketID]quoteport.ExternalReferenceSource
+	logger                   *slog.Logger
+	openingAlerts            notificationport.OpeningSender
+	configurationAlerts      notificationport.ConfigurationWarningSender
+	directionalCosts         DirectionalCostSource
+	quoteConversions         QuoteConversionSource
+	quoteConversionBlocked   func(bool)
+	alertFailures            atomic.Uint64
+	warningMu                sync.Mutex
+	deliveredWarnings        map[string]struct{}
+	simulationMu             sync.RWMutex
+	simulationSnapshots      map[string]market.MarketSnapshot
+	simulationSnapshotKeys   []string
+	executableMu             sync.Mutex
+	executableArtifacts      map[string]executionport.Artifact
+	executableAllowedRouters []common.Address
+	localExecutableMu        sync.RWMutex
+	localExecutables         map[market.MarketID]localexecution.ExecutableSource
+	latestLocalSnapshots     map[market.MarketID]market.MarketSnapshot
+	candidateEligible        func(arbitrage.Direction, arbitrage.Candidate) bool
+}
+
+// SetDirectionalCosts installs a background-refreshed complete-flow source
+// before the runner starts. Runtime composition uses this late binding when
+// the source depends on Live-only bridge and persistence capabilities.
+func (r *Runner) SetDirectionalCosts(source DirectionalCostSource) error {
+	if r == nil || source == nil {
+		return fmt.Errorf("directional cost source is required")
+	}
+	if r.directionalCosts != nil {
+		return fmt.Errorf("directional cost source is already configured")
+	}
+	r.directionalCosts = source
+	return nil
 }
 
 type CostEvidence struct {
@@ -119,10 +177,20 @@ type ParityEvidence struct {
 }
 
 type Report struct {
-	Research  runtimeresearch.Report
-	Cost      CostEvidence
-	Parity    []ParityEvidence
-	Reference []ReferenceComparison
+	Research   runtimeresearch.Report
+	Cost       CostEvidence
+	Parity     []ParityEvidence
+	Reference  []ReferenceComparison
+	Validation *arbitrage.ExecutableValidationRound
+	// ExecutableCandidate is the post-build, post-local-requote candidate.
+	// It is an in-process hand-off only and is deliberately omitted by every
+	// persistence/report DTO.
+	ExecutableCandidate *arbitrage.Candidate
+	// ImmediateCandidate is an in-process hand-off for a qualified local
+	// trigger. Its remote leg is deliberately built only after the local swap
+	// has been emitted by the trigger-aware Live executor.
+	ImmediateCandidate *arbitrage.Candidate
+	ImmediateDirection arbitrage.Direction
 }
 
 type marketRuntime struct {
@@ -144,6 +212,11 @@ type evaluationStrategy interface {
 }
 
 func New(config configuration.ParsedConfig, networks Networks, options Options) (*Runner, error) {
+	for _, router := range options.ExecutableAllowedRouters {
+		if router == (common.Address{}) {
+			return nil, fmt.Errorf("executable router allowlist is invalid")
+		}
+	}
 	if options.Clock == nil {
 		options.Clock = time.Now
 	}
@@ -156,14 +229,18 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 	if options.ConfigurationAlerts == nil && options.OpeningAlerts != nil {
 		options.ConfigurationAlerts, _ = options.OpeningAlerts.(notificationport.ConfigurationWarningSender)
 	}
-	if config.TelegramEnabled && (options.OpeningAlerts == nil || options.ConfigurationAlerts == nil) {
+	if config.TelegramEnabled && !options.SuppressConfiguredNotifications &&
+		(options.OpeningAlerts == nil || options.ConfigurationAlerts == nil) {
 		token, tokenOK := options.LookupEnv(config.TelegramBotTokenEnv)
 		chatID, chatOK := options.LookupEnv(config.TelegramChatIDEnv)
 		if !tokenOK || !chatOK || strings.TrimSpace(token) == "" || strings.TrimSpace(chatID) == "" {
 			return nil, fmt.Errorf("telegram alert environment is unset")
 		}
 		var err error
-		sender, err := telegramnotification.New(telegramnotification.Config{BotToken: token, ChatID: chatID})
+		sender, err := telegramnotification.New(telegramnotification.Config{
+			BotToken: token, ChatID: chatID,
+			SetupLabel: config.Markets[0].Base.Token.Symbol,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -202,12 +279,43 @@ func New(config configuration.ParsedConfig, networks Networks, options Options) 
 		referenceSources: options.ReferenceSources, referenceQuoteOverride: options.ReferenceQuoteOverride,
 		clock: options.Clock, lookup: options.LookupEnv, client: options.PriceClient, logger: options.Logger,
 		openingAlerts: options.OpeningAlerts, configurationAlerts: options.ConfigurationAlerts,
-		directionalCosts:       options.DirectionalCosts,
-		deliveredWarnings:      make(map[string]struct{}),
-		simulationSnapshots:    make(map[string]market.MarketSnapshot),
-		simulationSnapshotKeys: make([]string, 0, maxSimulationSnapshots),
+		directionalCosts:         options.DirectionalCosts,
+		quoteConversions:         options.QuoteConversions,
+		quoteConversionBlocked:   options.QuoteConversionBlocked,
+		deliveredWarnings:        make(map[string]struct{}),
+		simulationSnapshots:      make(map[string]market.MarketSnapshot),
+		simulationSnapshotKeys:   make([]string, 0, maxSimulationSnapshots),
+		executableArtifacts:      make(map[string]executionport.Artifact),
+		localExecutables:         make(map[market.MarketID]localexecution.ExecutableSource),
+		latestLocalSnapshots:     make(map[market.MarketID]market.MarketSnapshot),
+		candidateEligible:        options.CandidateEligible,
+		executableAllowedRouters: append([]common.Address(nil), options.ExecutableAllowedRouters...),
 	}, nil
 }
+
+// QuoteExecutable delegates to the compiled local source registered while a
+// route runtime is composed. It performs no I/O and is safe for the Live hot
+// path after stream bootstrap.
+func (r *Runner) QuoteExecutable(ctx context.Context, input quoteport.Input) (localexecution.ExecutableQuote, error) {
+	r.localExecutableMu.RLock()
+	source := r.localExecutables[input.Snapshot.Metadata().Market]
+	r.localExecutableMu.RUnlock()
+	if source == nil {
+		return localexecution.ExecutableQuote{}, fmt.Errorf("local executable source is unavailable")
+	}
+	return source.QuoteExecutable(ctx, input)
+}
+
+func (r *Runner) registerLocalExecutable(id market.MarketID, source localexecution.ExecutableSource) {
+	if id == "" || source == nil {
+		return
+	}
+	r.localExecutableMu.Lock()
+	r.localExecutables[id] = source
+	r.localExecutableMu.Unlock()
+}
+
+var _ localexecution.ExecutableSource = (*Runner)(nil)
 
 func (r *Runner) Run(ctx context.Context) (Report, error) {
 	if r.requiresRouteRuntime() {
@@ -340,6 +448,49 @@ func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.Arbitrag
 	if err != nil {
 		return nil, err
 	}
+	if r.config.EvaluationMode == "prefunded_parallel" {
+		notionals := []market.AssetQuantity{minimum}
+		if r.config.SizingKind == "discrete" {
+			notionals = make([]market.AssetQuantity, 0, len(r.config.Sizes))
+			for _, value := range r.config.Sizes {
+				quantity, quantityErr := market.NewAssetQuantity(r.sizingAsset(), value)
+				if quantityErr != nil {
+					return nil, quantityErr
+				}
+				notionals = append(notionals, quantity)
+			}
+		}
+		directionalThresholds := make(map[arbitrage.Direction]market.AssetQuantity, len(r.config.DirectionalMinimumNet))
+		for direction, amount := range r.config.DirectionalMinimumNet {
+			quantity, quantityErr := market.NewAssetQuantity(r.config.Markets[0].Quote.Token.Asset, amount)
+			if quantityErr != nil {
+				return nil, quantityErr
+			}
+			directionalThresholds[direction] = quantity
+		}
+		valuationMarket := market.MarketID("")
+		for _, configured := range r.config.Markets {
+			if configured.QuoteSource == "" {
+				valuationMarket = configured.ID
+				break
+			}
+		}
+		var candidateCost func(arbitrage.Direction, market.AssetQuantity, time.Time) (arbitrage.CostSnapshot, bool)
+		if sized, ok := r.directionalCosts.(SizedDirectionalCostSource); ok {
+			candidateCost = sized.SnapshotFor
+		}
+		return strategy.NewPrefundedParallel(strategy.PrefundedParallelConfig{
+			ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry, Sources: sources,
+			Notional: minimum, Notionals: notionals, Threshold: threshold, DirectionalThresholds: directionalThresholds,
+			ThresholdFixed: thresholdFixed, ThresholdBPS: r.config.ProfitThresholdBPS,
+			ValuationMarket: valuationMarket, Clock: r.clock,
+			RequireQuoteConversion: len(r.config.QuoteConversions) > 0,
+			OnEvaluationError: func(direction arbitrage.Direction, err error) {
+				r.logger.Warn("prefunded direction evaluation failed", "buy_market", direction.BuyMarket,
+					"sell_market", direction.SellMarket, "error", err)
+			}, CandidateEligible: r.candidateEligible, CandidateCost: candidateCost,
+		})
+	}
 	if r.config.EvaluationMode == "best_buy_opposite_sell" {
 		return strategy.NewBestBuyOppositeSell(strategy.BestBuyOppositeSellConfig{
 			ID: arbitrage.StrategyID(r.config.ResearchID), Setup: setup, Registry: registry,
@@ -354,6 +505,16 @@ func (r *Runner) newStrategy(registry *market.Registry, setup arbitrage.Arbitrag
 		grid, err = sizing.NewGrid([]market.AssetQuantity{minimum})
 	case "linear_range":
 		grid, err = sizing.NewLinearRange(minimum, maximum, r.config.SizeSamples)
+	case "discrete":
+		values := make([]market.AssetQuantity, 0, len(r.config.Sizes))
+		for _, value := range r.config.Sizes {
+			quantity, quantityErr := market.NewAssetQuantity(r.sizingAsset(), value)
+			if quantityErr != nil {
+				return nil, quantityErr
+			}
+			values = append(values, quantity)
+		}
+		grid, err = sizing.NewGrid(values)
 	default:
 		return nil, fmt.Errorf("unsupported sizing kind %q", r.config.SizingKind)
 	}
@@ -416,6 +577,10 @@ func (r *Runner) evaluateWithDirectionalCosts(
 			return runtimeresearch.Report{}, err
 		}
 	}
+	evaluation, err = r.withQuoteConversions(evaluation)
+	if err != nil {
+		return runtimeresearch.Report{}, err
+	}
 	if trigger != nil {
 		evaluation = evaluation.WithTrigger(*trigger)
 	}
@@ -438,6 +603,15 @@ func (r *Runner) evaluateWithDirectionalCosts(
 	if err != nil {
 		return runtimeresearch.Report{}, err
 	}
+	if r.quoteConversionBlocked != nil && len(r.config.QuoteConversions) > 0 {
+		blocked := false
+		for _, opportunity := range opportunities {
+			for _, reason := range opportunity.Reasons {
+				blocked = blocked || reason == "quote_conversion_unavailable"
+			}
+		}
+		r.quoteConversionBlocked(blocked)
+	}
 	status := runtimeresearch.StatusHealthy
 	for _, snapshot := range snapshots {
 		if snapshot.Metadata().Health != market.HealthHealthy {
@@ -449,6 +623,46 @@ func (r *Runner) evaluateWithDirectionalCosts(
 		RunID: arbitrage.ResearchRunID(r.config.RunID), ConfigHash: r.config.Hash,
 		Status: status, Evaluations: 1, Opportunities: opportunities, LocalTiming: localTiming,
 	}, nil
+}
+
+// withQuoteConversions is the single enrichment path for both discovery and
+// pinned tracking evaluations. Keeping it here prevents a tracking point from
+// silently dropping the immutable FX evidence captured by discovery.
+func (r *Runner) withQuoteConversions(evaluation arbitrage.Evaluation) (arbitrage.Evaluation, error) {
+	if r.config.EvaluationMode != "prefunded_parallel" {
+		return evaluation, nil
+	}
+	conversions := r.captureQuoteConversions(evaluation.StartedAt())
+	if len(conversions) == 0 {
+		return evaluation, nil
+	}
+	return evaluation.WithQuoteConversions(conversions)
+}
+
+func (r *Runner) captureQuoteConversions(at time.Time) []market.QuoteConversionSnapshot {
+	left := r.config.Markets[0].Quote.Token.ID
+	right := r.config.Markets[1].Quote.Token.ID
+	if left == right || r.quoteConversions == nil {
+		return nil
+	}
+	result := make([]market.QuoteConversionSnapshot, 0, 2)
+	for _, pair := range [][2]market.TokenID{{left, right}, {right, left}} {
+		if snapshot, ok := r.quoteConversions.Snapshot(pair[0], pair[1], at); ok {
+			result = append(result, snapshot)
+			continue
+		}
+		key := "quote-conversion-missing/" + string(pair[0]) + "/" + string(pair[1])
+		r.warningMu.Lock()
+		_, logged := r.deliveredWarnings[key]
+		if !logged {
+			r.deliveredWarnings[key] = struct{}{}
+		}
+		r.warningMu.Unlock()
+		if !logged {
+			r.logger.Warn("quote conversion snapshot unavailable", "input", pair[0], "output", pair[1])
+		}
+	}
+	return result
 }
 
 func (r *Runner) bootstrapMarket(ctx context.Context, configured configuration.ResolvedMarket, registry *market.Registry, block evm.BlockReference, maximum market.AssetQuantity, now time.Time) (marketRuntime, error) {
@@ -724,6 +938,25 @@ func (r *Runner) registry() (*market.Registry, arbitrage.ArbitrageSetup, error) 
 		}
 		pathID := market.PathID(string(configured.ID) + "/path")
 		hops := make([]market.Hop, 0, len(configured.Path))
+		if configured.SplitRoute != nil {
+			intermediate := configured.SplitRoute.Intermediate.Token
+			if !seenTokens[intermediate.ID] {
+				tokens = append(tokens, intermediate)
+				seenTokens[intermediate.ID] = true
+				if !seenAssets[intermediate.Asset] {
+					assets = append(assets, r.config.Assets[intermediate.Asset])
+					seenAssets[intermediate.Asset] = true
+				}
+			}
+			venueID := market.VenueID(string(configured.ID) + "/local-split")
+			poolID := market.PoolID(string(configured.ID) + "/composite")
+			venues = append(venues, market.Venue{ID: venueID})
+			pools = append(pools, market.Pool{ID: poolID, Venue: venueID, Chain: chainID,
+				Tokens:  []market.TokenID{configured.Base.Token.ID, configured.Quote.Token.ID},
+				Adapter: "local-two-stage-split"})
+			hops = append(hops, market.Hop{Pool: poolID, TokenIn: configured.Base.Token.ID,
+				TokenOut: configured.Quote.Token.ID})
+		}
 		if len(configured.Path) == 0 && configured.QuoteSource != "" {
 			venueID := market.VenueID(string(configured.ID) + "/" + configured.QuoteSource)
 			poolID := market.PoolID(string(configured.ID) + "/remote")

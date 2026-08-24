@@ -2,9 +2,13 @@ package livecanary
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +18,7 @@ import (
 	"github.com/VarozXYZ/vernier/domain/market"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 	notificationport "github.com/VarozXYZ/vernier/ports/notification"
+	persistenceport "github.com/VarozXYZ/vernier/ports/persistence"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
 )
 
@@ -22,17 +27,26 @@ type LiveNotifier struct {
 	runtimeSender notificationport.LiveRuntimeSender
 	logger        *slog.Logger
 	queue         chan liveNotification
+	outbox        persistenceport.LiveNotificationOutbox
 
 	mu        sync.Mutex
 	closed    bool
 	terminal  map[string]struct{}
+	inflight  map[string]struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 }
 
 type liveNotification struct {
+	id        string
+	attempts  int
 	execution *notificationport.LiveExecutionEvent
 	runtime   *notificationport.LiveRuntimeEvent
+}
+
+type durableLiveNotification struct {
+	Execution *notificationport.LiveExecutionEvent `json:"execution,omitempty"`
+	Runtime   *notificationport.LiveRuntimeEvent   `json:"runtime,omitempty"`
 }
 
 func NewLiveNotifier(
@@ -46,6 +60,7 @@ func NewLiveNotifier(
 		sender: sender, logger: logger,
 		queue:    make(chan liveNotification, 64),
 		terminal: make(map[string]struct{}),
+		inflight: make(map[string]struct{}),
 	}
 	if runtimeSender, ok := sender.(notificationport.LiveRuntimeSender); ok {
 		notifier.runtimeSender = runtimeSender
@@ -53,6 +68,16 @@ func NewLiveNotifier(
 	notifier.wg.Add(1)
 	go notifier.run()
 	return notifier, nil
+}
+
+func (n *LiveNotifier) AttachOutbox(ctx context.Context, outbox persistenceport.LiveNotificationOutbox) error {
+	if outbox == nil {
+		return fmt.Errorf("live notification outbox is required")
+	}
+	n.mu.Lock()
+	n.outbox = outbox
+	n.mu.Unlock()
+	return n.enqueueDue(ctx)
 }
 
 // Notify only enqueues an in-memory event. Telegram transport latency can
@@ -88,16 +113,7 @@ func (n *LiveNotifier) Notify(event notificationport.LiveExecutionEvent) {
 		}
 		n.terminal[key] = struct{}{}
 	}
-	select {
-	case n.queue <- liveNotification{execution: &event}:
-	default:
-		if n.logger != nil {
-			n.logger.Error(
-				"Live Telegram queue is full; notification dropped",
-				"operation", event.Operation, "kind", event.Kind,
-			)
-		}
-	}
+	n.persistAndEnqueueLocked(liveNotification{execution: &event})
 }
 
 func terminalNotificationKey(
@@ -124,14 +140,41 @@ func (n *LiveNotifier) NotifyRuntime(event notificationport.LiveRuntimeEvent) {
 	if n.closed || n.runtimeSender == nil {
 		return
 	}
+	n.persistAndEnqueueLocked(liveNotification{runtime: &event})
+}
+
+func (n *LiveNotifier) persistAndEnqueueLocked(item liveNotification) {
+	if n.outbox != nil {
+		payload, err := json.Marshal(durableLiveNotification{Execution: item.execution, Runtime: item.runtime})
+		if err == nil {
+			sum := sha256.Sum256(payload)
+			item.id = "live-notification-" + hex.EncodeToString(sum[:16])
+			now := time.Now().UTC()
+			var inserted bool
+			persistCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			inserted, err = n.outbox.PutLiveNotification(persistCtx, persistenceport.LiveNotificationRecord{
+				ID: item.id, Payload: payload, State: "pending", CreatedAt: now, UpdatedAt: now})
+			cancel()
+			if err == nil && !inserted {
+				return
+			}
+		}
+		if err != nil && n.logger != nil {
+			n.logger.Error("Live notification outbox persistence failed", "error", err)
+		}
+	}
+	if item.id != "" {
+		if _, exists := n.inflight[item.id]; exists {
+			return
+		}
+		n.inflight[item.id] = struct{}{}
+	}
 	select {
-	case n.queue <- liveNotification{runtime: &event}:
+	case n.queue <- item:
 	default:
+		delete(n.inflight, item.id)
 		if n.logger != nil {
-			n.logger.Error(
-				"Live Telegram lifecycle queue is full; notification dropped",
-				"kind", event.Kind,
-			)
+			n.logger.Error("Live Telegram queue is full; durable notification awaits retry")
 		}
 	}
 }
@@ -148,7 +191,20 @@ func (n *LiveNotifier) Close() {
 
 func (n *LiveNotifier) run() {
 	defer n.wg.Done()
-	for event := range n.queue {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		var event liveNotification
+		var ok bool
+		select {
+		case event, ok = <-n.queue:
+			if !ok {
+				return
+			}
+		case <-ticker.C:
+			_ = n.enqueueDue(context.Background())
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 		var err error
 		var kind any
@@ -161,6 +217,7 @@ func (n *LiveNotifier) run() {
 			err = n.runtimeSender.SendLiveRuntime(ctx, *event.runtime)
 		}
 		cancel()
+		n.finishDelivery(event, err)
 		if err != nil && n.logger != nil {
 			n.logger.Error(
 				"Live Telegram notification failed",
@@ -168,6 +225,71 @@ func (n *LiveNotifier) run() {
 			)
 		}
 	}
+}
+
+func (n *LiveNotifier) finishDelivery(event liveNotification, deliveryErr error) {
+	n.mu.Lock()
+	delete(n.inflight, event.id)
+	outbox := n.outbox
+	n.mu.Unlock()
+	if outbox == nil || event.id == "" {
+		return
+	}
+	now := time.Now().UTC()
+	state, next, detail := "delivered", time.Time{}, ""
+	attempts := event.attempts + 1
+	if deliveryErr != nil {
+		state, next, detail = "retrying", now.Add(notificationRetryDelay(attempts)), deliveryErr.Error()
+		if len(detail) > 500 {
+			detail = detail[:500]
+		}
+	}
+	if err := outbox.MarkLiveNotification(context.Background(), event.id, state, attempts, next, detail, now); err != nil && n.logger != nil {
+		n.logger.Error("Live notification outbox update failed", "error", err)
+	}
+}
+
+func (n *LiveNotifier) enqueueDue(ctx context.Context) error {
+	n.mu.Lock()
+	outbox := n.outbox
+	closed := n.closed
+	n.mu.Unlock()
+	if outbox == nil || closed {
+		return nil
+	}
+	records, err := outbox.LoadDueLiveNotifications(ctx, time.Now().UTC(), 32)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		var payload durableLiveNotification
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			_ = outbox.MarkLiveNotification(ctx, record.ID, "rejected", record.Attempts+1, time.Time{}, "invalid normalized payload", time.Now().UTC())
+			continue
+		}
+		n.mu.Lock()
+		if _, exists := n.inflight[record.ID]; !exists && !n.closed {
+			n.inflight[record.ID] = struct{}{}
+			select {
+			case n.queue <- liveNotification{id: record.ID, attempts: record.Attempts, execution: payload.Execution, runtime: payload.Runtime}:
+			default:
+				delete(n.inflight, record.ID)
+			}
+		}
+		n.mu.Unlock()
+	}
+	return nil
+}
+
+func notificationRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := time.Second << min(attempt-1, 6)
+	if delay > time.Minute {
+		return time.Minute
+	}
+	return delay
 }
 
 type progressOperation struct {
@@ -178,6 +300,7 @@ type progressOperation struct {
 	stageAt   map[int]time.Time
 	pending   []notificationport.LiveExecutionEvent
 	visible   bool
+	finished  bool
 }
 
 type ProgressObserver struct {
@@ -336,6 +459,7 @@ func (o *ProgressObserver) StageSettled(
 	}
 	o.mu.Lock()
 	value = o.operations[settlement.Request.Operation]
+	delete(value.stageAt, settlement.Request.Stage.Ordinal)
 	if !value.visible && settlement.Request.Stage.Stage == execution.StageBuy {
 		value.visible = true
 		pending := append(
@@ -354,6 +478,10 @@ func (o *ProgressObserver) StageSettled(
 	visible := value.visible
 	if !visible {
 		value.pending = append(value.pending, event)
+	}
+	if value.finished {
+		delete(o.operations, settlement.Request.Operation)
+	} else {
 		o.operations[settlement.Request.Operation] = value
 	}
 	o.mu.Unlock()
@@ -431,7 +559,17 @@ func (o *ProgressObserver) OperationFinished(
 	now := o.clock().UTC()
 	o.mu.Lock()
 	value := o.operations[operation.ID]
-	delete(o.operations, operation.ID)
+	_, quoteReturnPending := value.stageAt[4]
+	if quoteReturnPending &&
+		value.stage.Stage.Stage == execution.StageBridgeQuoteReturn {
+		// Quote restoration may deliberately continue after the economic
+		// operation completes. Retain just enough progress state for its
+		// eventual settlement to update the existing notification.
+		value.finished = true
+		o.operations[operation.ID] = value
+	} else {
+		delete(o.operations, operation.ID)
+	}
 	o.mu.Unlock()
 	duration := time.Duration(0)
 	if !value.started.IsZero() {
@@ -625,13 +763,26 @@ func (o *ProgressObserver) explorer(
 	if !ok {
 		return ""
 	}
+	escapedIdentity := url.PathEscape(strings.TrimSpace(identity))
 	switch {
 	case configured.Kind == "solana":
-		return "https://solscan.io/tx/" + identity
+		return "https://solscan.io/tx/" + escapedIdentity
 	case configured.Kind == "evm" &&
 		configured.ChainID != nil &&
-		configured.ChainID.Cmp(big.NewInt(137)) == 0:
-		return "https://polygonscan.com/tx/" + identity
+		configured.ChainID.IsInt64():
+		var prefix string
+		switch configured.ChainID.Int64() {
+		case 56:
+			prefix = "https://bscscan.com/tx/"
+		case 137:
+			prefix = "https://polygonscan.com/tx/"
+		case 8453:
+			prefix = "https://basescan.org/tx/"
+		}
+		if prefix == "" {
+			return ""
+		}
+		return prefix + escapedIdentity
 	default:
 		return ""
 	}

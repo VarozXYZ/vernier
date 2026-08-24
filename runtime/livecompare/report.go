@@ -165,6 +165,9 @@ func WriteTextWithOptions(writer io.Writer, report Report, options OutputOptions
 			return err
 		}
 	}
+	if err := writeValidationText(writer, report.Validation); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -183,6 +186,14 @@ func writeTextSummary(writer io.Writer, report Report, options OutputOptions) er
 			}
 			if _, err := fmt.Fprintf(
 				writer, "  Flow costs   %s\n", state,
+			); err != nil {
+				return err
+			}
+		} else if report.Cost.Model == "complete_flow_stale_fallback" {
+			if _, err := fmt.Fprintf(
+				writer,
+				"  Flow costs   provisional (stale fallback in use; max %s)\n",
+				readableQuantity(report.Cost.Cost),
 			); err != nil {
 				return err
 			}
@@ -230,13 +241,23 @@ func writeTextSummary(writer io.Writer, report Report, options OutputOptions) er
 	}
 	for _, opportunity := range report.Research.Opportunities {
 		if opportunity.SelectedIndex < 0 || opportunity.SelectedIndex >= len(opportunity.Candidates) {
+			if _, err := fmt.Fprintf(
+				writer,
+				"\nRESULT (%s -> %s)\n  Status       UNAVAILABLE: %s\n",
+				readableMarket(opportunity.Direction.BuyMarket),
+				readableMarket(opportunity.Direction.SellMarket),
+				strings.Join(opportunity.Reasons, ","),
+			); err != nil {
+				return err
+			}
 			continue
 		}
 		candidate := opportunity.Candidates[opportunity.SelectedIndex]
 		if _, err := fmt.Fprintf(
 			writer,
-			"\nRESULT (%s -> %s)\n  Gross PnL    %s\n  Flow cost    %s\n  Net PnL      %s  [%s]\n",
+			"\nRESULT (%s -> %s)\n  Input        %s  (%d sizes evaluated)\n  Gross PnL    %s\n  Flow cost    %s\n  Net PnL      %s  [%s]\n",
 			readableMarket(opportunity.Direction.BuyMarket), readableMarket(opportunity.Direction.SellMarket),
+			readableQuantity(candidate.Input), len(opportunity.Candidates),
 			readableQuantity(candidate.GrossPnL), readableQuantity(candidate.Cost.Amount),
 			readableQuantity(candidate.NetPnL),
 			readableVerdict(opportunity),
@@ -247,7 +268,19 @@ func writeTextSummary(writer io.Writer, report Report, options OutputOptions) er
 	if _, err := fmt.Fprintf(writer, "\nTOTAL          %s\n\n", readableDuration(report.Research.LocalTiming.Duration)); err != nil {
 		return err
 	}
+	if err := writeValidationText(writer, report.Validation); err != nil {
+		return err
+	}
 	return nil
+}
+
+func writeValidationText(writer io.Writer, round *arbitrage.ExecutableValidationRound) error {
+	if round == nil {
+		return nil
+	}
+	_, err := fmt.Fprintf(writer, "validation status=%s route=%s build=%s attempts=%d discovery_net=%s final_net=%s failure_stage=%s failure_class=%s\n",
+		round.Status, round.RouteDuration, round.BuildDuration, round.BuildAttempts, readableQuantity(round.DiscoveryNet), readableQuantity(round.FinalNet), round.FailureStage, round.FailureClass)
+	return err
 }
 
 func writeReadableProbes(writer io.Writer, probes []strategy.DirectionProbeTiming) error {
@@ -302,6 +335,8 @@ func writeReadableQuote(writer io.Writer, quote strategy.QuoteTiming) error {
 func selectedDirection(opportunities []arbitrage.Opportunity, direction arbitrage.Direction) bool {
 	for _, opportunity := range opportunities {
 		if opportunity.Direction == direction &&
+			(opportunity.Classification == arbitrage.ClassificationPolicyQualified ||
+				opportunity.Classification == arbitrage.ClassificationExecutable) &&
 			opportunity.SelectedIndex >= 0 &&
 			opportunity.SelectedIndex < len(opportunity.Candidates) {
 			return true
@@ -633,6 +668,7 @@ func writeJSON(writer io.Writer, report Report, indent bool, options OutputOptio
 		Cost          costDTO         `json:"cost_evidence"`
 		Parity        []parityDTO     `json:"parity"`
 		Reference     []referenceDTO  `json:"external_reference"`
+		Validation    *validationDTO  `json:"executable_validation,omitempty"`
 	}{
 		SchemaVersion: 1,
 		Research:      json.RawMessage(bytes.TrimSpace(researchJSON.Bytes())),
@@ -641,8 +677,9 @@ func writeJSON(writer io.Writer, report Report, indent bool, options OutputOptio
 			CostAmount: report.Cost.Cost.String(), CostAsset: string(report.Cost.Cost.Asset()),
 			PriceRequired: hasCostPrice(report.Cost), PriceSource: costPriceSource(report.Cost),
 		},
-		Parity:    make([]parityDTO, 0, len(report.Parity)),
-		Reference: make([]referenceDTO, 0, len(report.Reference)),
+		Parity:     make([]parityDTO, 0, len(report.Parity)),
+		Reference:  make([]referenceDTO, 0, len(report.Reference)),
+		Validation: validationDTOFrom(report.Validation),
 	}
 	if hasCostPrice(report.Cost) {
 		payload.Cost.PriceBase = string(report.Cost.Price.Base())
@@ -695,6 +732,7 @@ type summaryPayload struct {
 	Cost            *summaryCostDTO         `json:"cost,omitempty"`
 	ParityChecks    int                     `json:"parity_checks"`
 	ReferenceChecks int                     `json:"external_reference_checks"`
+	Validation      *validationDTO          `json:"executable_validation,omitempty"`
 }
 
 type discoverySummaryDTO struct {
@@ -751,6 +789,7 @@ func writeJSONSummary(writer io.Writer, report Report, options OutputOptions) er
 		Status: report.Research.Status, LocalDuration: report.Research.LocalTiming.Duration.String(),
 		Quotes: make([]summaryQuoteDTO, 0, 3), Opportunities: make([]summaryOpportunityDTO, 0, len(report.Research.Opportunities)),
 		ReferenceChecks: len(report.Reference), ParityChecks: len(report.Parity),
+		Validation: validationDTOFrom(report.Validation),
 	}
 	if !options.OmitCost {
 		payload.Cost = &summaryCostDTO{
@@ -804,6 +843,43 @@ func writeJSONSummary(writer io.Writer, report Report, options OutputOptions) er
 	encoder := json.NewEncoder(writer)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(payload)
+}
+
+type validationDTO struct {
+	Status               string    `json:"status"`
+	FailureStage         string    `json:"failure_stage,omitempty"`
+	FailureClass         string    `json:"failure_class,omitempty"`
+	DiscoveryNet         string    `json:"discovery_net"`
+	FinalNet             string    `json:"final_net,omitempty"`
+	Threshold            string    `json:"threshold"`
+	RouteDuration        string    `json:"route_duration"`
+	BuildDuration        string    `json:"build_duration"`
+	BuildAttempts        int       `json:"build_attempts"`
+	RouteHTTPStatus      int       `json:"route_http_status"`
+	BuildHTTPStatus      int       `json:"build_http_status"`
+	RequestedAt          time.Time `json:"requested_at"`
+	BuildFinishedAt      time.Time `json:"build_finished_at,omitempty"`
+	SimulationFinishedAt time.Time `json:"simulation_finished_at,omitempty"`
+	LocalRecapturedAt    time.Time `json:"local_recaptured_at,omitempty"`
+	RecalculatedAt       time.Time `json:"recalculated_at,omitempty"`
+}
+
+func validationDTOFrom(round *arbitrage.ExecutableValidationRound) *validationDTO {
+	if round == nil {
+		return nil
+	}
+	return &validationDTO{Status: string(round.Status), FailureStage: round.FailureStage, FailureClass: round.FailureClass,
+		DiscoveryNet: quantityReportString(round.DiscoveryNet), FinalNet: quantityReportString(round.FinalNet), Threshold: quantityReportString(round.Threshold),
+		RouteDuration: round.RouteDuration.String(), BuildDuration: round.BuildDuration.String(), BuildAttempts: round.BuildAttempts,
+		RouteHTTPStatus: round.RouteHTTPStatus, BuildHTTPStatus: round.BuildHTTPStatus, RequestedAt: round.RequestedAt,
+		BuildFinishedAt: round.BuildFinishedAt, SimulationFinishedAt: round.SimulationFinishedAt, LocalRecapturedAt: round.LocalRecapturedAt, RecalculatedAt: round.RecalculatedAt}
+}
+
+func quantityReportString(value market.AssetQuantity) string {
+	if value.Asset() == "" {
+		return ""
+	}
+	return value.String() + " " + string(value.Asset())
 }
 
 type costDTO struct {

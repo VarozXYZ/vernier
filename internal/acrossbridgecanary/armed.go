@@ -27,6 +27,8 @@ import (
 	sqlitepersistence "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
+	"github.com/VarozXYZ/vernier/internal/rpcpolicy"
+	"github.com/VarozXYZ/vernier/internal/safeerr"
 	chainport "github.com/VarozXYZ/vernier/ports/chain"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
 	"github.com/VarozXYZ/vernier/runtime/configuration"
@@ -37,6 +39,26 @@ type DestinationEvidence struct {
 	Balance  *big.Int
 	Amount   *big.Int
 	Source   string
+}
+
+type solanaSourceRejectedError struct {
+	identity string
+}
+
+func (e *solanaSourceRejectedError) Error() string {
+	return fmt.Sprintf(
+		"Across Solana source %s never landed and its blockhash expired",
+		e.identity,
+	)
+}
+
+type solanaSourceRevertedError struct {
+	identity string
+	detail   any
+}
+
+func (e *solanaSourceRevertedError) Error() string {
+	return fmt.Sprintf("Across Solana source %s failed on-chain: %v", e.identity, e.detail)
 }
 
 type DestinationWatcher interface {
@@ -91,7 +113,15 @@ type liveExecutionHooks struct {
 	Accounts         map[string]domainexecution.AccountID
 	NativeAssets     map[market.ChainID]market.AssetID
 	NonceCoordinator chainport.EVMNonceCoordinator
+	SourcePhase      string
 	Result           *liveExecutionResult
+}
+
+func (h *liveExecutionHooks) sourcePhase() string {
+	if h == nil || strings.TrimSpace(h.SourcePhase) == "" {
+		return "across_source"
+	}
+	return h.SourcePhase
 }
 
 func (h *liveExecutionHooks) prepared(
@@ -101,7 +131,7 @@ func (h *liveExecutionHooks) prepared(
 	if h == nil {
 		return nil
 	}
-	if h.Result != nil && phase == "across_source" {
+	if h.Result != nil && strings.HasPrefix(phase, "across_source") {
 		h.Result.SourceChain = chain
 		h.Result.SourceIdentity = identity
 	}
@@ -116,6 +146,28 @@ func (h *liveExecutionHooks) prepared(
 		Identity: domainexecution.TransactionIdentity{
 			Chain:   domainexecutionChain(chain, h.Request),
 			Account: h.Accounts[chain], Hash: identity, Nonce: nonce,
+		},
+		PreparedAt: time.Now().UTC(),
+	})
+}
+
+func (h *liveExecutionHooks) preparedSolana(
+	ctx context.Context,
+	phase, identity, blockhash string,
+) error {
+	if h == nil {
+		return nil
+	}
+	if h.Result != nil && strings.HasPrefix(phase, "across_source") {
+		h.Result.SourceChain = "solana"
+		h.Result.SourceIdentity = identity
+	}
+	return h.Journal.RecordPreparedTransaction(ctx, executionport.PreparedTransaction{
+		Operation: h.Request.Operation, Ordinal: h.Request.Stage.Ordinal,
+		Phase: phase,
+		Identity: domainexecution.TransactionIdentity{
+			Chain:   domainexecutionChain("solana", h.Request),
+			Account: h.Accounts["solana"], Hash: identity, Blockhash: blockhash,
 		},
 		PreparedAt: time.Now().UTC(),
 	})
@@ -263,6 +315,31 @@ func resumeArmedWithWatcher(
 	if err != nil {
 		return err
 	}
+	if operation.SourceChain == "solana" &&
+		operation.Status != "source_confirmed" &&
+		operation.Status != "destination_confirmed" {
+		confirmed, reconcileErr := reconcileAcrossSolanaSource(
+			ctx, endpoints, operation,
+		)
+		if reconcileErr != nil {
+			var rejected *solanaSourceRejectedError
+			var reverted *solanaSourceRevertedError
+			switch {
+			case errors.As(reconcileErr, &rejected):
+				_ = store.Mark(ctx, operation.ID, "rejected", reconcileErr)
+			case errors.As(reconcileErr, &reverted):
+				_ = store.Mark(ctx, operation.ID, "failed", reconcileErr)
+			default:
+				_ = store.Mark(ctx, operation.ID, "outcome_unknown", reconcileErr)
+			}
+			return reconcileErr
+		}
+		if confirmed {
+			if err := store.Mark(ctx, operation.ID, "source_confirmed", nil); err != nil {
+				return err
+			}
+		}
+	}
 	watcher := sharedWatcher
 	var current *big.Int
 	destinationChain := destinationChainForDirection(config, selected)
@@ -274,9 +351,13 @@ func resumeArmedWithWatcher(
 		}
 		defer watcher.Close()
 	} else {
-		current, err = watcher.Balance(ctx)
+		current, err = readDestinationBalance(ctx, watcher)
 		if err != nil {
-			return fmt.Errorf("read shared destination tracker balance: %w", err)
+			return fmt.Errorf(
+				"read shared destination tracker balance after %d attempts: %s",
+				rpcpolicy.DefaultReadAttempts,
+				safeerr.Message(err),
+			)
 		}
 	}
 	fmt.Fprintf(
@@ -319,6 +400,93 @@ func resumeArmedWithWatcher(
 		ctx, output, store, operation.ID, destinationChain,
 		evidence.Identity, before, evidence.Balance,
 	)
+}
+
+func reconcileAcrossSolanaSource(
+	ctx context.Context,
+	endpoints map[string]string,
+	operation sqlitepersistence.AcrossCanaryOperation,
+) (bool, error) {
+	rpcURL := endpoints["solana.http"]
+	if rpcURL == "" {
+		rpcURL = endpoints["solana"]
+	}
+	state, err := ReconcileSolanaSource(
+		ctx, rpcURL, operation.SourceIdentity, operation.SourceBlockhash,
+	)
+	if err != nil {
+		return false, err
+	}
+	switch state {
+	case domainexecution.StateConfirmedSuccess:
+		return true, nil
+	case domainexecution.StateConfirmedRevert:
+		return false, &solanaSourceRevertedError{
+			identity: operation.SourceIdentity,
+			detail:   "confirmed transaction error",
+		}
+	case domainexecution.StateBroadcastRejected:
+		return false, &solanaSourceRejectedError{identity: operation.SourceIdentity}
+	default:
+		return false, fmt.Errorf(
+			"across Solana source %s remains uncertain",
+			operation.SourceIdentity,
+		)
+	}
+}
+
+// ReconcileSolanaSource proves whether an Across source transaction landed.
+// An absent signature is only rejected after its exact blockhash is invalid;
+// while that blockhash remains valid the outcome stays unknown and must not be
+// resent.
+func ReconcileSolanaSource(
+	ctx context.Context,
+	rpcURL, identity, sourceBlockhash string,
+) (domainexecution.TechnicalState, error) {
+	client := solanarpc.New(rpcURL)
+	signature, err := solanago.SignatureFromBase58(identity)
+	if err != nil {
+		return domainexecution.StateOutcomeUnknown,
+			fmt.Errorf("parse persisted Across Solana signature: %w", err)
+	}
+	statuses, err := client.GetSignatureStatuses(ctx, true, signature)
+	if err != nil {
+		return domainexecution.StateOutcomeUnknown,
+			fmt.Errorf("reconcile Across Solana source signature: %w", err)
+	}
+	if statuses != nil && len(statuses.Value) == 1 && statuses.Value[0] != nil {
+		status := statuses.Value[0]
+		if status.Err != nil {
+			return domainexecution.StateConfirmedRevert, nil
+		}
+		if status.ConfirmationStatus == solanarpc.ConfirmationStatusConfirmed ||
+			status.ConfirmationStatus == solanarpc.ConfirmationStatusFinalized {
+			return domainexecution.StateConfirmedSuccess, nil
+		}
+		return domainexecution.StateOutcomeUnknown, nil
+	}
+	if strings.TrimSpace(sourceBlockhash) == "" {
+		return domainexecution.StateOutcomeUnknown, fmt.Errorf(
+			"across Solana source %s is absent and legacy recovery data lacks its blockhash",
+			identity,
+		)
+	}
+	blockhash, err := solanago.HashFromBase58(sourceBlockhash)
+	if err != nil {
+		return domainexecution.StateOutcomeUnknown,
+			fmt.Errorf("parse persisted Across Solana blockhash: %w", err)
+	}
+	validity, err := client.IsBlockhashValid(
+		ctx, blockhash, solanarpc.CommitmentConfirmed,
+	)
+	if err != nil {
+		return domainexecution.StateOutcomeUnknown,
+			fmt.Errorf("reconcile Across Solana source blockhash: %w", err)
+	}
+	if validity != nil && validity.Value {
+		return domainexecution.StateOutcomeUnknown, nil
+	}
+	return domainexecution.StateBroadcastRejected, nil
 }
 
 func completeResumedDestination(
@@ -419,25 +587,30 @@ func executeArmedWithWatcher(
 		}
 		defer watcher.Close()
 	} else {
-		before, err = watcher.Balance(ctx)
+		before, err = readDestinationBalance(ctx, watcher)
 		if err != nil {
 			_ = store.Mark(ctx, operationID, "failed", err)
-			return fmt.Errorf("read shared destination tracker balance: %w", err)
+			return fmt.Errorf(
+				"read shared destination tracker balance after %d attempts: %s",
+				rpcpolicy.DefaultReadAttempts,
+				safeerr.Message(err),
+			)
 		}
 	}
 
 	var sourceIdentity, sourceChain string
+	sourcePhase := hooks.sourcePhase()
 	if selected == evmToSolana {
 		sourceChain, sourceIdentity, err = executeEVMSource(
 			ctx, output, config, endpoints, approval.SwapTransaction,
 			func(identity string) error {
-				if hookErr := hooks.prepared(ctx, "polygon", "across_source", identity); hookErr != nil {
+				if hookErr := hooks.prepared(ctx, "polygon", sourcePhase, identity); hookErr != nil {
 					return hookErr
 				}
 				return store.Prepared(ctx, operationID, "polygon", identity, destinationChain, before.String())
 			},
 			func() error {
-				if hookErr := hooks.mark(ctx, "across_source", "broadcast"); hookErr != nil {
+				if hookErr := hooks.mark(ctx, sourcePhase, "broadcast"); hookErr != nil {
 					return hookErr
 				}
 				return store.Mark(ctx, operationID, "broadcast", nil)
@@ -448,14 +621,14 @@ func executeArmedWithWatcher(
 	} else {
 		sourceChain, sourceIdentity, err = executeSolanaSource(
 			ctx, output, config, endpoints, approval.SwapTransaction,
-			func(identity string) error {
-				if hookErr := hooks.prepared(ctx, "solana", "across_source", identity); hookErr != nil {
+			func(identity, blockhash string) error {
+				if hookErr := hooks.preparedSolana(ctx, sourcePhase, identity, blockhash); hookErr != nil {
 					return hookErr
 				}
-				return store.Prepared(ctx, operationID, "solana", identity, destinationChain, before.String())
+				return store.PreparedSolana(ctx, operationID, identity, blockhash, destinationChain, before.String())
 			},
 			func() error {
-				if hookErr := hooks.mark(ctx, "across_source", "broadcast"); hookErr != nil {
+				if hookErr := hooks.mark(ctx, sourcePhase, "broadcast"); hookErr != nil {
 					return hookErr
 				}
 				return store.Mark(ctx, operationID, "broadcast", nil)
@@ -476,7 +649,7 @@ func executeArmedWithWatcher(
 	if err := store.Mark(ctx, operationID, "source_confirmed", nil); err != nil {
 		return err
 	}
-	if err := hooks.mark(ctx, "across_source", "confirmed"); err != nil {
+	if err := hooks.mark(ctx, sourcePhase, "confirmed"); err != nil {
 		return err
 	}
 	fmt.Fprintf(output, "source_confirmed chain=%s tx=%s\n", sourceChain, sourceIdentity)
@@ -661,7 +834,7 @@ func executeSolanaSource(
 	config configuration.ParsedConfig,
 	endpoints map[string]string,
 	artifact across.Transaction,
-	persist func(string) error,
+	persist func(string, string) error,
 	markBroadcast func() error,
 	hooks *liveExecutionHooks,
 	timeout time.Duration,
@@ -689,6 +862,7 @@ func executeSolanaSource(
 		return "", "", fmt.Errorf("across Solana transaction has no signature")
 	}
 	identity := transaction.Signatures[0].String()
+	blockhash := transaction.Message.RecentBlockhash.String()
 	rpcURL := endpoints["solana.http"]
 	if rpcURL == "" {
 		rpcURL = endpoints["solana"]
@@ -700,7 +874,7 @@ func executeSolanaSource(
 	if err != nil || simulation.Value.Err != nil {
 		return "", "", fmt.Errorf("simulate Across Solana source: rpc=%v transaction=%v", err, simulationError(simulation))
 	}
-	if err := persist(identity); err != nil {
+	if err := persist(identity, blockhash); err != nil {
 		return "", "", err
 	}
 	if simulation.Value.UnitsConsumed == nil {
@@ -1292,25 +1466,37 @@ func AwaitDestinationConfirmation(
 			fmt.Fprintf(
 				output,
 				"tracking_warning source=destination_websocket error=%q action=balance_and_across_fallback_remain_active\n",
-				err,
+				safeerr.Message(err),
 			)
 			watcherErrors = nil
 		case err := <-statusErrors:
 			fmt.Fprintf(
 				output,
 				"tracking_warning source=across_status error=%q action=websocket_and_balance_fallback_remain_active\n",
-				err,
+				safeerr.Message(err),
 			)
 		case err := <-balanceErrors:
 			fmt.Fprintf(
 				output,
 				"tracking_warning source=destination_balance error=%q action=websocket_and_across_fallback_remain_active\n",
-				err,
+				safeerr.Message(err),
 			)
 		case <-ctx.Done():
 			return DestinationEvidence{}, ctx.Err()
 		}
 	}
+}
+
+func readDestinationBalance(
+	ctx context.Context,
+	watcher DestinationWatcher,
+) (*big.Int, error) {
+	return rpcpolicy.Read(
+		ctx,
+		rpcpolicy.DefaultReadAttempts,
+		rpcpolicy.DefaultInitialDelay,
+		watcher.Balance,
+	)
 }
 
 func pollDestinationBalance(

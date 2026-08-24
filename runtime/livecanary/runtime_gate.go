@@ -14,6 +14,7 @@ const (
 	RuntimeGateRecovering      RuntimeGateState = "recovering"
 	RuntimeGateRefueling       RuntimeGateState = "refueling"
 	RuntimeGateRecoveryBlocked RuntimeGateState = "recovery_blocked"
+	RuntimeGateCapacityBlocked RuntimeGateState = "capacity_blocked"
 	RuntimeGateStopping        RuntimeGateState = "stopping"
 )
 
@@ -86,6 +87,7 @@ func validRuntimeGateTransition(from, to RuntimeGateState) bool {
 	switch from {
 	case RuntimeGateStarting:
 		return to == RuntimeGateIdle ||
+			to == RuntimeGateCapacityBlocked ||
 			to == RuntimeGateRecovering ||
 			to == RuntimeGateRefueling ||
 			to == RuntimeGateRecoveryBlocked ||
@@ -98,23 +100,28 @@ func validRuntimeGateTransition(from, to RuntimeGateState) bool {
 			to == RuntimeGateStopping
 	case RuntimeGateExecuting:
 		return to == RuntimeGateIdle ||
+			to == RuntimeGateCapacityBlocked ||
 			to == RuntimeGateRecovering ||
 			to == RuntimeGateRefueling ||
 			to == RuntimeGateRecoveryBlocked ||
 			to == RuntimeGateStopping
 	case RuntimeGateRecovering:
 		return to == RuntimeGateIdle ||
+			to == RuntimeGateCapacityBlocked ||
 			to == RuntimeGateRefueling ||
 			to == RuntimeGateRecoveryBlocked ||
 			to == RuntimeGateStopping
 	case RuntimeGateRefueling:
 		return to == RuntimeGateIdle ||
+			to == RuntimeGateCapacityBlocked ||
 			to == RuntimeGateExecuting ||
 			to == RuntimeGateRecovering ||
 			to == RuntimeGateRecoveryBlocked ||
 			to == RuntimeGateStopping
 	case RuntimeGateRecoveryBlocked:
 		return to == RuntimeGateStopping
+	case RuntimeGateCapacityBlocked:
+		return to == RuntimeGateIdle || to == RuntimeGateRecoveryBlocked || to == RuntimeGateStopping
 	default:
 		return false
 	}

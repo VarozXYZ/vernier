@@ -4,6 +4,7 @@ package kyberswap
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -30,6 +31,10 @@ type RouteBuilder interface {
 	Build(context.Context, quoteadapter.BuildRequest) (quoteadapter.BuildResult, error)
 }
 
+type DiscoveryRouteSource interface {
+	DiscoveryRoute(market.Quote) (quoteadapter.RouteResult, bool)
+}
+
 type Config struct {
 	ID                         market.SourceID
 	ChainSlug                  string
@@ -42,8 +47,10 @@ type Config struct {
 	GasCostMode                string
 	FixedCostGasLimit          uint64
 	Source                     RouteBuilder
+	DiscoveryRoutes            DiscoveryRouteSource
 	Simulator                  Simulator
 	Clock                      func() time.Time
+	AllowedRouters             []common.Address
 }
 
 const (
@@ -56,6 +63,18 @@ type Validator struct {
 	config Config
 }
 
+// FreshRouteValidator returns an independent validator that always starts
+// with a new /routes request. It is used after cached discovery and must not
+// consult the retained discovery-route journal.
+func (v *Validator) FreshRouteValidator() *Validator {
+	if v == nil {
+		return nil
+	}
+	config := v.config
+	config.DiscoveryRoutes = nil
+	return &Validator{config: config}
+}
+
 func New(config Config) (*Validator, error) {
 	if config.ID == "" || strings.TrimSpace(config.ChainSlug) == "" ||
 		config.Sender == (common.Address{}) || len(config.TokenAddresses) < 2 ||
@@ -66,6 +85,11 @@ func New(config Config) (*Validator, error) {
 		if token == "" || !common.IsHexAddress(address) ||
 			common.HexToAddress(address) == (common.Address{}) {
 			return nil, fmt.Errorf("KyberSwap validator token mapping is invalid")
+		}
+	}
+	for _, router := range config.AllowedRouters {
+		if router == (common.Address{}) {
+			return nil, fmt.Errorf("KyberSwap router allowlist is invalid")
 		}
 	}
 	if config.SlippageBPS == 0 {
@@ -139,27 +163,40 @@ func (v *Validator) Validate(
 		return executionport.Artifact{}, fmt.Errorf("KyberSwap build token mapping is missing")
 	}
 	var (
-		built        quoteadapter.BuildResult
-		router       common.Address
-		calldata     []byte
-		value        *big.Int
-		estimatedGas uint64
+		built                quoteadapter.BuildResult
+		router               common.Address
+		calldata             []byte
+		value                *big.Int
+		estimatedGas         uint64
+		buildFinishedAt      time.Time
+		simulationFinishedAt time.Time
 	)
 	slippageBPS := v.config.SlippageBPS
 	if request.Slippage != nil {
 		slippageBPS = request.Slippage.BPS
 	}
 	buildAttempts := 0
+	var usedRoute quoteadapter.RouteResult
+	var discoveryRoute quoteadapter.RouteResult
+	hasDiscoveryRoute := false
+	if v.config.DiscoveryRoutes != nil {
+		discoveryRoute, hasDiscoveryRoute = v.config.DiscoveryRoutes.DiscoveryRoute(request.Discovery)
+	}
 	for {
 		buildAttempts++
-		route, err := v.config.Source.Route(ctx, quoteadapter.RouteRequest{
-			Chain: v.config.ChainSlug, TokenIn: inputAddress,
-			TokenOut: outputAddress, AmountIn: request.Leg.Input.String(),
-			Origin: v.config.Sender.Hex(),
-		})
-		if err != nil {
-			return executionport.Artifact{}, fmt.Errorf("KyberSwap route: %w", err)
+		var err error
+		route := discoveryRoute
+		if !hasDiscoveryRoute || buildAttempts > 1 {
+			route, err = v.config.Source.Route(ctx, quoteadapter.RouteRequest{
+				Chain: v.config.ChainSlug, TokenIn: inputAddress,
+				TokenOut: outputAddress, AmountIn: request.Leg.Input.String(),
+				Origin: v.config.Sender.Hex(),
+			})
+			if err != nil {
+				return executionport.Artifact{}, fmt.Errorf("KyberSwap route: %w", err)
+			}
 		}
+		usedRoute = route
 		built, err = v.config.Source.Build(ctx, quoteadapter.BuildRequest{
 			Route: route, Sender: v.config.Sender.Hex(),
 			Recipient: v.config.Sender.Hex(), Origin: v.config.Sender.Hex(),
@@ -167,7 +204,11 @@ func (v *Validator) Validate(
 			EnableGasEstimation: false,
 		})
 		if err == nil {
+			buildFinishedAt = v.config.Clock().UTC()
 			router = common.HexToAddress(built.RouterAddress)
+			if router == (common.Address{}) || !allowedRouter(router, v.config.AllowedRouters) {
+				return executionport.Artifact{}, fmt.Errorf("KyberSwap build router is not allowlisted")
+			}
 			calldata, err = hex.DecodeString(strings.TrimPrefix(built.Data, "0x"))
 			if err != nil || len(calldata) < 4 {
 				return executionport.Artifact{}, fmt.Errorf("decode KyberSwap calldata")
@@ -185,6 +226,7 @@ func (v *Validator) Validate(
 				validationPhase = "estimate gas for"
 				estimatedGas, err = v.config.Simulator.EstimateGas(ctx, call)
 			}
+			simulationFinishedAt = v.config.Clock().UTC()
 			if err == nil {
 				break
 			}
@@ -228,8 +270,9 @@ func (v *Validator) Validate(
 	thresholdUnits := slippageFloor(outputUnits, slippageBPS)
 	if request.Slippage != nil {
 		minimum := request.Slippage.MinimumOutput
-		if minimum.Token() != request.Leg.ExpectedOutput.Token() ||
-			thresholdUnits.Cmp(minimum.Units()) < 0 {
+		if !minimum.IsZero() &&
+			(minimum.Token() != request.Leg.ExpectedOutput.Token() ||
+				thresholdUnits.Cmp(minimum.Units()) < 0) {
 			actual, amountErr := market.NewTokenAmount(
 				request.Leg.ExpectedOutput.Token(),
 				thresholdUnits,
@@ -265,16 +308,28 @@ func (v *Validator) Validate(
 	metadata := map[string]string{
 		"kind": "kyberswap_route_build",
 		"to":   router.Hex(), "value": value.String(),
-		"gas_limit":            strconv.FormatUint(gasLimit, 10),
-		"expected_gas_used":    strconv.FormatUint(expectedGas, 10),
-		"build_attempts":       strconv.Itoa(buildAttempts),
-		"slippage_bps":         strconv.FormatUint(uint64(slippageBPS), 10),
-		"minimum_output_units": thresholdUnits.String(),
+		"gas_limit":              strconv.FormatUint(gasLimit, 10),
+		"expected_gas_used":      strconv.FormatUint(expectedGas, 10),
+		"build_attempts":         strconv.Itoa(buildAttempts),
+		"slippage_bps":           strconv.FormatUint(uint64(slippageBPS), 10),
+		"minimum_output_units":   thresholdUnits.String(),
+		"route_http_status":      strconv.Itoa(usedRoute.HTTPStatus),
+		"build_http_status":      strconv.Itoa(built.HTTPStatus),
+		"route_duration_nanos":   strconv.FormatInt(usedRoute.TotalDuration.Nanoseconds(), 10),
+		"build_duration_nanos":   strconv.FormatInt(built.TotalDuration.Nanoseconds(), 10),
+		"route_response_hash":    fmt.Sprintf("%x", sha256.Sum256(usedRoute.RawResponse)),
+		"build_response_hash":    fmt.Sprintf("%x", sha256.Sum256(built.RawResponse)),
+		"route_output_units":     usedRoute.AmountOut,
+		"build_output_units":     built.AmountOut,
+		"build_finished_at":      buildFinishedAt.Format(time.RFC3339Nano),
+		"simulation_finished_at": simulationFinishedAt.Format(time.RFC3339Nano),
 	}
 	if request.Slippage != nil {
 		metadata["slippage_reason"] = request.Slippage.Reason
-		metadata["required_minimum_output_units"] =
-			request.Slippage.MinimumOutput.String()
+		if !request.Slippage.MinimumOutput.IsZero() {
+			metadata["required_minimum_output_units"] =
+				request.Slippage.MinimumOutput.String()
+		}
 		for key, value := range request.Slippage.Evidence {
 			metadata["slippage_"+key] = value
 		}
@@ -285,6 +340,18 @@ func (v *Validator) Validate(
 		Metadata: metadata,
 		BuiltAt:  now,
 	}, nil
+}
+
+func allowedRouter(router common.Address, allowlist []common.Address) bool {
+	if len(allowlist) == 0 {
+		return true
+	}
+	for _, allowed := range allowlist {
+		if router == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func slippageFloor(amount *big.Int, bps uint16) *big.Int {
@@ -406,13 +473,15 @@ func classifyAllowanceFailure(err error, router common.Address) error {
 
 func staleRouteBuildError(err error) bool {
 	var apiErr *quoteadapter.APIError
-	if errors.As(err, &apiErr) && apiErr.Code == "4227" {
-		return true
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case "4222", "4227":
+			return true
+		}
 	}
-	return strings.Contains(
-		strings.ToLower(err.Error()),
-		"return amount is not enough",
-	)
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "return amount is not enough") ||
+		strings.Contains(message, "quoted amount is smaller than estimated")
 }
 
 var _ executionport.Validator = (*Validator)(nil)

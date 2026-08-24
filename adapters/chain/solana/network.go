@@ -577,29 +577,51 @@ func (n *ReadOnlyNetwork) ConfirmedPayerDebit(
 	ctx context.Context,
 	signature string,
 ) (uint64, error) {
-	transaction, err := n.ReadTransaction(ctx, signature)
+	networkFee, additionalDebit, err := n.ConfirmedPayerDebits(ctx, signature)
 	if err != nil {
 		return 0, err
 	}
+	if additionalDebit > ^uint64(0)-networkFee {
+		return 0, fmt.Errorf("solana calibration payer debit overflows uint64")
+	}
+	return networkFee + additionalDebit, nil
+}
+
+// ConfirmedPayerDebits separates the protocol transaction fee from every
+// other lamport debit paid by the source account. Across uses the latter for
+// native protocol/account costs that getFeeForMessage does not report.
+func (n *ReadOnlyNetwork) ConfirmedPayerDebits(
+	ctx context.Context,
+	signature string,
+) (networkFee, additionalDebit uint64, err error) {
+	transaction, err := n.ReadTransaction(ctx, signature)
+	if err != nil {
+		return 0, 0, err
+	}
 	var metadata struct {
 		Err          json.RawMessage `json:"err"`
+		Fee          uint64          `json:"fee"`
 		PreBalances  []uint64        `json:"preBalances"`
 		PostBalances []uint64        `json:"postBalances"`
 	}
 	if err := json.Unmarshal(transaction.Meta, &metadata); err != nil {
-		return 0, fmt.Errorf("decode %s transaction balances: %w", n.label, err)
+		return 0, 0, fmt.Errorf("decode %s transaction balances: %w", n.label, err)
 	}
 	if len(metadata.Err) > 0 && string(metadata.Err) != "null" {
-		return 0, fmt.Errorf("solana calibration transaction failed")
+		return 0, 0, fmt.Errorf("solana calibration transaction failed")
 	}
 	if len(metadata.PreBalances) == 0 ||
 		len(metadata.PreBalances) != len(metadata.PostBalances) {
-		return 0, fmt.Errorf("solana calibration transaction has no payer balances")
+		return 0, 0, fmt.Errorf("solana calibration transaction has no payer balances")
 	}
 	if metadata.PostBalances[0] >= metadata.PreBalances[0] {
-		return 0, nil
+		return metadata.Fee, 0, nil
 	}
-	return metadata.PreBalances[0] - metadata.PostBalances[0], nil
+	total := metadata.PreBalances[0] - metadata.PostBalances[0]
+	if total > metadata.Fee {
+		additionalDebit = total - metadata.Fee
+	}
+	return metadata.Fee, additionalDebit, nil
 }
 
 type jsonAccountValue struct {

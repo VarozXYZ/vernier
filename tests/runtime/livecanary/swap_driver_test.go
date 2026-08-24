@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,9 +50,43 @@ func (v *rebuildingValidator) Validate(
 }
 
 type durableJournal struct {
-	prepared bool
-	phases   []string
-	marked   []string
+	mu        sync.Mutex
+	prepared  bool
+	phases    []string
+	marked    []string
+	decisions []executionport.TriggerFirstDecision
+}
+
+type recoveryAttemptJournal struct {
+	attempts []executionport.SequentialRecoveryAttempt
+}
+
+func (*recoveryAttemptJournal) CreateRecoverableSequentialOperation(
+	context.Context, execution.SequentialOperation, execution.SequentialPlan,
+) error {
+	return nil
+}
+func (*recoveryAttemptJournal) LoadSequentialRecovery(
+	context.Context, execution.OperationID,
+) (executionport.SequentialRecoverySnapshot, error) {
+	return executionport.SequentialRecoverySnapshot{}, nil
+}
+func (*recoveryAttemptJournal) SetSequentialRecoveryState(
+	context.Context, execution.OperationID, execution.SequentialOperationState, error,
+) error {
+	return nil
+}
+func (j *recoveryAttemptJournal) RecordSequentialRecoveryAttempt(
+	_ context.Context, attempt executionport.SequentialRecoveryAttempt,
+) error {
+	j.attempts = append(j.attempts, attempt)
+	return nil
+}
+
+func (j *durableJournal) RecordTriggerFirstDecision(_ context.Context,
+	decision executionport.TriggerFirstDecision) error {
+	j.decisions = append(j.decisions, decision)
+	return nil
 }
 
 func (*durableJournal) CreateSequentialOperation(context.Context, execution.SequentialOperation) error {
@@ -64,7 +100,20 @@ func (j *durableJournal) RecordPreparedTransaction(
 	j.phases = append(j.phases, transaction.Phase)
 	return nil
 }
+func (j *durableJournal) RecordPreparedTransactions(
+	ctx context.Context,
+	transactions []executionport.PreparedTransaction,
+) error {
+	for _, transaction := range transactions {
+		if err := j.RecordPreparedTransaction(ctx, transaction); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (j *durableJournal) MarkTransaction(_ context.Context, _ execution.OperationID, _ int, _, status string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	j.marked = append(j.marked, status)
 	return nil
 }
@@ -86,11 +135,82 @@ type settledTxManager struct {
 	simulations     int
 	simulationErr   error
 	simulationErrs  []error
+	economicErrs    []error
 	actualOutput    market.TokenAmount
 	preparedInput   market.TokenAmount
 	reconciliation  *execution.Settlement
 	reconcileDelay  time.Duration
 	reconciliations atomic.Int32
+}
+
+type nonceRetryTxManager struct {
+	nonce        uint64
+	prepareCalls int
+	broadcasts   int
+	resyncs      int
+	actualOutput market.TokenAmount
+}
+
+func (*nonceRetryTxManager) Account() execution.AccountID { return "account" }
+func (*nonceRetryTxManager) Warm(context.Context) error   { return nil }
+func (m *nonceRetryTxManager) NextNonce() (uint64, error) { return m.nonce, nil }
+func (m *nonceRetryTxManager) MarkNonceUsed(nonce uint64) {
+	if nonce >= m.nonce {
+		m.nonce = nonce + 1
+	}
+}
+func (m *nonceRetryTxManager) ResyncNonce(_ context.Context, rejected uint64) (uint64, error) {
+	m.resyncs++
+	m.nonce = rejected + 2
+	return m.nonce, nil
+}
+func (m *nonceRetryTxManager) Prepare(
+	_ context.Context, artifact executionport.Artifact,
+) (chainport.PreparedTransaction, error) {
+	m.prepareCalls++
+	nonce := m.nonce
+	return chainport.PreparedTransaction{
+		Leg: artifact.Leg,
+		Identity: execution.TransactionIdentity{
+			Chain: artifact.Leg.Chain, Account: artifact.Leg.Account,
+			Hash: "transaction-" + strconv.Itoa(m.prepareCalls), Nonce: &nonce,
+		},
+		PreparedAt: time.Now(),
+	}, nil
+}
+func (*nonceRetryTxManager) SimulatePrepared(context.Context, chainport.PreparedTransaction) error {
+	return nil
+}
+func (m *nonceRetryTxManager) SimulatePreparedEconomic(
+	_ context.Context, request chainport.EconomicSimulationRequest,
+) (chainport.EconomicSimulationResult, error) {
+	return chainport.EconomicSimulationResult{
+		Input: request.Prepared.Leg.Input, Output: m.actualOutput,
+		ContextVersion: request.BalanceVersion, Evidence: "nonce-retry-simulation",
+	}, nil
+}
+func (m *nonceRetryTxManager) Broadcast(
+	_ context.Context, prepared chainport.PreparedTransaction,
+) (chainport.BroadcastResult, error) {
+	m.broadcasts++
+	if m.broadcasts == 1 {
+		return chainport.BroadcastResult{
+			Identity: prepared.Identity, Disposition: chainport.BroadcastRejected, Attempts: 2,
+		}, &chainport.AllFanoutNonceTooLowError{Nonce: *prepared.Identity.Nonce, Attempts: 2}
+	}
+	return chainport.BroadcastResult{
+		Identity: prepared.Identity, Disposition: chainport.BroadcastAccepted,
+		Accepted: true, Endpoint: "fresh-fanout", Attempts: 1,
+	}, nil
+}
+func (m *nonceRetryTxManager) Reconcile(
+	_ context.Context, step execution.OperationStep,
+) (execution.Settlement, error) {
+	return execution.Settlement{
+		Identity: step.Identity, Technical: execution.StateConfirmedSuccess,
+		Economic: execution.EconomicEffectVerified, ActualIn: step.Leg.Input,
+		ActualOut: m.actualOutput, ObservedAt: time.Now(), Evidence: "test-receipt",
+	}, nil
 }
 
 func (*settledTxManager) Account() execution.AccountID { return "account" }
@@ -133,6 +253,13 @@ func (m *settledTxManager) SimulatePreparedEconomic(
 	request chainport.EconomicSimulationRequest,
 ) (chainport.EconomicSimulationResult, error) {
 	m.simulations++
+	if len(m.economicErrs) > 0 {
+		err := m.economicErrs[0]
+		m.economicErrs = m.economicErrs[1:]
+		if err != nil {
+			return chainport.EconomicSimulationResult{}, err
+		}
+	}
 	if m.simulationErr != nil {
 		return chainport.EconomicSimulationResult{}, m.simulationErr
 	}
@@ -228,6 +355,38 @@ type fixedOutputValidator struct {
 	calls     int
 	inputs    []market.TokenAmount
 	slippages []*executionport.SlippageConstraint
+}
+
+type fixedFloorOutputValidator struct {
+	fixedOutputValidator
+	bps uint16
+}
+
+func (v *fixedFloorOutputValidator) Validate(ctx context.Context,
+	request executionport.ValidationRequest) (executionport.Artifact, error) {
+	artifact, err := v.fixedOutputValidator.Validate(ctx, request)
+	if err != nil {
+		return executionport.Artifact{}, err
+	}
+	if request.Slippage == nil {
+		minimum := ceilTestMulDiv(
+			artifact.ValidatedQuote.AmountOut.Units(),
+			big.NewInt(int64(10_000-v.bps)),
+			big.NewInt(10_000),
+		)
+		artifact.Metadata["slippage_bps"] = strconv.FormatUint(uint64(v.bps), 10)
+		artifact.Metadata["minimum_output_units"] = minimum.String()
+	}
+	return artifact, nil
+}
+
+func ceilTestMulDiv(value, numerator, denominator *big.Int) *big.Int {
+	product := new(big.Int).Mul(value, numerator)
+	quotient, remainder := new(big.Int).QuoRem(product, denominator, new(big.Int))
+	if remainder.Sign() != 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	return quotient
 }
 
 type recordingSellPreflight struct {
@@ -344,6 +503,7 @@ func (v *retryingValidator) Validate(
 type fixedQuoteEstimator struct {
 	output *big.Int
 	err    error
+	errs   []error
 	calls  atomic.Int32
 }
 
@@ -353,6 +513,13 @@ func (e *fixedQuoteEstimator) QuoteExactInput(
 	output market.TokenID,
 ) (market.TokenAmount, error) {
 	e.calls.Add(1)
+	if len(e.errs) > 0 {
+		err := e.errs[0]
+		e.errs = e.errs[1:]
+		if err != nil {
+			return market.TokenAmount{}, err
+		}
+	}
 	if e.err != nil {
 		return market.TokenAmount{}, e.err
 	}
@@ -393,10 +560,20 @@ func (v *fixedOutputValidator) Validate(
 		AmountOut:       output,
 		QuotedAt:        v.now,
 	})
+	allocation := execution.RouteAllocation{Input: request.Leg.Input, ExpectedOutput: output,
+		Groups: []execution.RouteGroup{{ID: "test", InputToken: request.Leg.Input.Token(), OutputToken: output.Token(),
+			Branches: []execution.RouteBranch{{Market: request.Leg.Market, PlannedInput: request.Leg.Input.Units(), ExpectedOutput: output.Units()}}}}}
+	metadata := map[string]string{"kind": "test"}
+	if request.Slippage != nil {
+		metadata["slippage_bps"] = new(big.Int).SetUint64(uint64(request.Slippage.BPS)).String()
+		metadata["minimum_output_units"] = request.Slippage.MinimumOutput.String()
+		for key, value := range request.Slippage.Evidence {
+			metadata["decision_"+key] = value
+		}
+	}
 	return executionport.Artifact{
-		Leg: request.Leg, ValidatedQuote: quote,
-		Metadata: map[string]string{"kind": "test"},
-		BuiltAt:  v.now,
+		Leg: request.Leg, ValidatedQuote: quote, Allocation: &allocation,
+		Metadata: metadata, BuiltAt: v.now,
 	}, nil
 }
 
@@ -1376,6 +1553,120 @@ func TestPrefundedRecoveryRetriesTransientOriginBuildBeforeComparison(t *testing
 	}
 }
 
+func TestSwapBroadcastAllNonceTooLowResyncsAndRebuildsFreshArtifactOnce(t *testing.T) {
+	now := time.Now().UTC()
+	plan := preflightPlan(t, now)
+	request := execution.SequentialStageRequest{
+		Operation: "operation-nonce-resync", Plan: plan.ID,
+		Stage: plan.Stages[0], Input: plan.InitialInput,
+	}
+	output := mustLiveAmount(t, request.Stage.OutputToken, "4000000000")
+	manager := &nonceRetryTxManager{nonce: 7, actualOutput: output}
+	initial := &fixedOutputValidator{now: now, output: output.Units()}
+	fresh := &fixedOutputValidator{now: now, output: output.Units()}
+	estimator := &fixedQuoteEstimator{output: output.Units()}
+	journal := &durableJournal{}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			request.Stage.Market: {
+				Account: "account", Validator: initial, RecoveryValidator: fresh,
+				Estimator: estimator, TxManager: manager, NonceCoordinator: manager,
+				BalanceSnapshot: func(market.TokenID) (*big.Int, uint64, error) {
+					return new(big.Int), 1, nil
+				},
+			},
+		},
+		Clock: func() time.Time { return now },
+	}
+	settlement, err := driver.ExecuteStage(context.Background(), request, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settlement.ActualOutput.Units().Cmp(output.Units()) != 0 ||
+		manager.broadcasts != 2 || manager.resyncs != 1 || manager.prepareCalls != 2 ||
+		initial.calls != 1 || fresh.calls != 1 || estimator.calls.Load() != 1 {
+		t.Fatalf("unexpected nonce rebuild settlement=%+v broadcasts=%d resyncs=%d prepares=%d validators=%d/%d quotes=%d",
+			settlement, manager.broadcasts, manager.resyncs, manager.prepareCalls,
+			initial.calls, fresh.calls, estimator.calls.Load())
+	}
+	if len(journal.phases) != 2 || journal.phases[0] == journal.phases[1] {
+		t.Fatalf("rebuilt identity was not durably versioned: phases=%v", journal.phases)
+	}
+}
+
+func TestHybridPrefundedRecoveryRetriesEntireQuoteBuildSimulationCycleAndPersistsFailures(t *testing.T) {
+	now := time.Now().UTC()
+	plan := prefundedPreflightPlan(t, now)
+	originEstimator := &fixedQuoteEstimator{
+		output: big.NewInt(1_020_000),
+		errs:   []error{errors.New("temporary quote failure")},
+	}
+	originValidator := &fixedOutputValidator{now: now, output: big.NewInt(1_020_000)}
+	originManager := &settledTxManager{
+		actualOutput: mustLiveAmount(t, "quote-a", "1020000"),
+		economicErrs: []error{errors.New("temporary simulation failure")},
+	}
+	destinationEstimator := &fixedQuoteEstimator{output: big.NewInt(1_010_000)}
+	destinationValidator := &fixedOutputValidator{now: now, output: big.NewInt(1_010_000)}
+	destinationManager := &settledTxManager{actualOutput: mustLiveAmount(t, "quote-b", "1010000")}
+	recoveryJournal := &recoveryAttemptJournal{}
+	zeroCost, _ := market.NewAssetQuantity("quote", new(big.Rat))
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": {
+				Account: "account", Validator: originValidator,
+				RecoveryValidator: originValidator, Estimator: originEstimator,
+				TxManager: originManager,
+				BalanceSnapshot: func(market.TokenID) (*big.Int, uint64, error) {
+					return new(big.Int), 1, nil
+				},
+			},
+			"market-b": {
+				Account: "account", Validator: destinationValidator,
+				RecoveryValidator: destinationValidator, Estimator: destinationEstimator,
+				TxManager: destinationManager,
+				BalanceSnapshot: func(market.TokenID) (*big.Int, uint64, error) {
+					return new(big.Int), 1, nil
+				},
+			},
+		},
+		TokenDecimals: map[market.TokenID]uint8{
+			"quote-a": 6, "base-a": 9, "base-b": 18, "quote-b": 6,
+		},
+		BridgePrecision: 8, QuoteAsset: "quote",
+		ExitCosts: fixedExitCostSource{costs: map[execution.SequentialExitRoute]market.AssetQuantity{
+			execution.ExitSellAtDestination: zeroCost,
+			execution.ExitSellAtOrigin:      zeroCost,
+		}},
+		ExitValidationAttempts: 3, ExitValidationRetryDelay: time.Nanosecond,
+		Clock: func() time.Time { return now }, RecoveryJournal: recoveryJournal,
+	}
+	bought, _ := market.NewTokenAmount("base-a", big.NewInt(4_836_579_243))
+	decision, err := driver.SelectPrefundedRecoveryExit(
+		context.Background(), "operation", plan, bought, nil,
+		errors.New("safe destination failure"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Route != execution.ExitSellAtOrigin {
+		t.Fatalf("decision=%+v; want origin", decision)
+	}
+	if originEstimator.calls.Load() != 3 || originValidator.calls != 2 || originManager.simulations != 2 {
+		t.Fatalf("full-cycle calls quote/build/simulation=%d/%d/%d; want 3/2/2",
+			originEstimator.calls.Load(), originValidator.calls, originManager.simulations)
+	}
+	if len(recoveryJournal.attempts) != 2 {
+		t.Fatalf("persisted attempts=%d; want 2", len(recoveryJournal.attempts))
+	}
+	if !strings.HasSuffix(recoveryJournal.attempts[0].Action, "_quote") ||
+		!strings.HasSuffix(recoveryJournal.attempts[1].Action, "_simulation") ||
+		!strings.Contains(recoveryJournal.attempts[0].Detail, "temporary quote failure") ||
+		!strings.Contains(recoveryJournal.attempts[1].Detail, "temporary simulation failure") {
+		t.Fatalf("unexpected durable attempts: %+v", recoveryJournal.attempts)
+	}
+}
+
 func TestSwapDriverKeepsFreshProfitableDestinationExitAndReusesIt(t *testing.T) {
 	now := time.Now().UTC()
 	plan := preflightPlan(t, now)
@@ -1898,6 +2189,490 @@ func TestPrefundedParallelPreflightUsesFixedIndependentInputsAndJointPnL(t *test
 	driver.DiscardPreflight("operation-parallel")
 }
 
+func TestPrefundedParallelExpiredSignatureIsRejectedWithoutFalseRevert(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	journal := &durableJournal{}
+	buyOutput := mustLiveAmount(t, "base-a", "2010000000")
+	sellOutput := mustLiveAmount(t, "quote-b", "501500000")
+	buyManager := &settledTxManager{
+		journal: journal, actualOutput: buyOutput,
+	}
+	sellManager := &settledTxManager{
+		journal: journal, actualOutput: sellOutput,
+		reconciliation: &execution.Settlement{
+			Technical:  execution.StateBroadcastRejected,
+			Economic:   execution.EconomicReserved,
+			ObservedAt: now,
+			Evidence:   "blockhash_expired_without_signature",
+		},
+	}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": parallelBinding(
+				&fixedOutputValidator{now: now, output: buyOutput.Units()},
+				buyManager,
+			),
+			"market-b": parallelBinding(
+				&fixedOutputValidator{now: now, output: sellOutput.Units()},
+				sellManager,
+			),
+		},
+		TokenDecimals: plan.TokenDecimals,
+		BaseAsset:     "base",
+		QuoteAsset:    "usdc",
+		MinimumNet:    big.NewRat(1, 1),
+		Clock:         func() time.Time { return now },
+	}
+	const operation = execution.OperationID("operation-expired-sell")
+	if err := driver.Preflight(context.Background(), operation, plan); err != nil {
+		t.Fatal(err)
+	}
+	settlements, err := driver.ExecuteParallelSwaps(
+		context.Background(), operation, plan, journal,
+	)
+	if err == nil {
+		t.Fatal("expired parallel signature unexpectedly settled")
+	}
+	if executionport.ErrorDisposition(err) != executionport.DispositionRejected {
+		t.Fatalf("disposition=%s error=%v", executionport.ErrorDisposition(err), err)
+	}
+	if len(settlements) != 1 || settlements[0].Request.Stage.Ordinal != 1 {
+		t.Fatalf("settlements=%+v", settlements)
+	}
+	markedRejected := false
+	for _, status := range journal.marked {
+		if status == "confirmed_revert" {
+			t.Fatalf("expired signature was marked as revert: %v", journal.marked)
+		}
+		if status == "rejected" {
+			markedRejected = true
+		}
+	}
+	if !markedRejected {
+		t.Fatalf("expired signature was not marked rejected: %v", journal.marked)
+	}
+}
+
+func TestLocalTriggeredExecutionConfirmsLocalBeforeFreshRemoteBroadcast(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-a/hop/0", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	candidate.BuyQuote.Market = "market-a"
+	candidate.BuyQuote.AmountIn = plan.InitialInput
+	sellInput, err := plan.ParallelSellInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.SellQuote.Market = "market-b"
+	candidate.SellQuote.AmountIn = sellInput
+	plan.Opportunity.Candidates[0] = candidate
+	journal := &durableJournal{}
+	localManager := &settledTxManager{journal: journal, actualOutput: mustLiveAmount(t, "base-a", "2010000000")}
+	remoteManager := &settledTxManager{journal: journal, actualOutput: mustLiveAmount(t, "quote-b", "501500000")}
+	localValidator := &fixedOutputValidator{now: now, output: big.NewInt(2_010_000_000)}
+	retainedRemote := &fixedOutputValidator{now: now, output: big.NewInt(501_500_000)}
+	freshRemote := &fixedOutputValidator{now: now, output: big.NewInt(501_500_000)}
+	localBinding := parallelBinding(localValidator, localManager)
+	localBinding.TrustValidatedQuote = true
+	remoteBinding := parallelBinding(retainedRemote, remoteManager)
+	remoteBinding.RecoveryValidator = freshRemote
+	driver := &livecanary.SwapDriver{Bindings: map[market.MarketID]livecanary.SwapBinding{
+		"market-a": localBinding, "market-b": remoteBinding,
+	}, TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc", Clock: func() time.Time { return now }}
+	if err := driver.Preflight(context.Background(), "operation-staged", plan); err != nil {
+		t.Fatal(err)
+	}
+	if retainedRemote.calls != 0 || freshRemote.calls != 0 || localManager.simulations != 0 {
+		t.Fatalf("hot preflight touched remote or simulated local: retained=%d fresh=%d local_sim=%d", retainedRemote.calls, freshRemote.calls, localManager.simulations)
+	}
+	settlements, err := driver.ExecuteTriggeredSwaps(context.Background(), "operation-staged", plan, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settlements) != 2 || localManager.broadcasts != 1 || remoteManager.broadcasts != 1 || freshRemote.calls != 1 || retainedRemote.calls != 0 {
+		t.Fatalf("settlements=%d broadcasts=%d/%d validators=%d/%d", len(settlements), localManager.broadcasts, remoteManager.broadcasts, freshRemote.calls, retainedRemote.calls)
+	}
+}
+
+func TestTriggerFirstDynamicFloorReservesExactlyOneQuarterOfExpectedNet(t *testing.T) {
+	for _, netText := range []string{"0.10", "1", "5", "20", "100"} {
+		t.Run(netText, func(t *testing.T) {
+			now := time.Now().UTC()
+			plan := parallelPreflightPlan(t, now)
+			plan.Policy = execution.PolicyPrefundedTriggerFirst
+			plan.Opportunity.HasTrigger = true
+			plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-a/hop/0", At: now}
+			candidate := plan.Opportunity.Candidates[0]
+			candidate.BuyQuote.Market, candidate.BuyQuote.AmountIn = "market-a", plan.InitialInput
+			candidate.BuyQuote.AmountOut = mustLiveAmount(t, "base-a", "1000000000000")
+			sellInput, err := plan.ParallelSellInput()
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate.SellQuote.Market, candidate.SellQuote.AmountIn = "market-b", sellInput
+			candidate.NetPnL = mustLiveAsset(t, "usdc", netText)
+			valuation, err := arbitrage.NewValuationSnapshot(1, "base", "usdc", big.NewRat(1, 1), 1, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate.Valuation = &valuation
+			plan.Opportunity.Candidates[0] = candidate
+			localValidator := &fixedOutputValidator{now: now, output: candidate.BuyQuote.AmountOut.Units()}
+			localBinding := parallelBinding(localValidator, &settledTxManager{})
+			localBinding.TrustValidatedQuote = true
+			remoteBinding := parallelBinding(&fixedOutputValidator{now: now, output: candidate.SellQuote.AmountOut.Units()}, &settledTxManager{})
+			remoteBinding.TrustValidatedQuote = true
+			remoteBinding.RecoveryValidator = &fixedOutputValidator{now: now, output: candidate.SellQuote.AmountOut.Units()}
+			driver := &livecanary.SwapDriver{Bindings: map[market.MarketID]livecanary.SwapBinding{
+				"market-a": localBinding, "market-b": remoteBinding}, TokenDecimals: plan.TokenDecimals,
+				BaseAsset: "base", QuoteAsset: "usdc", DynamicSlippage: livecanary.DynamicSlippagePolicy{
+					Enabled: true, MaxBPS: 500, HeadroomBPS: 2_500}, Clock: func() time.Time { return now }}
+			operationID := execution.OperationID("trigger-first-" + netText)
+			if err := driver.Preflight(context.Background(), operationID, plan); err != nil {
+				t.Fatal(err)
+			}
+			if len(localValidator.slippages) != 1 || localValidator.slippages[0] == nil {
+				t.Fatalf("missing trigger-first slippage evidence: %+v", localValidator.slippages)
+			}
+			constraint := localValidator.slippages[0]
+			net, _ := new(big.Rat).SetString(netText)
+			reserved := new(big.Rat).Quo(new(big.Rat).Set(net), big.NewRat(4, 1))
+			budget := new(big.Rat).Mul(new(big.Rat).Set(net), big.NewRat(3, 4))
+			if constraint.Evidence["reserved_headroom"] != reserved.RatString() ||
+				constraint.Evidence["consumable_budget"] != budget.RatString() {
+				t.Fatalf("unexpected 75/25 evidence: %+v", constraint.Evidence)
+			}
+			if constraint.BPS > 500 || constraint.Evidence["max_bps"] != "500" {
+				t.Fatalf("trigger-first percentage cap was not enforced: %+v", constraint)
+			}
+			if netText == "100" {
+				if constraint.BPS != 500 || constraint.Evidence["limiting_bound"] != "percentage_cap" {
+					t.Fatalf("percentage cap did not override the wider economic budget: %+v", constraint)
+				}
+			} else if constraint.Evidence["limiting_bound"] != "economic_budget" {
+				t.Fatalf("economic budget should be the tighter bound: %+v", constraint)
+			}
+			driver.DiscardPreflight(operationID)
+		})
+	}
+}
+
+func TestForcedTriggerFirstCanaryUsesConfiguredFixedSlippage(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Policy = execution.PolicyPrefundedTriggerFirst
+	plan.Opportunity.Reasons = []string{"forced_canary_direction"}
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-a/hop/0", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	candidate.BuyQuote.Market, candidate.BuyQuote.AmountIn = "market-a", plan.InitialInput
+	sellInput, err := plan.ParallelSellInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.SellQuote.Market, candidate.SellQuote.AmountIn = "market-b", sellInput
+	candidate.NetPnL = mustLiveAsset(t, "usdc", "-0.10")
+	plan.Opportunity.Candidates[0] = candidate
+	localValidator := &fixedFloorOutputValidator{fixedOutputValidator: fixedOutputValidator{
+		now: now, output: candidate.BuyQuote.AmountOut.Units(),
+	}, bps: 100}
+	remoteValidator := &fixedOutputValidator{now: now, output: candidate.SellQuote.AmountOut.Units()}
+	journal := &durableJournal{}
+	localManager := &settledTxManager{journal: journal, actualOutput: candidate.BuyQuote.AmountOut}
+	remoteManager := &settledTxManager{journal: journal, actualOutput: candidate.SellQuote.AmountOut}
+	localBinding := parallelBinding(localValidator, localManager)
+	localBinding.TrustValidatedQuote = true
+	remoteBinding := parallelBinding(remoteValidator, remoteManager)
+	remoteBinding.TrustValidatedQuote = true
+	remoteBinding.RecoveryValidator = remoteValidator
+	driver := &livecanary.SwapDriver{Bindings: map[market.MarketID]livecanary.SwapBinding{
+		"market-a": localBinding, "market-b": remoteBinding,
+	}, TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc",
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{
+			Enabled: true, MaxBPS: 500, HeadroomBPS: 2_500,
+		}, Clock: func() time.Time { return now }}
+	if err := driver.Preflight(context.Background(), "forced-trigger-first", plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(localValidator.slippages) != 1 || localValidator.slippages[0] != nil {
+		t.Fatalf("forced trigger-first used dynamic slippage: %+v", localValidator.slippages)
+	}
+	settlements, err := driver.ExecuteTriggeredSwaps(
+		context.Background(), "forced-trigger-first", plan, journal,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settlements) != 2 || localManager.broadcasts != 1 || remoteManager.broadcasts != 1 {
+		t.Fatalf("forced trigger-first did not execute both swaps: settlements=%d broadcasts=%d/%d",
+			len(settlements), localManager.broadcasts, remoteManager.broadcasts)
+	}
+	if len(journal.decisions) != 1 ||
+		journal.decisions[0].Kind != executionport.TriggerFirstDecisionForcedFixed ||
+		journal.decisions[0].ReservedHeadroom != "" ||
+		journal.decisions[0].ConsumableBudget != "" {
+		t.Fatalf("forced trigger-first decision evidence=%+v", journal.decisions)
+	}
+}
+
+func TestTriggerFirstUsesBSCStyleTriggerAsFirstConfirmedLeg(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Policy = execution.PolicyPrefundedTriggerFirst
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-b/pool/1", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	sellInput, err := plan.ParallelSellInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.BuyQuote.Market, candidate.BuyQuote.AmountIn = "market-a", plan.InitialInput
+	candidate.SellQuote.Market, candidate.SellQuote.AmountIn = "market-b", sellInput
+	candidate.NetPnL = mustLiveAsset(t, "usdc", "1.5")
+	valuation, _ := arbitrage.NewValuationSnapshot(1, "base", "usdc", big.NewRat(1, 1), 1, now)
+	candidate.Valuation = &valuation
+	plan.Opportunity.Candidates[0] = candidate
+	journal := &durableJournal{}
+	buyManager := &settledTxManager{journal: journal, actualOutput: candidate.BuyQuote.AmountOut}
+	sellManager := &settledTxManager{journal: journal, actualOutput: candidate.SellQuote.AmountOut}
+	buyValidator := &fixedOutputValidator{now: now, output: candidate.BuyQuote.AmountOut.Units()}
+	freshBuy := &fixedOutputValidator{now: now, output: candidate.BuyQuote.AmountOut.Units()}
+	sellValidator := &fixedOutputValidator{now: now, output: candidate.SellQuote.AmountOut.Units()}
+	buyBinding := parallelBinding(buyValidator, buyManager)
+	buyBinding.TrustValidatedQuote, buyBinding.RecoveryValidator = true, freshBuy
+	sellBinding := parallelBinding(sellValidator, sellManager)
+	sellBinding.TrustValidatedQuote, sellBinding.RecoveryValidator = true, sellValidator
+	driver := &livecanary.SwapDriver{Bindings: map[market.MarketID]livecanary.SwapBinding{
+		"market-a": buyBinding, "market-b": sellBinding}, TokenDecimals: plan.TokenDecimals,
+		BaseAsset: "base", QuoteAsset: "usdc", DynamicSlippage: livecanary.DynamicSlippagePolicy{
+			Enabled: true, HeadroomBPS: 2_500}, Clock: func() time.Time { return now }}
+	operation := execution.OperationID("trigger-first-b")
+	if err := driver.Preflight(context.Background(), operation, plan); err != nil {
+		t.Fatal(err)
+	}
+	if buyValidator.calls != 0 || sellValidator.calls != 1 || buyManager.simulations != 0 || sellManager.simulations != 0 {
+		t.Fatalf("preflight crossed the hot boundary: buy=%d sell=%d simulations=%d/%d",
+			buyValidator.calls, sellValidator.calls, buyManager.simulations, sellManager.simulations)
+	}
+	settlements, err := driver.ExecuteTriggeredSwaps(context.Background(), operation, plan, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settlements) != 2 || sellManager.broadcasts != 1 || buyManager.broadcasts != 1 ||
+		freshBuy.calls != 1 || len(journal.decisions) != 1 || journal.decisions[0].Ordinal != 2 {
+		t.Fatalf("unexpected trigger-first execution: settlements=%d broadcasts=%d/%d fresh=%d decisions=%+v",
+			len(settlements), sellManager.broadcasts, buyManager.broadcasts, freshBuy.calls, journal.decisions)
+	}
+}
+
+func TestLocalTriggeredSellValidatesBothLegsBeforeSimultaneousBroadcast(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-b/hop/0", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	candidate.BuyQuote.Market = "market-a"
+	candidate.BuyQuote.AmountIn = plan.InitialInput
+	candidate.BuyQuote.AmountOut = mustLiveAmount(t, "base-a", "508822000000")
+	candidate.SellQuote.Market = "market-b"
+	candidate.SellQuote.AmountIn = mustLiveAmount(t, "base-b", "508203000000000000000")
+	candidate.SellQuote.AmountOut = mustLiveAmount(t, "quote-b", "499713868")
+	candidate.GrossPnL = mustLiveAsset(t, "usdc", "0.322")
+	candidate.NetPnL = mustLiveAsset(t, "usdc", "0.172")
+	valuation, err := arbitrage.NewValuationSnapshot(1, "base", "usdc", big.NewRat(983, 1000), 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Valuation = &valuation
+	candidate.Cost = arbitrage.CostSnapshot{ID: "complete-flow", Amount: mustLiveAsset(t, "usdc", "0.15"), CapturedAt: now}
+	plan.Opportunity.Candidates[0] = candidate
+
+	journal := &durableJournal{}
+	remoteManager := &settledTxManager{journal: journal, actualOutput: candidate.BuyQuote.AmountOut}
+	localManager := &settledTxManager{journal: journal, actualOutput: candidate.SellQuote.AmountOut}
+	retainedRemote := &fixedOutputValidator{now: now, output: candidate.BuyQuote.AmountOut.Units()}
+	freshRemote := &fixedOutputValidator{now: now, output: candidate.BuyQuote.AmountOut.Units()}
+	localValidator := &fixedOutputValidator{now: now, output: candidate.SellQuote.AmountOut.Units()}
+	remoteBinding := parallelBinding(retainedRemote, remoteManager)
+	remoteBinding.RecoveryValidator = freshRemote
+	localBinding := parallelBinding(localValidator, localManager)
+	localBinding.TrustValidatedQuote = true
+	driver := &livecanary.SwapDriver{
+		Bindings:      map[market.MarketID]livecanary.SwapBinding{"market-a": remoteBinding, "market-b": localBinding},
+		TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc", MinimumNet: big.NewRat(1, 10),
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{Enabled: true, MaxBPS: 100},
+		Clock:           func() time.Time { return now },
+	}
+	if err = driver.Preflight(context.Background(), "operation-protected-sell", plan); err != nil {
+		t.Fatalf("complete prefunded economics rejected the local SELL path: %v", err)
+	}
+	if retainedRemote.calls != 0 || freshRemote.calls != 1 || localValidator.calls != 1 ||
+		remoteManager.simulations != 1 || localManager.simulations != 1 {
+		t.Fatalf("protected preflight did not validate both legs: retained=%d fresh=%d local=%d simulations=%d/%d",
+			retainedRemote.calls, freshRemote.calls, localValidator.calls, remoteManager.simulations, localManager.simulations)
+	}
+	settlements, err := driver.ExecuteParallelSwaps(context.Background(), "operation-protected-sell", plan, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settlements) != 2 || localManager.broadcasts != 1 || remoteManager.broadcasts != 1 || len(freshRemote.slippages) != 1 ||
+		freshRemote.slippages[0] == nil || freshRemote.slippages[0].Reason != "dynamic_prefunded_buy_budget" {
+		t.Fatalf("unexpected staged SELL execution: settlements=%d broadcasts=%d/%d slippage=%+v",
+			len(settlements), localManager.broadcasts, remoteManager.broadcasts, freshRemote.slippages)
+	}
+}
+
+func TestLocalTriggeredSellRejectsFreshRemoteDeteriorationBeforeEitherBroadcast(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-b/hop/0", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	candidate.BuyQuote.Market = "market-a"
+	candidate.BuyQuote.AmountIn = plan.InitialInput
+	candidate.BuyQuote.AmountOut = mustLiveAmount(t, "base-a", "485969070000")
+	candidate.SellQuote.Market = "market-b"
+	candidate.SellQuote.AmountIn = mustLiveAmount(t, "base-b", "486934000000000000000")
+	candidate.SellQuote.AmountOut = mustLiveAmount(t, "quote-b", "502758575")
+	candidate.GrossPnL = mustLiveAsset(t, "usdc", "2.908575")
+	candidate.NetPnL = mustLiveAsset(t, "usdc", "2.758575")
+	valuation, err := arbitrage.NewValuationSnapshot(1, "base", "usdc", big.NewRat(1035, 1000), 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Valuation = &valuation
+	candidate.Cost = arbitrage.CostSnapshot{ID: "complete-flow", Amount: mustLiveAsset(t, "usdc", "0.15"), CapturedAt: now}
+	plan.Opportunity.Candidates[0] = candidate
+
+	remoteManager := &settledTxManager{actualOutput: mustLiveAmount(t, "base-a", "482718000000")}
+	localManager := &settledTxManager{actualOutput: mustLiveAmount(t, "quote-b", "503442000")}
+	retainedRemote := &fixedOutputValidator{now: now, output: candidate.BuyQuote.AmountOut.Units()}
+	freshRemote := &fixedOutputValidator{now: now, output: big.NewInt(482_718_000_000)}
+	remoteBinding := parallelBinding(retainedRemote, remoteManager)
+	remoteBinding.RecoveryValidator = freshRemote
+	localBinding := parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(503_442_000)}, localManager)
+	localBinding.TrustValidatedQuote = true
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": remoteBinding,
+			"market-b": localBinding,
+		},
+		TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc",
+		MinimumNet: big.NewRat(1, 10), DynamicSlippage: livecanary.DynamicSlippagePolicy{Enabled: true, MaxBPS: 100},
+		Clock: func() time.Time { return now },
+	}
+	err = driver.Preflight(context.Background(), "operation-fresh-route-deteriorated", plan)
+	if err == nil {
+		t.Fatal("deteriorated fresh remote route unexpectedly qualified")
+	}
+	if retainedRemote.calls != 0 || freshRemote.calls != 1 || remoteManager.broadcasts != 0 || localManager.broadcasts != 0 {
+		t.Fatalf("deteriorated route crossed the safe boundary: retained=%d fresh=%d broadcasts=%d/%d",
+			retainedRemote.calls, freshRemote.calls, remoteManager.broadcasts, localManager.broadcasts)
+	}
+}
+
+func TestLocalTriggeredSellRejectsInvalidRemoteBuyBudgetBeforeLocalPreparation(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-b/hop/0", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	candidate.BuyQuote.AmountIn = plan.InitialInput
+	candidate.NetPnL = mustLiveAsset(t, "usdc", "0.05")
+	valuation, err := arbitrage.NewValuationSnapshot(1, "base", "usdc", big.NewRat(1, 1), 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Valuation = &valuation
+	plan.Opportunity.Candidates[0] = candidate
+	localValidator := &fixedOutputValidator{now: now, output: big.NewInt(1)}
+	localManager := &settledTxManager{}
+	localBinding := parallelBinding(localValidator, localManager)
+	localBinding.TrustValidatedQuote = true
+	remoteBinding := parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(1)}, &settledTxManager{})
+	remoteBinding.RecoveryValidator = &fixedOutputValidator{now: now, output: big.NewInt(1)}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": remoteBinding,
+			"market-b": localBinding,
+		},
+		TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc", MinimumNet: big.NewRat(1, 10),
+		DynamicSlippage: livecanary.DynamicSlippagePolicy{Enabled: true, MaxBPS: 100}, Clock: func() time.Time { return now },
+	}
+	err = driver.Preflight(context.Background(), "operation-invalid-budget", plan)
+	if err == nil || localManager.broadcasts != 0 {
+		t.Fatalf("invalid remote budget crossed the broadcast boundary: error=%v broadcasts=%d", err, localManager.broadcasts)
+	}
+}
+
+func TestLocalTriggeredFailureNeverBroadcastsRemoteLeg(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-a/hop/0", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	candidate.BuyQuote.Market, candidate.BuyQuote.AmountIn = "market-a", plan.InitialInput
+	sellInput, err := plan.ParallelSellInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.SellQuote.Market, candidate.SellQuote.AmountIn = "market-b", sellInput
+	plan.Opportunity.Candidates[0] = candidate
+	journal := &durableJournal{}
+	localManager := &settledTxManager{journal: journal, actualOutput: mustLiveAmount(t, "base-a", "2010000000"), reconciliation: &execution.Settlement{
+		Technical: execution.StateConfirmedRevert, Economic: execution.EconomicReleased, ObservedAt: now, Evidence: "test-revert",
+	}}
+	remoteManager := &settledTxManager{journal: journal, actualOutput: mustLiveAmount(t, "quote-b", "501500000")}
+	localBinding := parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(2_010_000_000)}, localManager)
+	localBinding.TrustValidatedQuote = true
+	remoteBinding := parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(501_500_000)}, remoteManager)
+	remoteBinding.RecoveryValidator = &fixedOutputValidator{now: now, output: big.NewInt(501_500_000)}
+	driver := &livecanary.SwapDriver{Bindings: map[market.MarketID]livecanary.SwapBinding{"market-a": localBinding, "market-b": remoteBinding},
+		TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc", Clock: func() time.Time { return now }}
+	if err = driver.Preflight(context.Background(), "operation-local-revert", plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = driver.ExecuteTriggeredSwaps(context.Background(), "operation-local-revert", plan, journal); err == nil {
+		t.Fatal("local revert unexpectedly completed")
+	}
+	if localManager.broadcasts != 1 || remoteManager.broadcasts != 0 {
+		t.Fatalf("broadcasts local=%d remote=%d", localManager.broadcasts, remoteManager.broadcasts)
+	}
+}
+
+func TestRemoteTriggeredPreflightSimulatesBothLegs(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-b", At: now}
+	candidate := plan.Opportunity.Candidates[0]
+	candidate.BuyQuote.Market, candidate.BuyQuote.AmountIn = "market-a", plan.InitialInput
+	sellInput, err := plan.ParallelSellInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.SellQuote.Market, candidate.SellQuote.AmountIn = "market-b", sellInput
+	plan.Opportunity.Candidates[0] = candidate
+	localManager := &settledTxManager{actualOutput: mustLiveAmount(t, "base-a", "2010000000")}
+	remoteManager := &settledTxManager{actualOutput: mustLiveAmount(t, "quote-b", "501500000")}
+	localBinding := parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(2_010_000_000)}, localManager)
+	localBinding.TrustValidatedQuote = true
+	driver := &livecanary.SwapDriver{Bindings: map[market.MarketID]livecanary.SwapBinding{
+		"market-a": localBinding,
+		"market-b": parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(501_500_000)}, remoteManager),
+	}, TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc", Clock: func() time.Time { return now }}
+	if err = driver.Preflight(context.Background(), "operation-remote-trigger", plan); err != nil {
+		t.Fatal(err)
+	}
+	if localManager.simulations != 1 || remoteManager.simulations != 1 {
+		t.Fatalf("simulations local=%d remote=%d", localManager.simulations, remoteManager.simulations)
+	}
+	driver.DiscardPreflight("operation-remote-trigger")
+}
+
 func TestPrefundedParallelPreflightRejectsCombinedSimulationDeterioration(t *testing.T) {
 	now := time.Now().UTC()
 	plan := parallelPreflightPlan(t, now)
@@ -1922,6 +2697,26 @@ func TestPrefundedParallelPreflightRejectsCombinedSimulationDeterioration(t *tes
 	}
 }
 
+func TestForcedPrefundedParallelCannotBypassMaximumCompleteFlowCost(t *testing.T) {
+	now := time.Now().UTC()
+	plan := parallelPreflightPlan(t, now)
+	plan.Opportunity.Reasons = []string{"forced_canary_direction"}
+	driver := &livecanary.SwapDriver{
+		Bindings: map[market.MarketID]livecanary.SwapBinding{
+			"market-a": parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(2_010_000_000)},
+				&settledTxManager{actualOutput: mustLiveAmount(t, "base-a", "2010000000")}),
+			"market-b": parallelBinding(&fixedOutputValidator{now: now, output: big.NewInt(501_500_000)},
+				&settledTxManager{actualOutput: mustLiveAmount(t, "quote-b", "501500000")}),
+		},
+		TokenDecimals: plan.TokenDecimals, BaseAsset: "base", QuoteAsset: "usdc",
+		MinimumNet: big.NewRat(100, 1), MaximumCost: big.NewRat(1, 2), Clock: func() time.Time { return now },
+	}
+	err := driver.Preflight(context.Background(), "operation-forced-cost-cap", plan)
+	if err == nil || !strings.Contains(err.Error(), "complete-flow cost exceeds maximum") {
+		t.Fatalf("preflight error = %v", err)
+	}
+}
+
 func parallelBinding(
 	validator executionport.Validator,
 	manager chainport.TxManager,
@@ -1931,6 +2726,28 @@ func parallelBinding(
 		BalanceSnapshot: func(market.TokenID) (*big.Int, uint64, error) {
 			return new(big.Int), 1, nil
 		},
+	}
+}
+
+func TestHybridStagedExecutionIsSelectedOnlyForLocalTrigger(t *testing.T) {
+	plan := parallelPreflightPlan(t, time.Now().UTC())
+	driver := &livecanary.SwapDriver{Bindings: map[market.MarketID]livecanary.SwapBinding{
+		"market-a": {TrustValidatedQuote: true},
+		"market-b": {},
+	}}
+	plan.Opportunity.HasTrigger = true
+	plan.Opportunity.Trigger = arbitrage.TriggerMetadata{Market: "market-a/hop/0", At: time.Now().UTC()}
+	if !driver.StagedFor(plan) {
+		t.Fatal("local trigger did not select staged execution")
+	}
+	plan.Opportunity.Trigger.Market = "market-b"
+	if driver.StagedFor(plan) {
+		t.Fatal("remote trigger selected staged execution")
+	}
+	plan.Opportunity.Trigger.Market = "market-b/hop/0"
+	driver.Bindings["market-b"] = livecanary.SwapBinding{TrustValidatedQuote: true}
+	if driver.StagedFor(plan) {
+		t.Fatal("local SELL trigger selected staged execution")
 	}
 }
 

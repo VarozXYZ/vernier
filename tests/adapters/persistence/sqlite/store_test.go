@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,7 +128,7 @@ func TestStoreMigratesV1WindowsToPersistAppliedThreshold(t *testing.T) {
 	if err := db.QueryRow("SELECT threshold_asset, threshold_value FROM opportunity_windows").Scan(&asset, &value); err != nil {
 		t.Fatal(err)
 	}
-	if version != 8 || asset != "QUOTE" || value != "0" {
+	if version != 9 || asset != "QUOTE" || value != "0" {
 		t.Fatalf("migration result: version=%d threshold=%s/%s", version, asset, value)
 	}
 }
@@ -178,9 +179,59 @@ func TestStoreFinalizesDanglingWindowsWithoutRecoveryTables(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	expected := []string{"opportunity_tracking_points", "opportunity_tracking_windows", "opportunity_window_observations", "opportunity_windows", "simulation_legs", "simulation_rounds"}
+	expected := []string{"executable_validation_rounds", "opportunity_tracking_points", "opportunity_tracking_windows", "opportunity_window_observations", "opportunity_windows", "simulation_legs", "simulation_rounds"}
 	if !reflect.DeepEqual(tables, expected) {
 		t.Fatalf("unexpected durable tables: %v", tables)
+	}
+}
+
+func TestStorePersistsNormalizedExecutableValidationWithoutPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "validation.sqlite")
+	store, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	round := &arbitrage.ExecutableValidationRound{ID: "window-1/validation/1", WindowID: "window-1", PointSequence: 1,
+		Direction: arbitrage.Direction{BuyMarket: "synthetic-local", SellMarket: "synthetic-remote"}, Status: arbitrage.ValidationConfirmed,
+		RequestedAt: now, BuildFinishedAt: now.Add(time.Millisecond), SimulationFinishedAt: now.Add(2 * time.Millisecond), RecalculatedAt: now.Add(3 * time.Millisecond),
+		DiscoveryOutput: quantity(t, "QUOTE", "501"), BuildOutput: quantity(t, "QUOTE", "500.9"), DiscoveryNet: quantity(t, "QUOTE", "1"),
+		FinalNet: quantity(t, "QUOTE", "0.9"), Threshold: quantity(t, "QUOTE", "0.75"), RemoteMarket: "synthetic-remote", LocalMarket: "synthetic-local",
+		RouteHash: "aa", BuildHash: "bb", RouteHTTPStatus: 200, BuildHTTPStatus: 200, RouteDuration: time.Millisecond, BuildDuration: 2 * time.Millisecond, BuildAttempts: 1}
+	if err := store.RecordExecutableValidationRound(context.Background(), round); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var status, routeHash, buildHash, finalNet string
+	if err := db.QueryRow("SELECT status, route_hash, build_hash, final_net_value FROM executable_validation_rounds WHERE round_id = ?", round.ID).Scan(&status, &routeHash, &buildHash, &finalNet); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(arbitrage.ValidationConfirmed) || routeHash != "aa" || buildHash != "bb" || finalNet != "9/10" {
+		t.Fatalf("unexpected validation row: %s %s %s %s", status, routeHash, buildHash, finalNet)
+	}
+	rows, err := db.Query("PRAGMA table_info(executable_validation_rounds)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primary int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primary); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(name, "payload") || strings.Contains(name, "calldata") || strings.Contains(name, "raw") {
+			t.Fatalf("forbidden payload column %q", name)
+		}
 	}
 }
 

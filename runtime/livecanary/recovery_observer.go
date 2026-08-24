@@ -170,6 +170,41 @@ func (o *RecoveryObserver) RecoveryCompleted(
 	o.forget(result.Operation)
 }
 
+func (o *RecoveryObserver) RecoveryAborted(
+	operation execution.SequentialOperation,
+	result executionport.SequentialResult,
+	cause error,
+) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	snapshot, found := o.snapshots[result.Operation]
+	o.mu.Unlock()
+	if o.progress != nil && found {
+		o.progress.OperationFinished(
+			snapshot.Operation,
+			execution.SequentialAborted,
+			result,
+			cause,
+		)
+	}
+	if o.notifier != nil {
+		detail := "recovery proved that no economic effect occurred"
+		if cause != nil {
+			detail = cause.Error()
+		}
+		o.notifier.Notify(notificationport.LiveExecutionEvent{
+			Kind:       notificationport.LiveExecutionFailed,
+			Operation:  string(operation.ID),
+			State:      string(execution.SequentialAborted),
+			Detail:     detail,
+			OccurredAt: o.clock().UTC(),
+		})
+	}
+	o.forget(result.Operation)
+}
+
 func (o *RecoveryObserver) RecoveryBlocked(
 	operation execution.SequentialOperation,
 	cause error,

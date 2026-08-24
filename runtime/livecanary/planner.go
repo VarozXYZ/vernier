@@ -16,19 +16,22 @@ import (
 )
 
 type Planner struct {
-	MarketChains    map[market.MarketID]market.ChainID
-	ExecutionUnits  *big.Int
-	ExecutionPolicy execution.ExecutionPolicyKind
-	BaseAsset       market.AssetID
-	QuoteAsset      market.AssetID
-	TokenDecimals   map[market.TokenID]uint8
-	Clock           func() time.Time
+	MarketChains            map[market.MarketID]market.ChainID
+	ExecutionUnits          *big.Int
+	ExecutionAmount         *big.Rat
+	AllowedExecutionAmounts []*big.Rat
+	ExecutionPolicy         execution.ExecutionPolicyKind
+	BaseAsset               market.AssetID
+	QuoteAsset              market.AssetID
+	TokenDecimals           map[market.TokenID]uint8
+	Clock                   func() time.Time
 }
 
 func (p Planner) Plan(
 	opportunity arbitrage.Opportunity,
 ) (execution.SequentialPlan, error) {
-	if p.ExecutionUnits == nil || p.ExecutionUnits.Sign() <= 0 {
+	if (p.ExecutionUnits == nil || p.ExecutionUnits.Sign() <= 0) &&
+		(p.ExecutionAmount == nil || p.ExecutionAmount.Sign() <= 0) && len(p.AllowedExecutionAmounts) == 0 {
 		return execution.SequentialPlan{}, fmt.Errorf("positive Live execution units are required")
 	}
 	if opportunity.SelectedIndex < 0 ||
@@ -38,9 +41,34 @@ func (p Planner) Plan(
 	buyChain := p.MarketChains[opportunity.Direction.BuyMarket]
 	sellChain := p.MarketChains[opportunity.Direction.SellMarket]
 	candidate := opportunity.Candidates[opportunity.SelectedIndex]
+	units := p.ExecutionUnits
+	if len(p.AllowedExecutionAmounts) > 0 {
+		allowed := false
+		for _, amount := range p.AllowedExecutionAmounts {
+			if amount != nil && candidate.Input.Rat().Cmp(amount) == 0 {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return execution.SequentialPlan{}, fmt.Errorf("selected Live input is not in the configured execution grid")
+		}
+		units = candidate.BuyQuote.AmountIn.Units()
+	} else if p.ExecutionAmount != nil {
+		decimals, ok := p.TokenDecimals[candidate.BuyQuote.AmountIn.Token()]
+		if !ok {
+			return execution.SequentialPlan{}, fmt.Errorf("live execution token decimals are unavailable")
+		}
+		scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+		scaled := new(big.Rat).Mul(p.ExecutionAmount, new(big.Rat).SetInt(scale))
+		if !scaled.IsInt() {
+			return execution.SequentialPlan{}, fmt.Errorf("live execution amount exceeds token precision")
+		}
+		units = new(big.Int).Set(scaled.Num())
+	}
 	initial, err := market.NewTokenAmount(
 		candidate.BuyQuote.AmountIn.Token(),
-		p.ExecutionUnits,
+		units,
 	)
 	if err != nil {
 		return execution.SequentialPlan{}, err
@@ -64,7 +92,7 @@ func (p Planner) Plan(
 			execution.PlanID(id), opportunity, initial,
 			buyChain, sellChain, clock().UTC(),
 		)
-	case execution.PolicyPrefundedParallel:
+	case execution.PolicyPrefundedParallel, execution.PolicyPrefundedTriggerFirst:
 		plan, planErr := execution.NewPrefundedParallelPlan(
 			execution.PlanID(id), opportunity, initial,
 			buyChain, sellChain, clock().UTC(),
@@ -72,6 +100,7 @@ func (p Planner) Plan(
 		if planErr != nil {
 			return execution.SequentialPlan{}, planErr
 		}
+		plan.Policy = p.ExecutionPolicy
 		plan.BaseAsset, plan.QuoteAsset = p.BaseAsset, p.QuoteAsset
 		plan.TokenDecimals = make(map[market.TokenID]uint8, len(p.TokenDecimals))
 		for token, decimals := range p.TokenDecimals {

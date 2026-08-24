@@ -13,6 +13,7 @@ import (
 	domainexecution "github.com/VarozXYZ/vernier/domain/execution"
 	"github.com/VarozXYZ/vernier/domain/market"
 	executionport "github.com/VarozXYZ/vernier/ports/execution"
+	persistenceport "github.com/VarozXYZ/vernier/ports/persistence"
 
 	_ "modernc.org/sqlite"
 )
@@ -110,6 +111,49 @@ func TestSequentialLiveStoreAcknowledgesManualReconciliation(t *testing.T) {
 	}
 	if audit == "" {
 		t.Fatal("manual reconciliation audit note is empty")
+	}
+}
+
+func TestSequentialLiveStorePersistsNormalizedTriggerFirstDecision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "live.sqlite")
+	store, err := sqlitestore.OpenSequentialLive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	input, _ := market.NewTokenAmount("quote-a", big.NewInt(500_000_000))
+	operation := domainexecution.SequentialOperation{ID: "operation-decision", Plan: "plan-1",
+		OpportunityID: "opportunity-1", ConfigHash: "config", State: domainexecution.SequentialRunning,
+		CurrentAmount: input, StartedAt: now, UpdatedAt: now}
+	if err := store.CreateSequentialOperation(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	decision := executionport.TriggerFirstDecision{Operation: operation.ID, Ordinal: 1,
+		ExpectedNet: "4", ReservedHeadroom: "1", ConsumableBudget: "3",
+		MinimumOutputToken: "base-a", MinimumOutputUnits: "497000000000000000000",
+		EquivalentBPS: 60, AllocationHash: "synthetic-allocation-hash", DecidedAt: now}
+	if err := store.RecordTriggerFirstDecision(ctx, decision); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var kind, expected, reserved, budget, minimum, hash string
+	var bps int
+	if err := db.QueryRow(`SELECT decision_kind, expected_net, reserved_headroom, consumable_budget,
+		minimum_output_units, equivalent_slippage_bps, allocation_hash
+		FROM sequential_live_trigger_first_decisions WHERE operation_id=?`, operation.ID).
+		Scan(&kind, &expected, &reserved, &budget, &minimum, &bps, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if kind != string(executionport.TriggerFirstDecisionEconomic75_25) ||
+		expected != "4" || reserved != "1" || budget != "3" || bps != 60 ||
+		minimum != decision.MinimumOutputUnits || hash != decision.AllocationHash {
+		t.Fatalf("unexpected persisted decision: %s %s %s %s %s %d %s", kind, expected, reserved, budget, minimum, bps, hash)
 	}
 }
 
@@ -302,6 +346,136 @@ func TestSequentialLiveStorePersistsRealizedCostsAndPnL(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("cost count=%d", count)
+	}
+}
+
+func TestSequentialLiveStoreAcceptsLateAsyncQuoteSettlementAndAdjustsPnL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "async-quote-cost.sqlite")
+	store, err := sqlitestore.OpenSequentialLive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	quoteA := mustTokenAmount(t, "quote-a", 500_000_000)
+	baseA := mustTokenAmount(t, "base-a", 2_000_000_000)
+	baseB := mustTokenAmount(t, "base-b", 2_000_000_000_000_000_000)
+	quoteB := mustTokenBigAmount(t, "quote-b", "501000000000000000000")
+	returned := mustTokenAmount(t, "quote-a", 500_500_000)
+	inputValue, _ := market.NewAssetQuantity("quote", big.NewRat(500, 1))
+	outputValue, _ := market.NewAssetQuantity("quote", big.NewRat(501, 1))
+	zeroQuote, _ := market.NewAssetQuantity("quote", new(big.Rat))
+	opportunity := arbitrage.Opportunity{Evaluation: "parallel-evaluation", ConfigHash: "config",
+		Classification: arbitrage.ClassificationPolicyQualified,
+		Direction:      arbitrage.Direction{BuyMarket: "market-a", SellMarket: "market-b"}, SelectedIndex: 0,
+		Candidates: []arbitrage.Candidate{{Input: inputValue, Output: outputValue,
+			Cost:      arbitrage.CostSnapshot{ID: "cost", Amount: zeroQuote, CapturedAt: now},
+			BuyQuote:  market.Quote{AmountIn: quoteA, AmountOut: baseA},
+			SellQuote: market.Quote{AmountIn: baseB, AmountOut: quoteB}}}}
+	plan, err := domainexecution.NewPrefundedParallelPlan("parallel-plan", opportunity, quoteA, "chain-a", "chain-b", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Policy = domainexecution.PolicyPrefundedTriggerFirst
+	plan.BaseAsset, plan.QuoteAsset = "base", "quote"
+	plan.TokenDecimals = map[market.TokenID]uint8{"quote-a": 6, "quote-b": 18, "base-a": 9, "base-b": 18}
+	operation := domainexecution.SequentialOperation{ID: "parallel-operation", Plan: plan.ID,
+		OpportunityID: string(opportunity.Evaluation), ConfigHash: opportunity.ConfigHash,
+		State: domainexecution.SequentialRunning, CurrentAmount: quoteA, StartedAt: now, UpdatedAt: now}
+	if err := store.CreateRecoverableSequentialOperation(ctx, operation, plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, prepared := range []executionport.PreparedTransaction{
+		{Operation: operation.ID, Ordinal: 1, Phase: "swap", Identity: domainexecution.TransactionIdentity{Chain: "chain-a", Account: "account", Hash: "buy"}, PreparedAt: now},
+		{Operation: operation.ID, Ordinal: 2, Phase: "swap", Identity: domainexecution.TransactionIdentity{Chain: "chain-b", Account: "account", Hash: "sell"}, PreparedAt: now},
+		{Operation: operation.ID, Ordinal: 3, Phase: "wtt_source", Identity: domainexecution.TransactionIdentity{Chain: "chain-a", Account: "account", Hash: "bridge-source"}, PreparedAt: now},
+		{Operation: operation.ID, Ordinal: 3, Phase: "wtt_redeem", Identity: domainexecution.TransactionIdentity{Chain: "chain-b", Account: "account", Hash: "bridge-redeem"}, PreparedAt: now},
+	} {
+		if err := store.RecordPreparedTransaction(ctx, prepared); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkTransaction(ctx, prepared.Operation, prepared.Ordinal, prepared.Phase, "confirmed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settlements := []domainexecution.SequentialStageSettlement{
+		{Request: domainexecution.SequentialStageRequest{Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[0], Input: quoteA},
+			ActualInput: quoteA, ActualOutput: baseA, SourceIdentity: domainexecution.TransactionIdentity{Chain: "chain-a", Account: "account", Hash: "buy"}, ObservedAt: now.Add(time.Second), Evidence: "receipt"},
+		{Request: domainexecution.SequentialStageRequest{Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[1], Input: baseB},
+			ActualInput: baseB, ActualOutput: quoteB, SourceIdentity: domainexecution.TransactionIdentity{Chain: "chain-b", Account: "account", Hash: "sell"}, ObservedAt: now.Add(2 * time.Second), Evidence: "receipt"},
+		{Request: domainexecution.SequentialStageRequest{Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[2], Input: baseA},
+			ActualInput: baseA, ActualOutput: baseB, SourceIdentity: domainexecution.TransactionIdentity{Chain: "chain-a", Account: "account", Hash: "bridge-source"},
+			DestinationIdentity: &domainexecution.TransactionIdentity{Chain: "chain-b", Account: "account", Hash: "bridge-redeem"}, ObservedAt: now.Add(3 * time.Second), Evidence: "receipt"},
+	}
+	for _, settlement := range settlements {
+		if err := store.RecordStageSettlement(ctx, settlement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := persistenceport.QuoteRestorationJob{ID: "parallel-operation/quote-return", Operation: operation.ID,
+		State: "pending", SourceChain: "chain-b", DestinationChain: "chain-a", InputToken: "quote-b", OutputToken: "quote-a",
+		InputUnits: quoteB.Units(), CreatedAt: now, UpdatedAt: now}
+	if err := store.StartQuoteRestoration(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	result := executionport.SequentialResult{Operation: operation.ID, FinalAmount: quoteB, Settlements: settlements,
+		ExecutionCost: zeroQuote, ExternalCost: zeroQuote, RealizedGross: mustAssetQuantity(t, "quote", big.NewRat(2, 1)),
+		RealizedNetPnL: mustAssetQuantity(t, "quote", big.NewRat(2, 1)), QuoteDelta: zeroQuote,
+		BaseDelta: mustAssetQuantity(t, "base", new(big.Rat)), MarkedBase: zeroQuote, MarkPrice: big.NewRat(1, 1)}
+	if err := store.RecordSequentialResult(ctx, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishSequentialOperation(ctx, operation.ID, domainexecution.SequentialCompleted, nil); err != nil {
+		t.Fatal(err)
+	}
+	nonce := uint64(7)
+	if err := store.RecordPreparedTransaction(ctx, executionport.PreparedTransaction{Operation: operation.ID, Ordinal: 4,
+		Phase: "across_source", Identity: domainexecution.TransactionIdentity{Chain: "chain-b", Account: "account", Hash: "across-source", Nonce: &nonce}, PreparedAt: now.Add(4 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkTransaction(ctx, operation.ID, 4, "across_source", "confirmed"); err != nil {
+		t.Fatal(err)
+	}
+	spread := mustAssetQuantity(t, "quote", big.NewRat(1, 2))
+	native := mustAssetQuantity(t, "native-b", big.NewRat(1, 1000))
+	gasValue := mustAssetQuantity(t, "quote", big.NewRat(1, 10))
+	late := domainexecution.SequentialStageSettlement{Request: domainexecution.SequentialStageRequest{Operation: operation.ID, Plan: plan.ID, Stage: plan.Stages[3], Input: quoteB},
+		ActualInput: quoteB, ActualOutput: returned, SourceIdentity: domainexecution.TransactionIdentity{Chain: "chain-b", Account: "account", Hash: "across-source"},
+		DestinationIdentity: &domainexecution.TransactionIdentity{Chain: "chain-a", Account: "account", Hash: "across-fill"},
+		Costs: []domainexecution.CostComponent{{Kind: "bridge_spread", Chain: "chain-b", Amount: spread, QuoteValue: spread, IncludedInOutput: true, Evidence: "fill"},
+			{Kind: "source_gas", Chain: "chain-b", Amount: native, QuoteValue: gasValue, Evidence: "receipt"}}, ObservedAt: now.Add(5 * time.Second), Evidence: "fill"}
+	if err := store.RecordStageSettlement(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	calibration, err := store.LatestEVMFlowTransactions(ctx, "market-a", "market-b", 4, "across_source", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calibration) != 1 || calibration[0].Chain != "chain-b" || calibration[0].Identity != "across-source" {
+		t.Fatalf("unexpected EVM calibration: %+v", calibration)
+	}
+	reverse, err := store.LatestEVMFlowTransactions(ctx, "market-b", "market-a", 4, "across_source", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverse) != 0 {
+		t.Fatalf("opposite direction leaked calibration: %+v", reverse)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var cost, external, gross, net string
+	if err := db.QueryRow(`SELECT cost_value, external_cost_value, gross_value, net_value FROM sequential_live_results WHERE operation_id=?`, operation.ID).
+		Scan(&cost, &external, &gross, &net); err != nil {
+		t.Fatal(err)
+	}
+	if cost != "3/5" || external != "1/10" || gross != "3/2" || net != "7/5" {
+		t.Fatalf("adjusted result cost=%s external=%s gross=%s net=%s", cost, external, gross, net)
 	}
 }
 
@@ -558,6 +732,28 @@ func mustTokenAmount(
 ) market.TokenAmount {
 	t.Helper()
 	amount, err := market.NewTokenAmount(token, big.NewInt(units))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return amount
+}
+
+func mustTokenBigAmount(t *testing.T, token market.TokenID, units string) market.TokenAmount {
+	t.Helper()
+	value, ok := new(big.Int).SetString(units, 10)
+	if !ok {
+		t.Fatal("invalid token amount")
+	}
+	amount, err := market.NewTokenAmount(token, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return amount
+}
+
+func mustAssetQuantity(t *testing.T, asset market.AssetID, value *big.Rat) market.AssetQuantity {
+	t.Helper()
+	amount, err := market.NewAssetQuantity(asset, value)
 	if err != nil {
 		t.Fatal(err)
 	}

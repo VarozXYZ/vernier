@@ -1,6 +1,7 @@
 package arbitrage_test
 
 import (
+	"math/big"
 	"testing"
 	"time"
 
@@ -25,6 +26,31 @@ func TestArbitrageSetupBuildsBothDirections(t *testing.T) {
 	directions[0].BuyMarket = "mutated"
 	if setup.Directions()[0].BuyMarket == "mutated" {
 		t.Fatal("setup exposed its internal direction slice")
+	}
+}
+
+func TestEvaluationWithTriggerRetainsQuoteConversions(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cost, _ := market.ParseAssetQuantity("quote", "1")
+	evaluation, err := arbitrage.NewEvaluation("evaluation", "run", "strategy", "hash",
+		[]market.MarketSnapshot{testSnapshot(t, "market-a", now), testSnapshot(t, "market-b", now)},
+		arbitrage.CostSnapshot{ID: "cost", Amount: cost, CapturedAt: now}, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, _ := market.NewTokenAmount("quote-a", big.NewInt(1_000_000))
+	output, _ := market.NewTokenAmount("quote-b", big.NewInt(999_000))
+	conversion, err := market.NewQuoteConversionSnapshot("fx", input, output, now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluation, err = evaluation.WithQuoteConversions([]market.QuoteConversionSnapshot{conversion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluation = evaluation.WithTrigger(arbitrage.TriggerMetadata{Market: "market-a", Source: "feed", At: now})
+	if retained, ok := evaluation.QuoteConversion("quote-a", "quote-b"); !ok || retained.Signature != conversion.Signature {
+		t.Fatal("triggered evaluation dropped its immutable quote conversion")
 	}
 }
 

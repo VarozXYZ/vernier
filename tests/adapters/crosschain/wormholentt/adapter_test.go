@@ -266,6 +266,37 @@ func TestGuardianClientReturnsMatchingAttestation(t *testing.T) {
 	}
 }
 
+func TestGuardianClientUsesWormholeScanVAAFallback(t *testing.T) {
+	manager := [32]byte{31: 0x22}
+	raw, identity := syntheticVAA(t, 23, manager, [32]byte{31: 0x44})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		wantPath := fmt.Sprintf("/api/v1/vaas/%d/%s/%d", identity.EmitterChain,
+			hex.EncodeToString(identity.EmitterAddress[:]), identity.Sequence)
+		if request.URL.Path != wantPath {
+			http.NotFound(writer, request)
+			return
+		}
+		fmt.Fprintf(writer, `{"data":{"vaa":%q}}`, base64.StdEncoding.EncodeToString(raw))
+	}))
+	defer server.Close()
+
+	client, err := wormholentt.NewGuardianClient(wormholentt.GuardianClientConfig{
+		Endpoints: []string{server.URL + "/api/v1/vaas"}, PollInterval: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attestation, err := client.Await(ctx, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attestation.Message != identity || len(attestation.Raw) != len(raw) {
+		t.Fatal("unexpected WormholeScan attestation")
+	}
+}
+
 func syntheticSolanaConfig() wormholentt.SolanaConfig {
 	return wormholentt.SolanaConfig{
 		WormholeChain: 23,

@@ -72,3 +72,23 @@ func LoadEnvFile(path string, lookup LookupEnv, set func(string, string) error) 
 	}
 	return scanner.Err()
 }
+
+// ReadIsolatedEnvFile reads an environment file into a private lookup. Values
+// may reference variables declared earlier in the same file, but never values
+// inherited by the process. This prevents an operational setup from silently
+// borrowing a signer, endpoint, or provider credential loaded for another
+// setup.
+func ReadIsolatedEnvFile(path string) (LookupEnv, error) {
+	values := make(map[string]string)
+	lookup := func(key string) (string, bool) {
+		value, ok := values[key]
+		return value, ok
+	}
+	if err := LoadEnvFile(path, lookup, func(key, value string) error {
+		values[key] = value
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return lookup, nil
+}

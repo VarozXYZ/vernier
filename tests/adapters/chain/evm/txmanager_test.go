@@ -194,12 +194,23 @@ func TestEVMTxManagerPreloadsAndFansOutSameSignedTransaction(t *testing.T) {
 	}
 	failed.sentMu.Lock()
 	accepted.sentMu.Lock()
-	defer failed.sentMu.Unlock()
-	defer accepted.sentMu.Unlock()
-	if len(failed.sent) != 1 || len(accepted.sent) != 1 ||
-		failed.sent[0].Hash() != accepted.sent[0].Hash() ||
-		failed.sent[0].Hash().Hex() != prepared.Identity.Hash {
+	fanoutInvalid := len(failed.sent) != 1 || len(accepted.sent) != 1
+	if !fanoutInvalid {
+		fanoutInvalid = failed.sent[0].Hash() != accepted.sent[0].Hash() ||
+			failed.sent[0].Hash().Hex() != prepared.Identity.Hash
+	}
+	failed.sentMu.Unlock()
+	accepted.sentMu.Unlock()
+	if fanoutInvalid {
 		t.Fatal("fanout endpoints did not receive the same signed transaction")
+	}
+	if _, err := manager.BroadcastPrimary(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	primary.sentMu.Lock()
+	defer primary.sentMu.Unlock()
+	if len(primary.sent) != 1 || primary.sent[0].Hash().Hex() != prepared.Identity.Hash {
+		t.Fatal("primary-only broadcast did not use exactly the primary RPC")
 	}
 }
 

@@ -2,12 +2,62 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	sqlitestore "github.com/VarozXYZ/vernier/adapters/persistence/sqlite"
 )
+
+func TestNTTCanarySanitizesHistoricalDiagnosticsOnOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "canary.sqlite")
+	store, err := sqlitestore.OpenNTTCanary(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := sqlitestore.NTTCanaryOperation{
+		ID: "historical-secret", Direction: "chain-a-to-chain-b",
+		AmountUnits: "1", Stage: "created", CreatedAt: time.Now().UTC(),
+	}
+	if err := store.Create(context.Background(), operation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "must-not-survive"
+	if _, err := db.Exec(
+		`UPDATE ntt_canary_operations SET last_error=? WHERE operation_id=?`,
+		"rpc https://rpc.example/?api-key="+secret,
+		operation.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = sqlitestore.OpenNTTCanary(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	loaded, _, err := store.Load(context.Background(), operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(loaded.LastError, secret) ||
+		strings.Contains(loaded.LastError, "?") {
+		t.Fatalf("historical credential survived sanitization: %s", loaded.LastError)
+	}
+}
 
 func TestNTTCanaryPersistsIdentityBeforeBroadcastState(t *testing.T) {
 	store, err := sqlitestore.OpenNTTCanary(
@@ -132,6 +182,42 @@ func TestNTTCanaryRejectsDuplicateTransactionIdentity(t *testing.T) {
 	}
 }
 
+func TestNTTCanaryFindsDurableMessageBySourceTransaction(t *testing.T) {
+	store, err := sqlitestore.OpenNTTCanary(
+		filepath.Join(t.TempDir(), "canary.sqlite"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	operation := sqlitestore.NTTCanaryOperation{
+		ID: "source-message", Direction: "chain-a-to-chain-b",
+		AmountUnits: "1000", Stage: "created", CreatedAt: time.Now().UTC(),
+	}
+	if err := store.Create(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	const sourceTx = "0xsource"
+	const emitter = "0000000000000000000000000000000000000000000000000000000000000022"
+	if err := store.UpdateMessage(
+		ctx, operation.ID, sourceTx, 5, emitter, 21390, "", "source_confirmed",
+	); err != nil {
+		t.Fatal(err)
+	}
+	message, found, err := store.FindMessageBySourceTransaction(ctx, sourceTx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || message.EmitterChain != 5 ||
+		message.EmitterAddress != emitter || message.Sequence != 21390 {
+		t.Fatalf("unexpected durable message: %#v found=%t", message, found)
+	}
+	if _, found, err := store.FindMessageBySourceTransaction(ctx, "missing"); err != nil || found {
+		t.Fatalf("unexpected missing lookup: found=%t err=%v", found, err)
+	}
+}
+
 func TestNTTCanaryReusesOnlyUnbroadcastReadinessFailure(t *testing.T) {
 	store, err := sqlitestore.OpenNTTCanary(
 		filepath.Join(t.TempDir(), "canary.sqlite"),
@@ -166,6 +252,22 @@ func TestNTTCanaryReusesOnlyUnbroadcastReadinessFailure(t *testing.T) {
 	if loaded.Stage != "created" || loaded.LastError != "" ||
 		len(transactions) != 0 {
 		t.Fatalf("unexpected reused operation: %#v %#v", loaded, transactions)
+	}
+	if err := store.Fail(
+		ctx, operation.ID, "source_recovery_failed", context.DeadlineExceeded,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateOrReuseUnbroadcast(ctx, operation); err != nil {
+		t.Fatalf("pre-broadcast source recovery failure was not reusable: %v", err)
+	}
+	if err := store.Fail(
+		ctx, operation.ID, "source_failed", context.DeadlineExceeded,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateOrReuseUnbroadcast(ctx, operation); err != nil {
+		t.Fatalf("pre-identity source failure was not reusable: %v", err)
 	}
 	if err := store.RecordPrepared(ctx, sqlitestore.NTTCanaryTransaction{
 		OperationID: operation.ID, Ordinal: 1, Phase: "source_transfer",

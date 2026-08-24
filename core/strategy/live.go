@@ -37,6 +37,7 @@ type LiveEvaluationRequest struct {
 	MaximumCost         market.AssetQuantity
 	MaximumBaseExposure market.AssetQuantity
 	TriggeredAt         time.Time
+	QuoteConversion     *market.QuoteConversionSnapshot
 }
 
 func NewLiveEvaluator(config LiveConfig) (*LiveEvaluator, error) {
@@ -125,6 +126,28 @@ func (e *LiveEvaluator) Value(request LiveEvaluationRequest, buy, sell market.Qu
 	sellQuoteOutput, err := sell.AmountOut.ToAssetQuantity(tokens.sellQuote)
 	if err != nil {
 		return arbitrage.LiveOpportunity{}, err
+	}
+	if request.QuoteConversion != nil {
+		conversion := request.QuoteConversion
+		if !conversion.ValidAt(e.clock().UTC()) ||
+			conversion.Input.Token() != tokens.sellQuote.ID ||
+			conversion.Output.Token() != tokens.buyQuote.ID {
+			return arbitrage.LiveOpportunity{}, fmt.Errorf("live quote conversion is unavailable")
+		}
+		conversionInput, conversionErr := conversion.Input.ToAssetQuantity(tokens.sellQuote)
+		if conversionErr != nil {
+			return arbitrage.LiveOpportunity{}, conversionErr
+		}
+		conversionOutput, conversionErr := conversion.Output.ToAssetQuantity(tokens.buyQuote)
+		if conversionErr != nil {
+			return arbitrage.LiveOpportunity{}, conversionErr
+		}
+		rate := new(big.Rat).Quo(conversionOutput.Rat(), conversionInput.Rat())
+		sellQuoteOutput, err = market.NewAssetQuantity(tokens.buyQuote.Asset,
+			new(big.Rat).Mul(sellQuoteOutput.Rat(), rate))
+		if err != nil {
+			return arbitrage.LiveOpportunity{}, err
+		}
 	}
 	quoteDelta, err := sellQuoteOutput.Sub(buyQuoteInput)
 	if err != nil {

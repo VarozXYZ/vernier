@@ -87,6 +87,55 @@ func TestLoadConfigResolvesModularYAMLExactly(t *testing.T) {
 	}
 }
 
+func TestLoadConfigResolvesStateOnlyPoolTriggerPolicy(t *testing.T) {
+	topology := strings.Replace(topologyYAML, "markets:\n", `pools:
+  auxiliary_pool: {venue: venue_a, chain: chain_a, address: "0x0000000000000000000000000000000000000005", suppress_evaluation_trigger: true}
+paths:
+  auxiliary_path:
+    chain: chain_a
+    hops: [{pool: auxiliary_pool, token_in: virtual_a, token_out: weth_a}]
+markets:
+`, 1)
+	topology = strings.Replace(topology,
+		"market_a: {venue: venue_a, base_token: virtual_a, quote_token: weth_a}",
+		"market_a: {path: auxiliary_path, base_token: virtual_a, quote_token: weth_a}", 1)
+	config, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topology, policyYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Markets[0].Path) != 1 || !config.Markets[0].Path[0].SuppressEvaluationTrigger {
+		t.Fatalf("state-only trigger policy was not resolved: %+v", config.Markets[0].Path)
+	}
+}
+
+func TestLoadConfigResolvesExplicitV3CoverageProbes(t *testing.T) {
+	topology := strings.Replace(topologyYAML, "markets:\n", `pools:
+  v3_pool: {venue: venue_b, chain: chain_b, address: "0x0000000000000000000000000000000000000008", coverage_probe_in: "1500", coverage_probe_out: "3"}
+paths:
+  v3_path:
+    chain: chain_b
+    hops: [{pool: v3_pool, token_in: virtual_b, token_out: weth_b}]
+markets:
+`, 1)
+	topology = strings.Replace(topology,
+		"market_b: {venue: venue_b, base_token: virtual_b, quote_token: weth_b, reference_quote: external}",
+		"market_b: {path: v3_path, base_token: virtual_b, quote_token: weth_b, reference_quote: external}", 1)
+	config, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topology, policyYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hop := config.Markets[1].Path[0]
+	if hop.CoverageProbeIn == nil || hop.CoverageProbeIn.RatString() != "1500" ||
+		hop.CoverageProbeOut == nil || hop.CoverageProbeOut.RatString() != "3" {
+		t.Fatalf("unexpected V3 coverage probes: %+v", hop)
+	}
+
+	invalid := strings.Replace(topology, `coverage_probe_out: "3"`, `coverage_probe_out: ""`, 1)
+	if _, err = configuration.LoadConfig(writeConfig(t, manifestYAML, invalid, policyYAML)); err == nil {
+		t.Fatal("one-sided V3 coverage probes were accepted")
+	}
+}
+
 func TestLoadConfigRejectsUnknownFieldsAndBrokenReferences(t *testing.T) {
 	for name, topology := range map[string]string{
 		"unknown field":  strings.Replace(topologyYAML, "schema_version: 2", "schema_version: 2\nunknown: true", 1),
@@ -118,6 +167,31 @@ func TestLoadConfigRejectsUnsupportedSizingAsset(t *testing.T) {
 	policy := strings.Replace(policyYAML, "sizing: {kind: linear_range, min: \"100\", max: \"5000\", samples: 10}", "sizing: {kind: linear_range, asset: notional, min: \"100\", max: \"5000\", samples: 10}", 1)
 	if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, policy)); err == nil {
 		t.Fatal("unsupported sizing asset was accepted")
+	}
+}
+
+func TestLoadConfigResolvesDiscreteSizingGrid(t *testing.T) {
+	policy := strings.Replace(policyYAML,
+		`sizing: {kind: linear_range, min: "100", max: "5000", samples: 10}`,
+		`sizing: {kind: discrete, values: ["250", "500", "750", "1000"]}`, 1)
+	config, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.SizingKind != "discrete" || len(config.Sizes) != 4 ||
+		config.MinimumSize.RatString() != "250" || config.MaximumSize.RatString() != "1000" {
+		t.Fatalf("unexpected discrete sizing: %+v", config.Sizes)
+	}
+	for index, want := range []string{"250", "500", "750", "1000"} {
+		if got := config.Sizes[index].RatString(); got != want {
+			t.Fatalf("size[%d]=%s want=%s", index, got, want)
+		}
+	}
+
+	invalid := strings.Replace(policy, `"500", "750"`, `"750", "500"`, 1)
+	if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topologyYAML, invalid)); err == nil ||
+		!strings.Contains(err.Error(), "strictly increasing") {
+		t.Fatalf("unordered discrete sizes accepted: %v", err)
 	}
 }
 
@@ -304,6 +378,75 @@ research:
 	}
 }
 
+func TestLoadConfigResolvesSyntheticPrefundedHybridAndRejectsIncompleteValidation(t *testing.T) {
+	manifest := "schema_version: 2\ntopology: topology.yaml\npolicy: policy.yaml\nactive_research: hybrid\n"
+	topology := `schema_version: 2
+chains:
+  local: {kind: evm, label: Local, chain_id: "1", http_url_env: LOCAL_HTTP, websocket_url_env: LOCAL_WS}
+  remote: {kind: evm, label: Remote, chain_id: "2", http_url_env: REMOTE_HTTP, websocket_url_env: REMOTE_WS}
+assets: {base: {symbol: BASE}, quote: {symbol: QUOTE}}
+tokens:
+  base_local: {asset: base, chain: local, address: "0x0000000000000000000000000000000000000001", decimals: 18, symbol: BASE}
+  quote_local: {asset: quote, chain: local, address: "0x0000000000000000000000000000000000000002", decimals: 6, symbol: QUOTE}
+  base_remote: {asset: base, chain: remote, address: "0x0000000000000000000000000000000000000003", decimals: 18, symbol: BASE}
+  quote_remote: {asset: quote, chain: remote, address: "0x0000000000000000000000000000000000000004", decimals: 18, symbol: QUOTE}
+venues:
+  local_v3: {kind: pancakeswap_v3, chain: local, pool_address: "0x0000000000000000000000000000000000000005"}
+pools:
+  local_pool: {venue: local_v3, chain: local, address: "0x0000000000000000000000000000000000000005"}
+  remote_trigger: {chain: remote, kind: uniswap_v3, address: "0x0000000000000000000000000000000000000006"}
+paths:
+  local_path: {chain: local, hops: [{pool: local_pool, token_in: base_local, token_out: quote_local}]}
+quote_sources:
+  remote_aggregator: {kind: kyberswap, chain_slug: synthetic, client_id_env: SYNTH_CLIENT, slippage_bps: 10}
+markets:
+  local_market: {path: local_path, base_token: base_local, quote_token: quote_local}
+  remote_market: {chain: remote, base_token: base_remote, quote_token: quote_remote, quote_source: remote_aggregator, trigger_pools: [remote_trigger]}
+`
+	policy := `schema_version: 2
+setups: {hybrid_pair: {markets: [local_market, remote_market]}}
+research:
+  hybrid:
+    run_id: synthetic-hybrid
+    setup: hybrid_pair
+    inventory_mode: prepositioned
+    fixed_cost: {asset: quote, amount: "1"}
+    min_net_profit: "0.75"
+    sizing: {kind: fixed, asset: quote, amount: "500"}
+    evaluation_mode: prefunded_parallel
+    tracking_mode: fixed_candidate
+    executable_validation:
+      enabled: true
+      evm_sender_env: SYNTH_SENDER
+      evm_token_slots: {base_remote: {balance_slot: 1, allowance_slot: 2}, quote_remote: {balance_slot: 3, allowance_slot: 4}}
+`
+	config, err := configuration.LoadConfig(writeConfig(t, manifest, topology, policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.EvaluationMode != "prefunded_parallel" || !config.ExecutableValidationEnabled || config.QuoteSources["remote_aggregator"].ChainSlug != "synthetic" {
+		t.Fatalf("unexpected hybrid config: %+v", config)
+	}
+	for name, invalid := range map[string]string{
+		"sender":      strings.Replace(policy, "evm_sender_env: SYNTH_SENDER", "evm_sender_env: ''", 1),
+		"slots":       strings.Replace(policy, "balance_slot: 1, allowance_slot: 2", "balance_slot: 1, allowance_slot: 1", 1),
+		"tracking":    strings.Replace(policy, "tracking_mode: fixed_candidate", "tracking_mode: window_reselect", 1),
+		"token slots": strings.Replace(policy, ", quote_remote: {balance_slot: 3, allowance_slot: 4}", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := configuration.LoadConfig(writeConfig(t, manifest, topology, invalid)); err == nil {
+				t.Fatal("incomplete hybrid configuration was accepted")
+			}
+		})
+	}
+	if _, err := configuration.LoadConfig(writeConfig(t, manifest, strings.Replace(topology, "chain_slug: synthetic", "chain_slug: ''", 1), policy)); err == nil {
+		t.Fatal("empty chain slug was accepted")
+	}
+	if _, err := configuration.LoadConfig(writeConfig(t, manifest, strings.Replace(topology, "trigger_pools: [remote_trigger]", "trigger_pools: []", 1), policy)); err == nil {
+		t.Fatal("empty trigger set was accepted")
+	}
+}
+
 func TestLoadConfigRejectsPrimaryAndReferenceQuoteTogether(t *testing.T) {
 	topology := strings.Replace(
 		topologyYAML,
@@ -313,6 +456,36 @@ func TestLoadConfigRejectsPrimaryAndReferenceQuoteTogether(t *testing.T) {
 	)
 	if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topology, policyYAML)); err == nil {
 		t.Fatal("market with primary and reference quote sources was accepted")
+	}
+}
+
+func TestLoadConfigResolvesQuoteConversionBridgeTokenAndRejectsUnknownSelection(t *testing.T) {
+	topology := strings.Replace(
+		topologyYAML,
+		"  virtual_b: {asset: virtual, chain: chain_b, address: \"0x0000000000000000000000000000000000000003\", decimals: 18, symbol: VIRTUAL}",
+		"  virtual_b: {asset: virtual, chain: chain_b, address: \"0x0000000000000000000000000000000000000003\", decimals: 18, symbol: VIRTUAL}\n  virtual_bridge_b: {asset: virtual, chain: chain_b, address: \"0x000000000000000000000000000000000000000c\", decimals: 6, symbol: VIRTUAL}",
+		1,
+	)
+	topology = strings.Replace(
+		topology,
+		"  external: {kind: jupiter, taker_env: PUBLIC_TAKER, slippage_bps: 50, max_accounts: 32}",
+		"  external: {kind: jupiter, taker_env: PUBLIC_TAKER, slippage_bps: 50, max_accounts: 32}\n  bridge_fx: {kind: kyberswap, chain_slug: synthetic, client_id_env: SYNTHETIC_CLIENT}\nquote_conversions:\n  synthetic_fx: {chain: chain_b, source: bridge_fx, token_a: virtual_b, token_b: virtual_bridge_b, bridge_token: virtual_bridge_b, amount: \"500\", refresh_interval_ms: 1000, ttl_ms: 3000}",
+		1,
+	)
+
+	config, err := configuration.LoadConfig(writeConfig(t, manifestYAML, topology, policyYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversion := config.QuoteConversions["synthetic_fx"]
+	if conversion.BridgeToken == nil || conversion.BridgeToken.Token.ID != "virtual_bridge_b" {
+		t.Fatalf("unexpected bridge token: %+v", conversion.BridgeToken)
+	}
+
+	invalid := strings.Replace(topology, "bridge_token: virtual_bridge_b", "bridge_token: weth_b", 1)
+	if _, err := configuration.LoadConfig(writeConfig(t, manifestYAML, invalid, policyYAML)); err == nil ||
+		!strings.Contains(err.Error(), "bridge token must be token_a or token_b") {
+		t.Fatalf("unknown bridge-token selection was accepted: %v", err)
 	}
 }
 

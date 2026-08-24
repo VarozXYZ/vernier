@@ -41,6 +41,8 @@ var maxUint256 = new(big.Int).Sub(
 	big.NewInt(1),
 )
 
+var nearInfiniteAllowance = new(big.Int).Lsh(big.NewInt(1), 255)
+
 type Target struct {
 	Token       common.Address
 	TokenSymbol string
@@ -55,6 +57,11 @@ type discoveredSetup struct {
 	RPCURL      string
 	Targets     []Target
 	ProbeAmount *big.Int
+}
+
+type discoveredPlan struct {
+	Owner  common.Address
+	Chains []discoveredSetup
 }
 
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -100,113 +107,174 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "live-approve: cannot load local environment")
 		return 2
 	}
-	setup, err := discover(ctx, *configPath, os.LookupEnv)
+	plan, err := discoverPlan(ctx, *configPath, os.LookupEnv)
 	if err != nil {
 		fmt.Fprintf(stderr, "live-approve: %v\n", err)
 		return 1
 	}
-	if *arm && !strings.EqualFold(strings.TrimSpace(*confirmOwner), setup.Owner.Hex()) {
+	if *arm && !strings.EqualFold(strings.TrimSpace(*confirmOwner), plan.Owner.Hex()) {
 		fmt.Fprintf(
 			stderr,
 			"live-approve: --confirm-owner must exactly match derived owner %s\n",
-			setup.Owner.Hex(),
+			plan.Owner.Hex(),
 		)
 		return 2
 	}
-	client, err := ethclient.DialContext(ctx, setup.RPCURL)
-	if err != nil {
-		fmt.Fprintf(stderr, "live-approve: connect EVM RPC: %v\n", err)
-		return 1
-	}
-	defer client.Close()
-	networkChainID, err := client.ChainID(ctx)
-	if err != nil {
-		fmt.Fprintf(stderr, "live-approve: read EVM chain ID: %v\n", err)
-		return 1
-	}
-	if networkChainID.Cmp(setup.ChainID) != 0 {
-		fmt.Fprintf(
-			stderr,
-			"live-approve: RPC chain ID %s does not match configuration %s\n",
-			networkChainID,
-			setup.ChainID,
-		)
-		return 1
-	}
-
-	fmt.Fprintf(
-		stdout,
-		"approval_setup chain_id=%s owner=%s targets=%d mode=%s\n",
-		setup.ChainID,
-		setup.Owner.Hex(),
-		len(setup.Targets),
-		map[bool]string{false: "audit", true: "armed"}[*arm],
-	)
 	sent := 0
 	skipped := 0
-	for index, target := range setup.Targets {
-		allowance, readErr := readAllowance(
-			ctx, client, target.Token, setup.Owner, target.Spender,
-		)
-		if readErr != nil {
-			fmt.Fprintf(stderr, "live-approve: read allowance: %v\n", readErr)
+	required := 0
+	for _, setup := range plan.Chains {
+		client, dialErr := ethclient.DialContext(ctx, setup.RPCURL)
+		if dialErr != nil {
+			fmt.Fprintf(stderr, "live-approve: connect EVM RPC: %v\n", dialErr)
 			return 1
 		}
-		status := "required"
-		if allowance.Cmp(maxUint256) == 0 {
-			status = "already_max"
-		}
-		fmt.Fprintf(
-			stdout,
-			"target=%d/%d token=%s token_address=%s spender=%s purpose=%s allowance=%s status=%s\n",
-			index+1,
-			len(setup.Targets),
-			target.TokenSymbol,
-			target.Token.Hex(),
-			target.Spender.Hex(),
-			strings.Join(target.Purposes, ","),
-			formatAllowance(allowance),
-			status,
-		)
-		if status == "already_max" {
-			skipped++
-			continue
-		}
-		if !*arm {
-			continue
-		}
-		if err := approve(
-			ctx,
-			stdout,
-			client,
-			setup.PrivateKey,
-			setup.ChainID,
-			setup.Owner,
-			target,
-			*timeout,
-		); err != nil {
-			fmt.Fprintf(stderr, "live-approve: %v\n", err)
+		networkChainID, chainErr := client.ChainID(ctx)
+		if chainErr != nil || networkChainID.Cmp(setup.ChainID) != 0 {
+			client.Close()
+			fmt.Fprintf(stderr, "live-approve: RPC chain ID does not match configuration %s\n", setup.ChainID)
 			return 1
 		}
-		sent++
+		fmt.Fprintf(stdout, "approval_setup chain_id=%s owner=%s targets=%d mode=%s\n",
+			setup.ChainID, setup.Owner.Hex(), len(setup.Targets), map[bool]string{false: "audit", true: "armed"}[*arm])
+		for index, target := range setup.Targets {
+			allowance, readErr := readAllowance(ctx, client, target.Token, setup.Owner, target.Spender)
+			if readErr != nil {
+				client.Close()
+				fmt.Fprintf(stderr, "live-approve: read allowance: %v\n", readErr)
+				return 1
+			}
+			status := "required"
+			if allowance.Cmp(nearInfiniteAllowance) >= 0 {
+				status = "already_sufficient"
+			}
+			fmt.Fprintf(stdout,
+				"target=%d/%d token=%s token_address=%s spender=%s purpose=%s allowance=%s status=%s\n",
+				index+1, len(setup.Targets), target.TokenSymbol, target.Token.Hex(), target.Spender.Hex(),
+				strings.Join(target.Purposes, ","), formatAllowance(allowance), status)
+			if status == "already_sufficient" {
+				skipped++
+				continue
+			}
+			required++
+			if !*arm {
+				continue
+			}
+			if approveErr := approve(ctx, stdout, client, setup.PrivateKey, setup.ChainID, setup.Owner, target, *timeout); approveErr != nil {
+				client.Close()
+				fmt.Fprintf(stderr, "live-approve: %v\n", approveErr)
+				return 1
+			}
+			sent++
+		}
+		client.Close()
 	}
 	if !*arm {
-		fmt.Fprintf(
-			stdout,
-			"broadcast=disabled required=%d already_max=%d\n",
-			len(setup.Targets)-skipped,
-			skipped,
-		)
+		fmt.Fprintf(stdout, "broadcast=disabled required=%d already_sufficient=%d\n", required, skipped)
 		return 0
 	}
 	fmt.Fprintf(
 		stdout,
-		"result=completed approvals_sent=%d already_max=%d owner=%s\n",
+		"result=completed approvals_sent=%d already_sufficient=%d owner=%s\n",
 		sent,
 		skipped,
-		setup.Owner.Hex(),
+		plan.Owner.Hex(),
 	)
 	return 0
+}
+
+func discoverPlan(ctx context.Context, manifestPath string, lookup configuration.LookupEnv) (discoveredPlan, error) {
+	live, err := configuration.LoadLiveConfig(manifestPath)
+	if err != nil {
+		return discoveredPlan{}, err
+	}
+	if len(live.ApprovalSpenders) != 0 {
+		return discoverExplicitPlan(manifestPath, lookup, live)
+	}
+	legacy, err := discover(ctx, manifestPath, lookup)
+	if err != nil {
+		return discoveredPlan{}, err
+	}
+	return discoveredPlan{Owner: legacy.Owner, Chains: []discoveredSetup{legacy}}, nil
+}
+
+func discoverExplicitPlan(manifestPath string, lookup configuration.LookupEnv, live configuration.ParsedLiveConfig) (discoveredPlan, error) {
+	research, err := configuration.LoadConfig(manifestPath)
+	if err != nil {
+		return discoveredPlan{}, err
+	}
+	if research.Hash != live.Hash || research.SetupID != live.SetupID {
+		return discoveredPlan{}, fmt.Errorf("research and Live manifests do not match")
+	}
+	endpoints, err := research.ResolveEndpoints(lookup)
+	if err != nil {
+		return discoveredPlan{}, err
+	}
+	type tokenInfo struct {
+		address common.Address
+		symbol  string
+	}
+	tokens := make(map[string]map[string]tokenInfo)
+	addToken := func(chain string, id string, address common.Address, symbol string) {
+		if tokens[chain] == nil {
+			tokens[chain] = make(map[string]tokenInfo)
+		}
+		tokens[chain][id] = tokenInfo{address: address, symbol: symbol}
+	}
+	for _, configured := range research.Markets {
+		addToken(configured.Chain, string(configured.Base.Token.ID), configured.Base.Address, configured.Base.Token.Symbol)
+		addToken(configured.Chain, string(configured.Quote.Token.ID), configured.Quote.Address, configured.Quote.Token.Symbol)
+	}
+	for _, conversion := range live.QuoteConversions {
+		addToken(conversion.Chain, string(conversion.TokenA.Token.ID), conversion.TokenA.Address, conversion.TokenA.Token.Symbol)
+		addToken(conversion.Chain, string(conversion.TokenB.Token.ID), conversion.TokenB.Address, conversion.TokenB.Token.Symbol)
+	}
+	grouped := make(map[string][]Target)
+	for _, requirement := range live.ApprovalSpenders {
+		chain := string(requirement.Chain)
+		token, ok := tokens[chain][string(requirement.Token)]
+		if !ok || token.address == (common.Address{}) {
+			return discoveredPlan{}, fmt.Errorf("approval token %s/%s is unavailable", chain, requirement.Token)
+		}
+		grouped[chain] = append(grouped[chain], Target{Token: token.address, TokenSymbol: token.symbol,
+			Spender: requirement.Spender, Purposes: []string{requirement.Purpose}})
+	}
+	plan := discoveredPlan{}
+	for chain, targets := range grouped {
+		resolvedChain, ok := research.Chains[chain]
+		if !ok || resolvedChain.Kind != "evm" || resolvedChain.ChainID == nil || resolvedChain.ChainID.Sign() <= 0 {
+			return discoveredPlan{}, fmt.Errorf("approval chain %s is not a configured EVM chain", chain)
+		}
+		account, ok := live.Accounts[chain]
+		if !ok {
+			return discoveredPlan{}, fmt.Errorf("approval chain %s has no Live account", chain)
+		}
+		keyText, err := requiredEnv(lookup, account.SignerEnv)
+		if err != nil {
+			return discoveredPlan{}, err
+		}
+		privateKey, err := gethcrypto.HexToECDSA(strings.TrimPrefix(strings.TrimSpace(keyText), "0x"))
+		if err != nil {
+			return discoveredPlan{}, fmt.Errorf("invalid EVM private key for chain %s", chain)
+		}
+		owner := gethcrypto.PubkeyToAddress(privateKey.PublicKey)
+		if plan.Owner == (common.Address{}) {
+			plan.Owner = owner
+		} else if plan.Owner != owner {
+			return discoveredPlan{}, fmt.Errorf("explicit approval chains must use the same owner")
+		}
+		targets, err = normalizeTargets(targets)
+		if err != nil {
+			return discoveredPlan{}, err
+		}
+		plan.Chains = append(plan.Chains, discoveredSetup{Owner: owner, PrivateKey: privateKey,
+			ChainID: new(big.Int).Set(resolvedChain.ChainID), RPCURL: endpoints[chain], Targets: targets})
+	}
+	if plan.Owner == (common.Address{}) || len(plan.Chains) == 0 {
+		return discoveredPlan{}, fmt.Errorf("explicit approval allowlist is empty")
+	}
+	sort.Slice(plan.Chains, func(i, j int) bool { return plan.Chains[i].ChainID.Cmp(plan.Chains[j].ChainID) < 0 })
+	return plan, nil
 }
 
 func discover(
@@ -728,9 +796,9 @@ func approve(
 	if err != nil {
 		return fmt.Errorf("verify %s approval: %w", target.TokenSymbol, err)
 	}
-	if allowance.Cmp(maxUint256) != 0 {
+	if allowance.Cmp(nearInfiniteAllowance) < 0 {
 		return fmt.Errorf(
-			"%s approval confirmed but allowance is not MaxUint256",
+			"%s approval confirmed but allowance remains below the near-infinite threshold",
 			target.TokenSymbol,
 		)
 	}
@@ -818,7 +886,7 @@ func waitAllowanceAtReceipt(
 		)
 		if err == nil {
 			lastAllowance = allowance
-			if allowance.Cmp(maxUint256) == 0 {
+			if allowance.Cmp(nearInfiniteAllowance) >= 0 {
 				return allowance, nil
 			}
 		} else {
@@ -913,6 +981,9 @@ func requiredEnv(lookup configuration.LookupEnv, name string) (string, error) {
 func formatAllowance(value *big.Int) string {
 	if value.Cmp(maxUint256) == 0 {
 		return "max_uint256"
+	}
+	if value.Cmp(nearInfiniteAllowance) >= 0 {
+		return "near_infinite"
 	}
 	return value.String()
 }

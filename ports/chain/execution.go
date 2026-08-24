@@ -4,6 +4,7 @@ package chain
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -44,6 +45,38 @@ type TxManager interface {
 	Prepare(context.Context, executionport.Artifact) (PreparedTransaction, error)
 	Broadcast(context.Context, PreparedTransaction) (BroadcastResult, error)
 	Reconcile(context.Context, execution.OperationStep) (execution.Settlement, error)
+}
+
+// PrimaryBroadcaster is used for operational transactions whose propagation
+// is not latency-sensitive: approvals, bridges, redeems, and gas maintenance.
+// Swap execution keeps using TxManager.Broadcast so its configured fanout is
+// explicit and cannot leak into unrelated transaction classes.
+type PrimaryBroadcaster interface {
+	BroadcastPrimary(context.Context, PreparedTransaction) (BroadcastResult, error)
+}
+
+// ReceiptStatusReconciler proves only EVM inclusion and receipt status. It is
+// intentionally separate from economic settlement decoding and is suitable
+// for approvals and other transactions with no token input/output deltas.
+type ReceiptStatusReconciler interface {
+	ReconcileReceiptStatus(
+		context.Context,
+		execution.TransactionIdentity,
+	) (execution.TechnicalState, error)
+}
+
+// BroadcastPrimary selects the primary-only capability when the concrete
+// manager exposes it. The fallback preserves compatibility with chain
+// managers whose Broadcast implementation already has a single transport.
+func BroadcastPrimary(
+	ctx context.Context,
+	manager TxManager,
+	prepared PreparedTransaction,
+) (BroadcastResult, error) {
+	if broadcaster, ok := manager.(PrimaryBroadcaster); ok {
+		return broadcaster.BroadcastPrimary(ctx, prepared)
+	}
+	return manager.Broadcast(ctx, prepared)
 }
 
 // PreparedTransactionSimulator executes the exact signed payload against the
@@ -112,6 +145,42 @@ type EconomicPreparedTransactionSimulator interface {
 type EVMNonceCoordinator interface {
 	NextNonce() (uint64, error)
 	MarkNonceUsed(uint64)
+}
+
+// EVMNonceResynchronizer is an optional recovery capability. It is used only
+// after every broadcast endpoint has definitively rejected one identity with
+// nonce_too_low. Implementations must refresh from chain state without ever
+// moving the local nonce backwards.
+type EVMNonceResynchronizer interface {
+	ResyncNonce(context.Context, uint64) (uint64, error)
+}
+
+// AllFanoutNonceTooLowError proves that no fanout endpoint accepted the
+// transaction and every endpoint classified the same deterministic rejection.
+// Callers may safely discard the rejected identity and rebuild with a fresh
+// nonce; mixed or uncertain fanout outcomes must never use this path.
+type AllFanoutNonceTooLowError struct {
+	Nonce    uint64
+	Attempts int
+	Err      error
+}
+
+func (e *AllFanoutNonceTooLowError) Error() string {
+	if e == nil {
+		return "all EVM fanout endpoints rejected nonce as too low"
+	}
+	return fmt.Sprintf(
+		"all %d EVM fanout endpoints rejected nonce %d as too low",
+		e.Attempts,
+		e.Nonce,
+	)
+}
+
+func (e *AllFanoutNonceTooLowError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 // ConfirmationSource is the primary WebSocket evidence path. Implementations

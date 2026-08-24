@@ -171,39 +171,30 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 	if len(code) == 0 {
 		return nil, fmt.Errorf("uniswap V3 pool has no bytecode at block %d", block.Number)
 	}
-	token0Values, err := a.call(ctx, network, block, "token0")
+	initial, err := a.calls(ctx, network, block, []poolCall{
+		{method: "token0"}, {method: "token1"}, {method: "fee"},
+		{method: "tickSpacing"}, {method: "slot0"}, {method: "liquidity"},
+	})
 	if err != nil {
 		return nil, err
 	}
-	token1Values, err := a.call(ctx, network, block, "token1")
-	if err != nil {
-		return nil, err
-	}
+	token0Values, token1Values := initial[0], initial[1]
 	token0, ok0 := token0Values[0].(common.Address)
 	token1, ok1 := token1Values[0].(common.Address)
 	if !ok0 || !ok1 || token0 == (common.Address{}) || token1 == (common.Address{}) || token0 == token1 {
 		return nil, fmt.Errorf("uniswap V3 pool returned invalid tokens")
 	}
-	feeValues, err := a.call(ctx, network, block, "fee")
-	if err != nil {
-		return nil, err
-	}
+	feeValues := initial[2]
 	fee, err := uint32Value(feeValues[0], "fee")
 	if err != nil {
 		return nil, err
 	}
-	spacingValues, err := a.call(ctx, network, block, "tickSpacing")
-	if err != nil {
-		return nil, err
-	}
+	spacingValues := initial[3]
 	spacing, err := int32Value(spacingValues[0], "tick spacing")
 	if err != nil {
 		return nil, err
 	}
-	slotValues, err := a.call(ctx, network, block, "slot0")
-	if err != nil {
-		return nil, err
-	}
+	slotValues := initial[4]
 	sqrtPrice, err := bigValue(slotValues[0], "sqrt price")
 	if err != nil {
 		return nil, err
@@ -212,10 +203,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, network evm.Network, block evm.
 	if err != nil {
 		return nil, err
 	}
-	liquidityValues, err := a.call(ctx, network, block, "liquidity")
-	if err != nil {
-		return nil, err
-	}
+	liquidityValues := initial[5]
 	liquidity, err := bigValue(liquidityValues[0], "liquidity")
 	if err != nil {
 		return nil, err
@@ -371,53 +359,35 @@ func (a *Adapter) loadWord(ctx context.Context, network evm.Network, block evm.B
 		}
 	}
 	ticks := make([]Tick, len(indices))
-	sem := make(chan struct{}, 8)
-	var wg sync.WaitGroup
-	var firstErr error
-	var errMu sync.Mutex
-	for position, index := range indices {
-		wg.Add(1)
-		go func(position int, index int32) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			values, callErr := a.call(ctx, network, block, "ticks", big.NewInt(int64(index)))
-			if callErr != nil {
-				setFirstError(&errMu, &firstErr, callErr)
-				return
-			}
+	for offset := 0; offset < len(indices); offset += 64 {
+		end := min(offset+64, len(indices))
+		requests := make([]poolCall, end-offset)
+		for position := offset; position < end; position++ {
+			requests[position-offset] = poolCall{method: "ticks", arguments: []any{big.NewInt(int64(indices[position]))}}
+		}
+		responses, callErr := a.calls(ctx, network, block, requests)
+		if callErr != nil {
+			return callErr
+		}
+		for position := offset; position < end; position++ {
+			index, values := indices[position], responses[position-offset]
 			gross, grossErr := bigValue(values[0], "tick liquidity gross")
 			net, netErr := bigValue(values[1], "tick liquidity net")
 			if grossErr != nil {
-				setFirstError(&errMu, &firstErr, grossErr)
-				return
+				return grossErr
 			}
 			if netErr != nil {
-				setFirstError(&errMu, &firstErr, netErr)
-				return
+				return netErr
 			}
 			initialized, tickErr := NewTick(index, gross, net)
 			if tickErr != nil {
-				setFirstError(&errMu, &firstErr, tickErr)
-				return
+				return tickErr
 			}
 			ticks[position] = initialized
-		}(position, index)
-	}
-	wg.Wait()
-	if firstErr != nil {
-		return firstErr
+		}
 	}
 	loaded[word] = ticks
 	return nil
-}
-
-func setFirstError(mu *sync.Mutex, target *error, candidate error) {
-	mu.Lock()
-	defer mu.Unlock()
-	if *target == nil {
-		*target = candidate
-	}
 }
 
 func (a *Adapter) call(ctx context.Context, network evm.Network, block evm.BlockReference, method string, arguments ...any) ([]any, error) {
@@ -434,6 +404,46 @@ func (a *Adapter) call(ctx context.Context, network evm.Network, block evm.Block
 		return nil, fmt.Errorf("decode Uniswap V3 %s response: %w", method, err)
 	}
 	return values, nil
+}
+
+type poolCall struct {
+	method    string
+	arguments []any
+}
+
+func (a *Adapter) calls(ctx context.Context, network evm.Network, block evm.BlockReference,
+	requests []poolCall) ([][]any, error) {
+	batch, ok := network.(evm.BatchContractCaller)
+	if ok && len(requests) > 1 {
+		calls := make([]evm.ContractCall, len(requests))
+		for index, request := range requests {
+			input, err := poolABI.Pack(request.method, request.arguments...)
+			if err != nil {
+				return nil, fmt.Errorf("encode Uniswap V3 %s call: %w", request.method, err)
+			}
+			calls[index] = evm.ContractCall{Message: geth.CallMsg{To: &a.pool, Data: input}}
+		}
+		raw, err := batch.BatchCallContracts(ctx, block, calls)
+		if err == nil {
+			results := make([][]any, len(requests))
+			for index, request := range requests {
+				results[index], err = poolABI.Unpack(request.method, raw[index])
+				if err != nil {
+					return nil, fmt.Errorf("decode Uniswap V3 %s response: %w", request.method, err)
+				}
+			}
+			return results, nil
+		}
+	}
+	results := make([][]any, len(requests))
+	for index, request := range requests {
+		values, err := a.call(ctx, network, block, request.method, request.arguments...)
+		if err != nil {
+			return nil, err
+		}
+		results[index] = values
+	}
+	return results, nil
 }
 
 func decodeLog(events abi.ABI, event types.Log) (market.EventData, error) {

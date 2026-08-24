@@ -352,6 +352,18 @@ func (r *Runner) simulationSnapshotValue(leg arbitrage.SimulationLeg) market.Mar
 	return snapshot
 }
 
+// SnapshotForQuote returns the immutable snapshot retained for one discovery
+// quote. Live uses it to rebuild a deterministic local intent after the remote
+// build completes; it never returns a merely latest snapshot under the same
+// identity.
+func (r *Runner) SnapshotForQuote(quote market.Quote) (market.MarketSnapshot, bool) {
+	r.simulationMu.RLock()
+	defer r.simulationMu.RUnlock()
+	key := string(quote.Market) + "/" + fmt.Sprint(quote.SnapshotVersion) + "/" + fmt.Sprintf("%x", quote.SnapshotHash)
+	snapshot, ok := r.simulationSnapshots[key]
+	return snapshot, ok
+}
+
 func simulationSnapshotKey(id market.MarketID, snapshot market.MarketSnapshot) string {
 	metadata := snapshot.Metadata()
 	return string(id) + "/" + fmt.Sprint(metadata.Version) + "/" + fmt.Sprintf("%x", metadata.StateHash)
@@ -361,6 +373,7 @@ func (r *Runner) rememberSimulationSnapshots(snapshots []market.MarketSnapshot) 
 	r.simulationMu.Lock()
 	defer r.simulationMu.Unlock()
 	for _, snapshot := range snapshots {
+		r.latestLocalSnapshots[snapshot.Metadata().Market] = snapshot
 		key := simulationSnapshotKey(snapshot.Metadata().Market, snapshot)
 		if _, exists := r.simulationSnapshots[key]; exists {
 			r.simulationSnapshots[key] = snapshot
@@ -374,6 +387,13 @@ func (r *Runner) rememberSimulationSnapshots(snapshots []market.MarketSnapshot) 
 			delete(r.simulationSnapshots, oldest)
 		}
 	}
+}
+
+func (r *Runner) LatestSnapshot(id market.MarketID) (market.MarketSnapshot, bool) {
+	r.simulationMu.RLock()
+	defer r.simulationMu.RUnlock()
+	snapshot, ok := r.latestLocalSnapshots[id]
+	return snapshot, ok
 }
 
 func (r *Runner) simulationRequestForCandidate(windowID arbitrage.WindowID, sequence uint64, candidate arbitrage.Candidate, snapshots []market.MarketSnapshot, qualified bool) (arbitrage.SimulationRequest, bool) {
