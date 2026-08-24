@@ -334,8 +334,9 @@ const (
 )
 
 type RecoveryError struct {
-	Kind RecoveryFailureKind
-	Err  error
+	Kind  RecoveryFailureKind
+	Chain market.ChainID
+	Err   error
 }
 
 func (e *RecoveryError) Error() string {
@@ -359,6 +360,17 @@ func NewRecoveryError(kind RecoveryFailureKind, err error) error {
 	return &RecoveryError{Kind: kind, Err: err}
 }
 
+func NewChainRecoveryError(
+	kind RecoveryFailureKind,
+	chain market.ChainID,
+	err error,
+) error {
+	if err == nil {
+		err = errors.New("sequential recovery failed")
+	}
+	return &RecoveryError{Kind: kind, Chain: chain, Err: err}
+}
+
 func RecoveryKind(err error) RecoveryFailureKind {
 	if err == nil {
 		return ""
@@ -371,6 +383,17 @@ func RecoveryKind(err error) RecoveryFailureKind {
 		return RecoveryFailureUncertain
 	}
 	return RecoveryFailureTemporary
+}
+
+func RecoveryChain(err error) (market.ChainID, bool) {
+	if err == nil {
+		return "", false
+	}
+	var recoveryErr *RecoveryError
+	if !errors.As(err, &recoveryErr) || recoveryErr.Chain == "" {
+		return "", false
+	}
+	return recoveryErr.Chain, true
 }
 
 // SequentialPreflight validates all dependent swap legs before the first

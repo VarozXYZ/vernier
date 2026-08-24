@@ -436,8 +436,9 @@ func (r *armedRuntime) validateNetworks(ctx context.Context) error {
 		solanaNative = new(big.Int).SetUint64(solanaBalance.Value)
 	}
 	if solanaNative.Cmp(new(big.Int).SetUint64(r.config.Solana.MinimumBalanceLamports)) < 0 {
-		return executionport.NewRecoveryError(
+		return executionport.NewChainRecoveryError(
 			executionport.RecoveryFailureInsufficientNative,
+			r.liveChain("solana"),
 			fmt.Errorf(
 				"solana payer has %s lamports; at least %d are required",
 				solanaNative,
@@ -466,8 +467,9 @@ func (r *armedRuntime) validateNetworks(ctx context.Context) error {
 		}
 	}
 	if evmBalance.Cmp(minimumEVM) < 0 {
-		return executionport.NewRecoveryError(
+		return executionport.NewChainRecoveryError(
 			executionport.RecoveryFailureInsufficientNative,
+			r.liveChain("evm"),
 			fmt.Errorf(
 				"EVM sender has %s wei; at least %s are required",
 				evmBalance,

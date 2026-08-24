@@ -185,12 +185,22 @@ func (s *RefuelService) EmergencyRefuel(
 	if executor == nil {
 		return fmt.Errorf("refuel chain %q is unavailable", chain)
 	}
+	// Recovery can retry every few hundred milliseconds. A completed refuel is
+	// durable, so never buy gas again during its cooldown merely because the
+	// original stage has not observed the updated balance yet.
+	if !s.refuelDue(ctx, chain) {
+		return nil
+	}
 	if err := s.gate.Transition(
 		RuntimeGateRecovering,
 		RuntimeGateRefueling,
 	); err != nil {
 		return err
 	}
+	// A genuine recovery shortage may sit above the ordinary polling threshold,
+	// so the first eligible emergency action still fills to the configured
+	// target. The durable cooldown above prevents every recovery retry from
+	// buying gas again.
 	record, err := s.execute(ctx, executor, true)
 	if executionport.RecoveryKind(err) ==
 		executionport.RecoveryFailureUncertain {
@@ -216,6 +226,9 @@ func (s *RefuelService) EmergencyRefuel(
 			err,
 		)
 		return err
+	}
+	if record.Input.Token() == "" {
+		return nil
 	}
 	s.notify(
 		notificationport.LiveExecutionRefuelCompleted,
